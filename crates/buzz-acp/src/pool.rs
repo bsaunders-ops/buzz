@@ -2840,6 +2840,7 @@ where
         .kinds([
             nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
             nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_FORUM_COMMENT as u16),
         ])
         .custom_tags(e_tag, [root_event_id])
         .custom_tags(h_tag, [ch_str.as_str()])
@@ -3030,6 +3031,7 @@ fn parse_thread_response(json: serde_json::Value) -> Option<ConversationContext>
         messages,
         total,
         truncated,
+        root_kind: None,
     })
 }
 
@@ -3129,6 +3131,7 @@ fn parse_nostr_thread_response_with_meta(
     let events = json.as_array()?;
     let agent_pubkey_hex = agent_pubkey.to_hex();
     let mut root_msg = None;
+    let mut root_kind = None;
     let mut reply_msgs = Vec::new();
     let mut seen_reply_ids = HashSet::new();
 
@@ -3136,6 +3139,10 @@ fn parse_nostr_thread_response_with_meta(
         let ev_id = ev.get("id").and_then(|v| v.as_str()).unwrap_or("");
         if let Some(msg) = json_to_context_message(ev) {
             if ev_id == root_event_id {
+                root_kind = ev
+                    .get("kind")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|kind| u32::try_from(kind).ok());
                 root_msg = Some(msg);
             } else if seen_reply_ids.insert(ev_id.to_string()) {
                 let is_agent = msg.pubkey.eq_ignore_ascii_case(&agent_pubkey_hex);
@@ -3201,6 +3208,7 @@ fn parse_nostr_thread_response_with_meta(
             messages,
             total,
             truncated,
+            root_kind,
         },
         root_present,
     })
@@ -3800,36 +3808,91 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
     }
 }
 
-/// Best-effort: post a visible failure notice (kind:9) to a channel after a
-/// batch is dead-lettered. Replies into the thread of `thread_tags` when the
-/// triggering event was threaded. Errors are logged and swallowed — the
-/// notice must never take down the main loop.
+/// Best-effort: post a visible failure notice to a channel after a batch is
+/// dead-lettered. Replies into the triggering thread and preserves forum
+/// comment kind semantics. Errors are logged and swallowed — the notice must
+/// never take down the main loop.
 pub(crate) async fn post_failure_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
+    triggering_kind: u32,
+    triggering_event_id: Option<nostr::EventId>,
     content: &str,
 ) {
-    let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
-        let root_id = nostr::EventId::from_hex(root).ok()?;
-        let parent_id = thread_tags
-            .parent_event_id
-            .as_deref()
-            .and_then(|p| nostr::EventId::from_hex(p).ok())
-            .unwrap_or(root_id);
-        Some(buzz_sdk::ThreadRef {
-            root_event_id: root_id,
-            parent_event_id: parent_id,
+    let thread_ref = thread_tags
+        .root_event_id
+        .as_deref()
+        .and_then(|root| {
+            let root_id = nostr::EventId::from_hex(root).ok()?;
+            let parent_id = thread_tags
+                .parent_event_id
+                .as_deref()
+                .and_then(|p| nostr::EventId::from_hex(p).ok())
+                .unwrap_or(root_id);
+            Some(buzz_sdk::ThreadRef {
+                root_event_id: root_id,
+                parent_event_id: parent_id,
+            })
         })
+        .or_else(|| {
+            triggering_event_id.map(|event_id| buzz_sdk::ThreadRef {
+                root_event_id: event_id,
+                parent_event_id: event_id,
+            })
+        });
+    let root_kind = if let Some(thread_ref) = &thread_ref {
+        let filter = nostr::Filter::new().id(thread_ref.root_event_id);
+        match tokio::time::timeout(Duration::from_secs(5), rest.query(&[filter])).await {
+            Ok(Ok(json)) => json
+                .as_array()
+                .and_then(|events| events.first())
+                .and_then(|event| event.get("kind"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|kind| u32::try_from(kind).ok()),
+            Ok(Err(e)) => {
+                tracing::debug!(channel = %channel_id, "failure notice: root kind lookup failed: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::debug!(channel = %channel_id, "failure notice: root kind lookup timed out");
+                None
+            }
+        }
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        if matches!(
+            triggering_kind,
+            buzz_core::kind::KIND_FORUM_POST | buzz_core::kind::KIND_FORUM_COMMENT
+        ) {
+            buzz_core::kind::KIND_FORUM_POST
+        } else {
+            triggering_kind
+        }
     });
-    let builder =
-        match buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[]) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
+
+    let builder_result = if root_kind == buzz_core::kind::KIND_FORUM_POST {
+        match thread_ref.as_ref() {
+            Some(thread_ref) => {
+                buzz_sdk::build_forum_comment(channel_id, content, thread_ref, &[], &[])
+            }
+            None => {
+                tracing::warn!(channel = %channel_id, "failure notice: forum reply missing thread reference");
                 return;
             }
-        };
+        }
+    } else {
+        buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[])
+    };
+    let builder = match builder_result {
+        Ok(builder) => builder,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
+            return;
+        }
+    };
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {
@@ -4191,6 +4254,42 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_nostr_thread_response_captures_root_kind() {
+        let root_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let json = json!([
+            {
+                "id": root_id,
+                "kind": 45001,
+                "pubkey": "pub1",
+                "content": "forum root",
+                "created_at": 1710518400
+            },
+            {
+                "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "kind": 45003,
+                "pubkey": "pub2",
+                "content": "forum reply",
+                "created_at": 1710518460
+            }
+        ]);
+
+        let agent = Keys::generate();
+        let ctx = parse_nostr_thread_response(json, root_id, 10, &agent.public_key())
+            .expect("should parse");
+        match ctx {
+            ConversationContext::Thread {
+                messages,
+                root_kind,
+                ..
+            } => {
+                assert_eq!(root_kind, Some(45_001));
+                assert_eq!(messages[0].content, "forum root");
+            }
+            _ => panic!("expected Thread context"),
+        }
+    }
+
+    #[test]
     fn test_parse_thread_response_basic() {
         let json = json!({
             "root": {
@@ -4216,6 +4315,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert_eq!(messages.len(), 2); // root + 1 reply
                 assert_eq!(total, 2); // 1 reply + 1 root
@@ -4253,6 +4353,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert_eq!(messages.len(), 2);
                 assert_eq!(total, 11); // 10 replies + 1 root
@@ -4306,6 +4407,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 // Should be reversed to chronological order.
                 assert_eq!(messages.len(), 2);
@@ -4428,6 +4530,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert_eq!(messages.len(), 3); // root + 2 displayed replies
                 assert_eq!(total, 4); // root + displayed replies + sentinel
@@ -4469,6 +4572,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert_eq!(messages.len(), 2);
                 assert_eq!(total, 2);
@@ -4589,6 +4693,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 3);
@@ -4640,6 +4745,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 2);
@@ -4692,6 +4798,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 3);
@@ -4744,6 +4851,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 3);
@@ -4805,6 +4913,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(total, 4);
@@ -4878,6 +4987,7 @@ mod tests {
                 messages,
                 total,
                 truncated,
+                ..
             } => {
                 assert!(truncated);
                 assert_eq!(messages.len(), 3);
@@ -4920,14 +5030,14 @@ mod tests {
         assert!(root.get("limit").is_none());
 
         let replies = serde_json::to_value(&filters[1]).expect("serialize replies filter");
-        assert_eq!(replies.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(replies.get("kinds"), Some(&json!([9, 40002, 45003])));
         assert_eq!(replies.get("#e"), Some(&json!([root_id])));
         assert_eq!(replies.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(replies.get("limit"), Some(&json!(reply_limit)));
         assert!(replies.get("authors").is_none());
 
         let agent = serde_json::to_value(&filters[2]).expect("serialize agent filter");
-        assert_eq!(agent.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(agent.get("kinds"), Some(&json!([9, 40002, 45003])));
         assert_eq!(agent.get("#e"), Some(&json!([root_id])));
         assert_eq!(agent.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(agent.get("authors"), Some(&json!([agent_pubkey.to_hex()])));
@@ -4938,7 +5048,7 @@ mod tests {
         assert_eq!(filters.len(), 1, "count should query only matching replies");
 
         let count = serde_json::to_value(&filters[0]).expect("serialize count filter");
-        assert_eq!(count.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(count.get("kinds"), Some(&json!([9, 40002, 45003])));
         assert_eq!(count.get("#e"), Some(&json!([root_id])));
         assert_eq!(count.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(count.get("limit"), Some(&json!(0)));
@@ -5016,6 +5126,7 @@ mod tests {
             }],
             total: 1,
             truncated: false,
+            root_kind: None,
         };
 
         let pubkeys = collect_prompt_pubkeys(&batch, Some(&context));
