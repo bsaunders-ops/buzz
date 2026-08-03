@@ -1,0 +1,2239 @@
+use std::time::Duration as StdDuration;
+
+use buzz_core::CommunityId;
+use buzz_db::core_storage::{
+    action_member_hash, action_member_operation_hash, action_operation_hash,
+    action_ordered_members_hash, append_audit_entry, claim_action_execution,
+    claim_audit_export_batch, claim_delta_scope, claim_insight_slot, complete_audit_export_batch,
+    complete_delta_scope, fail_delta_scope, insert_action_proposal,
+    mark_action_timeout_for_reconciliation, retry_audit_export_batch, search_source_chunks,
+    search_source_chunks_by_embedding, ActionClaimDecision, ActionMemberHashInput,
+    ActionProposalStatus, AuditEntityType, AuditEnvelope, AuditEventType, AuditObjectVersion,
+    AuditOutcome, DeltaLeaseDecision, ExternalConnector, ExternalOperation, InsightClaimDecision,
+    InsightClaimOutcome, InsightPriority, NewAssistantInsight, NewExternalActionProposal,
+    NewExternalActionProposalItem, SourceSearchRequest, SourceVectorSearchRequest,
+};
+use chrono::{Duration, NaiveDate, Utc};
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
+
+const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+
+#[test]
+fn action_operation_hash_uses_the_frozen_domain_and_exact_canonical_bytes() {
+    assert_eq!(
+        hex::encode(action_operation_hash(br#"{"x":1}"#)),
+        "4474c4c51bb8952e6934b2d708bf2102db763d56c4888250d880f3cb1ef9795c"
+    );
+    assert_ne!(
+        action_operation_hash(br#"{"x":1}"#),
+        action_operation_hash(b"{ \"x\": 1 }")
+    );
+}
+
+fn test_db_url() -> String {
+    std::env::var("BUZZ_TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap_or_else(|_| TEST_DB_URL.to_owned())
+}
+
+async fn scratch_db() -> (PgPool, PgPool, String) {
+    let admin = PgPool::connect(&test_db_url())
+        .await
+        .expect("connect to Postgres test instance");
+    let name = format!("core_storage_{}", Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+        .execute(&admin)
+        .await
+        .expect("create isolated scratch database");
+    let base = test_db_url();
+    let path = base.rfind('/').expect("database URL has a path");
+    let pool = PgPool::connect(&format!("{}/{name}", &base[..path]))
+        .await
+        .expect("connect to scratch database");
+    buzz_db::migration::run_migrations(&pool)
+        .await
+        .expect("apply migrations to scratch database");
+    (admin, pool, name)
+}
+
+async fn drop_scratch_db(admin: &PgPool, pool: PgPool, name: &str) {
+    pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+    )))
+    .execute(admin)
+    .await
+    .expect("drop isolated scratch database");
+}
+
+async fn seed_community(pool: &PgPool, marker: &str) -> (CommunityId, Uuid) {
+    let community = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+        .bind(community)
+        .bind(format!("{marker}-{}.example", community.simple()))
+        .execute(pool)
+        .await
+        .expect("insert community");
+    sqlx::query(
+        "INSERT INTO channels (community_id, id, name, created_by) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(community)
+    .bind(channel)
+    .bind(format!("{marker}-channel"))
+    .bind(vec![7_u8; 32])
+    .execute(pool)
+    .await
+    .expect("insert channel");
+    for marker in [3_u8, 4_u8, 8_u8] {
+        sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+            .bind(community)
+            .bind(vec![marker; 32])
+            .execute(pool)
+            .await
+            .expect("insert connector or insight owner");
+    }
+    (CommunityId::from_uuid(community), channel)
+}
+
+async fn seed_source(
+    pool: &PgPool,
+    community: CommunityId,
+    item_id: Uuid,
+    acl_pubkey: &[u8],
+) -> (Uuid, Uuid, Uuid) {
+    let account_id = Uuid::new_v4();
+    let scope_id = Uuid::new_v4();
+    let chunk_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(community.as_uuid())
+        .bind(acl_pubkey)
+        .execute(pool)
+        .await
+        .expect("insert ACL user");
+    sqlx::query(
+        "INSERT INTO connector_accounts \
+         (community_id, id, provider, owner_pubkey, external_account_id, credential_reference) \
+         VALUES ($1, $2, 'microsoft_graph', $3, $4, $5)",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(vec![3_u8; 32])
+    .bind(format!("account-{account_id}"))
+    .bind(format!("kv-account-{account_id}"))
+    .execute(pool)
+    .await
+    .expect("insert connector account");
+    sqlx::query(
+        "INSERT INTO approved_source_scopes \
+         (community_id, id, account_id, external_scope_id, scope_type, can_read, can_write) \
+         VALUES ($1, $2, $3, $4, 'sharepoint_site', true, false)",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .bind(account_id)
+    .bind(format!("scope-{scope_id}"))
+    .execute(pool)
+    .await
+    .expect("insert source scope");
+    sqlx::query(
+        "INSERT INTO source_items \
+         (community_id, id, account_id, scope_id, external_item_id, remote_version, title, source_type, modified_at, resolvable_link, last_authorization_check_at) \
+         VALUES ($1, $2, $3, $4, $5, 'v1', $6, 'document', NOW(), $7, NOW())",
+    )
+    .bind(community.as_uuid())
+    .bind(item_id)
+    .bind(account_id)
+    .bind(scope_id)
+    .bind(format!("external-{item_id}"))
+    .bind(format!("Needle {item_id}"))
+    .bind(format!("https://source.invalid/{item_id}"))
+    .execute(pool)
+    .await
+    .expect("insert source item");
+    sqlx::query(
+        "INSERT INTO source_chunks \
+         (community_id, id, item_id, chunk_index, content, content_hash) \
+         VALUES ($1, $2, $3, 0, 'needle confidential evidence', $4)",
+    )
+    .bind(community.as_uuid())
+    .bind(chunk_id)
+    .bind(item_id)
+    .bind(vec![9_u8; 32])
+    .execute(pool)
+    .await
+    .expect("insert source chunk");
+    sqlx::query(
+        "INSERT INTO source_item_acls \
+         (community_id, id, item_id, principal_type, principal_pubkey) \
+         VALUES ($1, $2, $3, 'user', $4)",
+    )
+    .bind(community.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(item_id)
+    .bind(acl_pubkey)
+    .execute(pool)
+    .await
+    .expect("insert source ACL");
+    (account_id, scope_id, chunk_id)
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres with pgvector"]
+async fn revoked_identity_history_allows_new_key_but_never_reuses_compromised_key() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, _) = seed_community(&pool, "identity").await;
+    let old_key = vec![10_u8; 32];
+    let new_key = vec![11_u8; 32];
+    let revoker = vec![12_u8; 32];
+    for pubkey in [&old_key, &new_key, &revoker] {
+        sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+            .bind(community.as_uuid())
+            .bind(pubkey)
+            .execute(&pool)
+            .await
+            .expect("insert identity user");
+    }
+    let active_without_verification = sqlx::query(
+        "INSERT INTO core_identity_bindings \
+         (community_id, entra_object_id, buzz_pubkey, lifecycle_state, challenge_hash, challenge_created_at, challenge_expires_at) \
+         VALUES ($1, $2, $3, 'active', $4, NOW(), NOW()+INTERVAL '5 minutes')",
+    )
+    .bind(community.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(&old_key)
+    .bind(vec![90_u8; 32])
+    .execute(&pool)
+    .await;
+    assert!(active_without_verification.is_err());
+    let challenged_with_verification = sqlx::query(
+        "INSERT INTO core_identity_bindings \
+         (community_id, entra_object_id, buzz_pubkey, lifecycle_state, challenge_hash, challenge_created_at, challenge_expires_at, challenge_verified_at) \
+         VALUES ($1, $2, $3, 'challenged', $4, NOW(), NOW()+INTERVAL '5 minutes', NOW())",
+    )
+    .bind(community.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(&new_key)
+    .bind(vec![91_u8; 32])
+    .execute(&pool)
+    .await;
+    assert!(challenged_with_verification.is_err());
+    let verification_before_challenge = sqlx::query(
+        "INSERT INTO core_identity_bindings \
+         (community_id, entra_object_id, buzz_pubkey, lifecycle_state, challenge_hash, challenge_created_at, challenge_expires_at, challenge_verified_at) \
+         VALUES ($1, $2, $3, 'active', $4, NOW(), NOW()+INTERVAL '5 minutes', NOW()-INTERVAL '1 second')",
+    )
+    .bind(community.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(&revoker)
+    .bind(vec![92_u8; 32])
+    .execute(&pool)
+    .await;
+    assert!(
+        verification_before_challenge.is_err(),
+        "verification before challenge creation must be rejected"
+    );
+    let entra_object_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+    let old_binding_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO connector_accounts \
+         (community_id, id, provider, owner_pubkey, external_account_id, credential_reference) \
+         VALUES ($1, $2, 'microsoft_graph', $3, $4, $5)",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(&old_key)
+    .bind(format!("account-{account_id}"))
+    .bind(format!("kv-account-{account_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert identity connector account");
+    sqlx::query(
+        "INSERT INTO core_identity_bindings \
+         (community_id, id, entra_object_id, buzz_pubkey, lifecycle_state, challenge_hash, challenge_created_at, challenge_expires_at, challenge_verified_at, connector_account_id) \
+         VALUES ($1, $2, $3, $4, 'active', $5, NOW(), NOW()+INTERVAL '5 minutes', NOW(), $6)",
+    )
+    .bind(community.as_uuid())
+    .bind(old_binding_id)
+    .bind(entra_object_id)
+    .bind(&old_key)
+    .bind(vec![13_u8; 32])
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("insert old active identity binding");
+
+    let simultaneous = sqlx::query(
+        "INSERT INTO core_identity_bindings \
+         (community_id, entra_object_id, buzz_pubkey, lifecycle_state, challenge_hash, challenge_created_at, challenge_expires_at) \
+         VALUES ($1, $2, $3, 'challenged', $4, NOW(), NOW()+INTERVAL '5 minutes')",
+    )
+    .bind(community.as_uuid())
+    .bind(entra_object_id)
+    .bind(&new_key)
+    .bind(vec![14_u8; 32])
+    .execute(&pool)
+    .await;
+    assert!(
+        simultaneous.is_err(),
+        "two live Entra bindings must conflict"
+    );
+
+    let mut tx = pool.begin().await.expect("begin identity recovery");
+    sqlx::query(
+        "UPDATE core_identity_bindings \
+         SET lifecycle_state='revoked', revoked_at=NOW(), revoked_by_pubkey=$3, connector_account_id=NULL \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(old_binding_id)
+    .bind(&revoker)
+    .execute(&mut *tx)
+    .await
+    .expect("revoke and detach old binding");
+    sqlx::query("UPDATE connector_accounts SET owner_pubkey=$3 WHERE community_id=$1 AND id=$2")
+        .bind(community.as_uuid())
+        .bind(account_id)
+        .bind(&new_key)
+        .execute(&mut *tx)
+        .await
+        .expect("reassign connector account owner");
+    sqlx::query(
+        "INSERT INTO core_identity_bindings \
+         (community_id, entra_object_id, buzz_pubkey, lifecycle_state, challenge_hash, challenge_created_at, challenge_expires_at, challenge_verified_at, connector_account_id) \
+         VALUES ($1, $2, $3, 'active', $4, NOW(), NOW()+INTERVAL '5 minutes', NOW(), $5)",
+    )
+    .bind(community.as_uuid())
+    .bind(entra_object_id)
+    .bind(&new_key)
+    .bind(vec![15_u8; 32])
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await
+    .expect("insert replacement identity binding");
+    tx.commit().await.expect("commit identity recovery");
+
+    let compromised_reuse = sqlx::query(
+        "INSERT INTO core_identity_bindings \
+         (community_id, entra_object_id, buzz_pubkey, lifecycle_state, challenge_hash, challenge_created_at, challenge_expires_at) \
+         VALUES ($1, $2, $3, 'challenged', $4, NOW(), NOW()+INTERVAL '5 minutes')",
+    )
+    .bind(community.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(&old_key)
+    .bind(vec![16_u8; 32])
+    .execute(&pool)
+    .await;
+    assert!(
+        compromised_reuse.is_err(),
+        "revoked Buzz keys remain permanently unique"
+    );
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires vanilla PostgreSQL without pgvector"]
+async fn vanilla_postgres_migrates_without_installing_vector_storage() {
+    let (admin, pool, name) = scratch_db().await;
+    let vector_installed: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='vector')")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect installed extensions");
+    let embedding_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='source_chunks' AND column_name='embedding')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect optional embedding column");
+    assert!(!vector_installed);
+    assert!(!embedding_column);
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[test]
+fn pure_claim_decisions_fail_closed_at_boundaries() {
+    let now = Utc::now();
+    let worker = Uuid::new_v4();
+
+    assert_eq!(
+        InsightClaimDecision::evaluate(true, 4),
+        InsightClaimDecision::Duplicate
+    );
+    assert_eq!(
+        InsightClaimDecision::evaluate(false, 10),
+        InsightClaimDecision::BudgetExhausted
+    );
+    assert_eq!(
+        ActionClaimDecision::evaluate(
+            ActionProposalStatus::Approved,
+            now + Duration::seconds(1),
+            false,
+            now,
+        ),
+        ActionClaimDecision::Claim
+    );
+    assert_eq!(
+        ActionClaimDecision::evaluate(ActionProposalStatus::Approved, now, false, now),
+        ActionClaimDecision::Expired
+    );
+    assert_eq!(
+        DeltaLeaseDecision::evaluate(
+            Some(Uuid::new_v4()),
+            Some(now + Duration::seconds(1)),
+            worker,
+            now,
+        ),
+        DeltaLeaseDecision::Busy
+    );
+    assert_eq!(
+        DeltaLeaseDecision::evaluate(None, Some(now - Duration::seconds(1)), worker, now),
+        DeltaLeaseDecision::Claim
+    );
+}
+
+#[test]
+fn operation_and_audit_categories_reject_open_ended_values() {
+    assert_eq!(
+        ExternalOperation::from_wire("outlook/create_draft"),
+        Some(ExternalOperation::OutlookCreateDraft)
+    );
+    assert_eq!(ExternalOperation::from_wire("outlook/send_mail"), None);
+    assert!(AuditObjectVersion::new("v1:etag-2").is_ok());
+    assert!(AuditObjectVersion::new("mailbox body with spaces").is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres with pgvector"]
+async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community_a, channel_a) = seed_community(&pool, "source-a").await;
+    let (community_b, _) = seed_community(&pool, "source-b").await;
+    let shared_item_id = Uuid::new_v4();
+    let allowed_user = vec![1_u8; 32];
+    let denied_user = vec![2_u8; 32];
+    let (_, scope_a, chunk_a) =
+        seed_source(&pool, community_a, shared_item_id, &allowed_user).await;
+    seed_source(&pool, community_b, shared_item_id, &denied_user).await;
+    sqlx::query(
+        "INSERT INTO source_item_acls \
+         (community_id, id, item_id, principal_type, channel_id) \
+         VALUES ($1, $2, $3, 'channel', $4)",
+    )
+    .bind(community_a.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(shared_item_id)
+    .bind(channel_a)
+    .execute(&pool)
+    .await
+    .expect("insert channel source ACL");
+    let embedding_version = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO embedding_versions \
+         (community_id, id, model_name, dimensions, version, activated_at) \
+         VALUES ($1, $2, 'acl-contract', 384, 1, NOW())",
+    )
+    .bind(community_a.as_uuid())
+    .bind(embedding_version)
+    .execute(&pool)
+    .await
+    .expect("insert embedding version");
+    let embedding = vec![1.0_f32; 384];
+    let embedding_literal = format!(
+        "[{}]",
+        embedding
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    sqlx::query(
+        "UPDATE source_chunks SET embedding_version_id=$3, embedding=CAST($4 AS vector) \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community_a.as_uuid())
+    .bind(chunk_a)
+    .bind(embedding_version)
+    .bind(embedding_literal)
+    .execute(&pool)
+    .await
+    .expect("seed source embedding");
+
+    let allowed = search_source_chunks(
+        &pool,
+        community_a,
+        SourceSearchRequest {
+            query: "needle",
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[channel_a],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("search allowed source chunks");
+    assert_eq!(allowed.len(), 1);
+    assert_eq!(allowed[0].item_id, shared_item_id);
+    assert_eq!(allowed[0].title, format!("Needle {shared_item_id}"));
+
+    let denied = search_source_chunks(
+        &pool,
+        community_a,
+        SourceSearchRequest {
+            query: "needle",
+            requester_pubkey: &denied_user,
+            authorized_channel_ids: &[],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("search denied source chunks");
+    assert!(
+        denied.is_empty(),
+        "positive ACLs must prevent search leakage"
+    );
+    let forged_channel = search_source_chunks(
+        &pool,
+        community_a,
+        SourceSearchRequest {
+            query: "needle",
+            requester_pubkey: &denied_user,
+            authorized_channel_ids: &[channel_a],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("search with forged authorized-channel UUID");
+    assert!(
+        forged_channel.is_empty(),
+        "a supplied channel UUID cannot replace current tenant membership"
+    );
+    assert!(search_source_chunks_by_embedding(
+        &pool,
+        community_a,
+        SourceVectorSearchRequest {
+            embedding: &embedding,
+            embedding_version_id: embedding_version,
+            requester_pubkey: &denied_user,
+            authorized_channel_ids: &[channel_a],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("vector search with forged channel UUID")
+    .is_empty());
+    sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+        .bind(community_a.as_uuid())
+        .bind(&denied_user)
+        .execute(&pool)
+        .await
+        .expect("insert channel ACL requester");
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+         VALUES ($1, $2, $3, 'member')",
+    )
+    .bind(community_a.as_uuid())
+    .bind(channel_a)
+    .bind(&denied_user)
+    .execute(&pool)
+    .await
+    .expect("grant current channel membership");
+    assert_eq!(
+        search_source_chunks(
+            &pool,
+            community_a,
+            SourceSearchRequest {
+                query: "needle",
+                requester_pubkey: &denied_user,
+                authorized_channel_ids: &[channel_a],
+                limit: 10,
+            },
+        )
+        .await
+        .expect("search current channel member")
+        .len(),
+        1
+    );
+    assert_eq!(
+        search_source_chunks_by_embedding(
+            &pool,
+            community_a,
+            SourceVectorSearchRequest {
+                embedding: &embedding,
+                embedding_version_id: embedding_version,
+                requester_pubkey: &denied_user,
+                authorized_channel_ids: &[channel_a],
+                limit: 10,
+            },
+        )
+        .await
+        .expect("vector search current channel member")
+        .len(),
+        1
+    );
+    assert!(
+        search_source_chunks(
+            &pool,
+            community_a,
+            SourceSearchRequest {
+                query: "needle",
+                requester_pubkey: &denied_user,
+                authorized_channel_ids: &[],
+                limit: 10,
+            },
+        )
+        .await
+        .expect("search member outside supplied audience")
+        .is_empty(),
+        "membership must not expand beyond the supplied audience subset"
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NOW() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community_a.as_uuid())
+    .bind(channel_a)
+    .bind(&denied_user)
+    .execute(&pool)
+    .await
+    .expect("remove channel ACL requester");
+    assert!(
+        search_source_chunks(
+            &pool,
+            community_a,
+            SourceSearchRequest {
+                query: "needle",
+                requester_pubkey: &denied_user,
+                authorized_channel_ids: &[channel_a],
+                limit: 10,
+            },
+        )
+        .await
+        .expect("search removed channel member")
+        .is_empty(),
+        "retained removed membership must not authorize search"
+    );
+    assert!(search_source_chunks_by_embedding(
+        &pool,
+        community_a,
+        SourceVectorSearchRequest {
+            embedding: &embedding,
+            embedding_version_id: embedding_version,
+            requester_pubkey: &denied_user,
+            authorized_channel_ids: &[channel_a],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("vector search removed channel member")
+    .is_empty());
+
+    sqlx::query("UPDATE source_items SET tombstoned_at=NOW() WHERE community_id=$1 AND id=$2")
+        .bind(community_a.as_uuid())
+        .bind(shared_item_id)
+        .execute(&pool)
+        .await
+        .expect("tombstone source");
+    assert!(search_source_chunks(
+        &pool,
+        community_a,
+        SourceSearchRequest {
+            query: "needle",
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("search tombstoned source")
+    .is_empty());
+
+    sqlx::query("UPDATE source_items SET tombstoned_at=NULL WHERE community_id=$1 AND id=$2")
+        .bind(community_a.as_uuid())
+        .bind(shared_item_id)
+        .execute(&pool)
+        .await
+        .expect("restore source for revocation check");
+    sqlx::query(
+        "UPDATE approved_source_scopes SET status='revoked', revoked_at=NOW() WHERE community_id=$1 AND id=$2",
+    )
+        .bind(community_a.as_uuid())
+        .bind(scope_a)
+        .execute(&pool)
+        .await
+        .expect("revoke source scope");
+    assert!(search_source_chunks(
+        &pool,
+        community_a,
+        SourceSearchRequest {
+            query: "needle",
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("search revoked scope")
+    .is_empty());
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres with pgvector"]
+async fn concurrent_insight_claims_cap_at_ten_and_dedupe_without_visible_rejections() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, channel_id) = seed_community(&pool, "insights").await;
+    let owner = vec![4_u8; 32];
+    let local_date: NaiveDate = sqlx::query_scalar(
+        "SELECT (transaction_timestamp() AT TIME ZONE 'America/New_York')::date",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("derive current New York budget date");
+    let boundary_dates: (NaiveDate, NaiveDate) = sqlx::query_as(
+        "SELECT (TIMESTAMPTZ '2026-03-08 04:59:59+00' AT TIME ZONE 'America/New_York')::date, \
+                (TIMESTAMPTZ '2026-03-08 05:00:00+00' AT TIME ZONE 'America/New_York')::date",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("evaluate New York DST date boundary");
+    assert_eq!(
+        boundary_dates,
+        (
+            NaiveDate::from_ymd_opt(2026, 3, 7).expect("valid date"),
+            NaiveDate::from_ymd_opt(2026, 3, 8).expect("valid date")
+        )
+    );
+    let rejected_insight = NewAssistantInsight {
+        owner_pubkey: &owner,
+        channel_id,
+        dedupe_key: &[250_u8; 32],
+        priority: InsightPriority::Low,
+        evidence_hash: &[251_u8; 32],
+        evidence_count: 1,
+        expires_at: None,
+    };
+    assert!(
+        claim_insight_slot(&pool, community, rejected_insight)
+            .await
+            .is_err(),
+        "an open channel must reject private insight projection"
+    );
+    sqlx::query("UPDATE channels SET visibility='private' WHERE community_id=$1 AND id=$2")
+        .bind(community.as_uuid())
+        .bind(channel_id)
+        .execute(&pool)
+        .await
+        .expect("make insight channel private");
+    assert!(
+        claim_insight_slot(&pool, community, rejected_insight)
+            .await
+            .is_err(),
+        "a nonmember owner must reject private insight projection"
+    );
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+         VALUES ($1, $2, $3, 'owner')",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&owner)
+    .execute(&pool)
+    .await
+    .expect("authorize private insight owner");
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NOW() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&owner)
+    .execute(&pool)
+    .await
+    .expect("remove private insight owner");
+    assert!(
+        claim_insight_slot(&pool, community, rejected_insight)
+            .await
+            .is_err(),
+        "a retained removed membership must not authorize feed insertion"
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NULL \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&owner)
+    .execute(&pool)
+    .await
+    .expect("restore private insight owner");
+    sqlx::query(
+        "INSERT INTO insight_daily_budgets (community_id, owner_pubkey, new_york_date) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(community.as_uuid())
+    .bind(&owner)
+    .bind(local_date)
+    .execute(&pool)
+    .await
+    .expect("seed insight budget for priority rejection");
+    let invalid_priority = sqlx::query(
+        "INSERT INTO assistant_insights \
+         (community_id, owner_pubkey, channel_id, new_york_date, dedupe_key, priority, evidence_hash, evidence_count) \
+         VALUES ($1, $2, $3, $4, $5, 4, $6, 1)",
+    )
+    .bind(community.as_uuid())
+    .bind(&owner)
+    .bind(channel_id)
+    .bind(local_date)
+    .bind(vec![248_u8; 32])
+    .bind(vec![249_u8; 32])
+    .execute(&pool)
+    .await;
+    assert!(
+        invalid_priority.is_err(),
+        "priority tiers outside 0..3 persisted"
+    );
+    let mut tasks = Vec::new();
+    for marker in 0_u8..20 {
+        let pool = pool.clone();
+        let owner = owner.clone();
+        tasks.push(tokio::spawn(async move {
+            let outcome = claim_insight_slot(
+                &pool,
+                community,
+                NewAssistantInsight {
+                    owner_pubkey: &owner,
+                    channel_id,
+                    dedupe_key: &[marker; 32],
+                    priority: match marker % 4 {
+                        0 => InsightPriority::Low,
+                        1 => InsightPriority::Normal,
+                        2 => InsightPriority::High,
+                        _ => InsightPriority::Urgent,
+                    },
+                    evidence_hash: &[marker.saturating_add(32); 32],
+                    evidence_count: 1,
+                    expires_at: None,
+                },
+            )
+            .await;
+            (marker, outcome)
+        }));
+    }
+    let mut claimed = 0;
+    let mut claimed_marker = None;
+    for task in tasks {
+        let (marker, outcome) = task.await.expect("join claim task");
+        if matches!(
+            outcome.expect("claim slot"),
+            InsightClaimOutcome::Claimed(_)
+        ) {
+            claimed += 1;
+            claimed_marker.get_or_insert(marker);
+        }
+    }
+    assert_eq!(claimed, 10);
+    let claimed_marker = claimed_marker.expect("at least one insight was claimed");
+
+    let duplicate = claim_insight_slot(
+        &pool,
+        community,
+        NewAssistantInsight {
+            owner_pubkey: &owner,
+            channel_id,
+            dedupe_key: &[claimed_marker; 32],
+            priority: InsightPriority::Low,
+            evidence_hash: &[claimed_marker.saturating_add(32); 32],
+            evidence_count: 1,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("duplicate claim");
+    assert_eq!(duplicate, InsightClaimOutcome::Duplicate);
+    let visible: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assistant_insights WHERE community_id=$1 AND owner_pubkey=$2 AND new_york_date=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(&owner)
+    .bind(local_date)
+    .fetch_one(&pool)
+    .await
+    .expect("count visible insights");
+    assert_eq!(visible, 10);
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn learning_domains_reject_policy_and_unknown_values() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, _) = seed_community(&pool, "learning-domains").await;
+    for (version, domain) in [(1_i32, "permissions"), (2_i32, "unknown")] {
+        let result = sqlx::query(
+            "INSERT INTO learning_revisions \
+             (community_id, layer, domain, version, encrypted_bundle, bundle_integrity_hash, \
+              encryption_key_version, base_policy_version) \
+             VALUES ($1, 'sanitized_firm', $2, $3, $4, $5, 1, 'policy-v1')",
+        )
+        .bind(community.as_uuid())
+        .bind(domain)
+        .bind(version)
+        .bind(vec![1_u8])
+        .bind(vec![2_u8; 32])
+        .execute(&pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "forbidden learning domain {domain} persisted"
+        );
+    }
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres with pgvector"]
+async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, channel_id) = seed_community(&pool, "actions").await;
+    let account_id = Uuid::new_v4();
+    let scope_id = Uuid::new_v4();
+    let google_account_id = Uuid::new_v4();
+    let google_scope_id = Uuid::new_v4();
+    let proposal_id = Uuid::new_v4();
+    let signer = vec![8_u8; 32];
+    let broker = vec![4_u8; 32];
+    sqlx::query(
+        "INSERT INTO connector_accounts \
+         (community_id, id, provider, owner_pubkey, external_account_id, credential_reference) \
+         VALUES ($1, $2, 'microsoft_graph', $3, $4, $5)",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(&signer)
+    .bind(format!("account-{account_id}"))
+    .bind(format!("kv-account-{account_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert action account");
+    sqlx::query(
+        "INSERT INTO connector_accounts \
+         (community_id, id, provider, owner_pubkey, external_account_id, credential_reference) \
+         VALUES ($1, $2, 'google_drive', $3, $4, $5)",
+    )
+    .bind(community.as_uuid())
+    .bind(google_account_id)
+    .bind(&signer)
+    .bind(format!("account-{google_account_id}"))
+    .bind(format!("kv-account-{google_account_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert cross-provider action account");
+    sqlx::query(
+        "INSERT INTO approved_source_scopes \
+         (community_id, id, account_id, external_scope_id, scope_type, can_read, can_write) \
+         VALUES ($1, $2, $3, $4, 'mailbox', true, true)",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .bind(account_id)
+    .bind(format!("scope-{scope_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert approved action scope");
+    sqlx::query(
+        "INSERT INTO approved_source_scopes \
+         (community_id, id, account_id, external_scope_id, scope_type, can_read, can_write) \
+         VALUES ($1, $2, $3, $4, 'drive_folder', true, true)",
+    )
+    .bind(community.as_uuid())
+    .bind(google_scope_id)
+    .bind(google_account_id)
+    .bind(format!("scope-{google_scope_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert cross-provider action scope");
+    sqlx::query("UPDATE channels SET visibility='private' WHERE community_id=$1 AND id=$2")
+        .bind(community.as_uuid())
+        .bind(channel_id)
+        .execute(&pool)
+        .await
+        .expect("make action channel private");
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+         VALUES ($1, $2, $3, 'owner')",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&signer)
+    .execute(&pool)
+    .await
+    .expect("authorize action owner in private channel");
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+         VALUES ($1, $2, $3, 'member')",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&broker)
+    .execute(&pool)
+    .await
+    .expect("authorize action broker in private channel");
+    let member_idempotency_keys = [Uuid::new_v4(), Uuid::new_v4()];
+    let operation_ids = [Uuid::new_v4(), Uuid::new_v4()];
+    let proposed_at = Utc::now();
+    let mut new_proposal = NewExternalActionProposal {
+        id: proposal_id,
+        owner_pubkey: signer.clone(),
+        broker_pubkey: broker.clone(),
+        channel_id,
+        canonical_proposal: br#"{"action":"cross-provider"}"#.to_vec(),
+        operation_hash: vec![3_u8; 32],
+        ordered_members_hash: vec![4_u8; 32],
+        nonce: Uuid::new_v4(),
+        proposed_at,
+        expires_at: proposed_at + Duration::minutes(5),
+        items: vec![
+            NewExternalActionProposalItem {
+                operation_id: operation_ids[0],
+                account_id,
+                scope_id,
+                connector: ExternalConnector::MicrosoftGraph,
+                operation: ExternalOperation::OutlookCreateDraft,
+                target_hash: vec![15_u8; 32],
+                canonical_operation: br#"{"to":"counterparty@example.invalid"}"#.to_vec(),
+                canonical_operation_hash: vec![5_u8; 32],
+                before_hash: None,
+                after_hash: vec![35_u8; 32],
+                expected_remote_version: None,
+                idempotency_key: member_idempotency_keys[0],
+                member_hash: vec![45_u8; 32],
+            },
+            NewExternalActionProposalItem {
+                operation_id: operation_ids[1],
+                account_id: google_account_id,
+                scope_id: google_scope_id,
+                connector: ExternalConnector::GoogleDrive,
+                operation: ExternalOperation::GoogleEditDoc,
+                target_hash: vec![16_u8; 32],
+                canonical_operation: br#"{"document":"document-1"}"#.to_vec(),
+                canonical_operation_hash: vec![6_u8; 32],
+                before_hash: Some(vec![26_u8; 32]),
+                after_hash: vec![36_u8; 32],
+                expected_remote_version: Some("etag-1".into()),
+                idempotency_key: member_idempotency_keys[1],
+                member_hash: vec![46_u8; 32],
+            },
+        ],
+    };
+    new_proposal.operation_hash = action_operation_hash(&new_proposal.canonical_proposal).to_vec();
+    let mut member_hashes = Vec::new();
+    for item in &mut new_proposal.items {
+        item.canonical_operation_hash =
+            action_member_operation_hash(&item.canonical_operation).to_vec();
+        let member_hash = action_member_hash(ActionMemberHashInput {
+            account_id: item.account_id,
+            scope_id: item.scope_id,
+            operation_id: item.operation_id,
+            owner_pubkey: &new_proposal.owner_pubkey,
+            connector: item.connector,
+            operation: item.operation,
+            target_hash: &item.target_hash,
+            before_hash: item.before_hash.as_deref(),
+            after_hash: &item.after_hash,
+            expected_remote_version: item.expected_remote_version.as_deref(),
+            idempotency_key: item.idempotency_key,
+            canonical_operation_hash: &item.canonical_operation_hash,
+        });
+        item.member_hash = member_hash.to_vec();
+        member_hashes.push(member_hash);
+    }
+    new_proposal.ordered_members_hash = action_ordered_members_hash(&member_hashes).to_vec();
+    let mut mutated_operation_id = new_proposal.clone();
+    mutated_operation_id.id = Uuid::new_v4();
+    mutated_operation_id.nonce = Uuid::new_v4();
+    mutated_operation_id.items[0].operation_id = Uuid::new_v4();
+    assert!(
+        insert_action_proposal(&pool, community, &mutated_operation_id)
+            .await
+            .is_err(),
+        "operation_id mutation without new member hashes must reject insertion"
+    );
+    let mut duplicate_operation_id = new_proposal.clone();
+    duplicate_operation_id.id = Uuid::new_v4();
+    duplicate_operation_id.nonce = Uuid::new_v4();
+    duplicate_operation_id.items[1].operation_id = duplicate_operation_id.items[0].operation_id;
+    assert!(
+        insert_action_proposal(&pool, community, &duplicate_operation_id)
+            .await
+            .is_err(),
+        "duplicate operation_id must reject the whole proposal"
+    );
+    let mut wrong_proposal_hash = new_proposal.clone();
+    wrong_proposal_hash.id = Uuid::new_v4();
+    wrong_proposal_hash.nonce = Uuid::new_v4();
+    wrong_proposal_hash.canonical_proposal.push(b' ');
+    assert!(
+        insert_action_proposal(&pool, community, &wrong_proposal_hash)
+            .await
+            .is_err(),
+        "canonical proposal mutation without a new frozen hash must reject insertion"
+    );
+    let mut oversized_proposal = new_proposal.clone();
+    oversized_proposal.id = Uuid::new_v4();
+    oversized_proposal.nonce = Uuid::new_v4();
+    oversized_proposal.canonical_proposal = vec![b'x'; 65_536];
+    oversized_proposal.operation_hash =
+        action_operation_hash(&oversized_proposal.canonical_proposal).to_vec();
+    assert!(
+        insert_action_proposal(&pool, community, &oversized_proposal)
+            .await
+            .is_err(),
+        "oversized canonical proposal must reject insertion"
+    );
+    let mut oversized_member = new_proposal.clone();
+    oversized_member.id = Uuid::new_v4();
+    oversized_member.nonce = Uuid::new_v4();
+    oversized_member.items[0].canonical_operation = vec![b'x'; 65_536];
+    oversized_member.items[0].canonical_operation_hash =
+        action_member_operation_hash(&oversized_member.items[0].canonical_operation).to_vec();
+    assert!(
+        insert_action_proposal(&pool, community, &oversized_member)
+            .await
+            .is_err(),
+        "oversized member canonical operation must reject insertion"
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NOW() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&broker)
+    .execute(&pool)
+    .await
+    .expect("remove action broker");
+    let mut removed_broker = new_proposal.clone();
+    removed_broker.id = Uuid::new_v4();
+    removed_broker.nonce = Uuid::new_v4();
+    assert!(
+        insert_action_proposal(&pool, community, &removed_broker)
+            .await
+            .is_err(),
+        "removed broker membership must not authorize proposal insertion"
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NULL \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&broker)
+    .execute(&pool)
+    .await
+    .expect("restore action broker membership");
+    let mut invalid_create = new_proposal.clone();
+    invalid_create.id = Uuid::new_v4();
+    invalid_create.nonce = Uuid::new_v4();
+    invalid_create.items.truncate(1);
+    invalid_create.items[0].before_hash = Some(vec![99_u8; 32]);
+    assert!(
+        insert_action_proposal(&pool, community, &invalid_create)
+            .await
+            .is_err(),
+        "create members must reject before-state preconditions"
+    );
+    let mut invalid_update = new_proposal.clone();
+    invalid_update.id = Uuid::new_v4();
+    invalid_update.nonce = Uuid::new_v4();
+    invalid_update.items.remove(0);
+    invalid_update.items[0].before_hash = None;
+    invalid_update.items[0].expected_remote_version = None;
+    assert!(
+        insert_action_proposal(&pool, community, &invalid_update)
+            .await
+            .is_err(),
+        "non-create members must require before state and a remote version"
+    );
+    let mut replayed_proposal = new_proposal.clone();
+    replayed_proposal.id = Uuid::new_v4();
+    replayed_proposal.nonce = Uuid::new_v4();
+    replayed_proposal.proposed_at = Utc::now() - Duration::minutes(20);
+    replayed_proposal.expires_at = replayed_proposal.proposed_at + Duration::minutes(5);
+    assert!(
+        insert_action_proposal(&pool, community, &replayed_proposal)
+            .await
+            .is_err(),
+        "a replayed canonical proposal must not receive a fresh DB insertion window"
+    );
+    let mut extreme_timestamp = new_proposal.clone();
+    extreme_timestamp.id = Uuid::new_v4();
+    extreme_timestamp.nonce = Uuid::new_v4();
+    extreme_timestamp.proposed_at = chrono::DateTime::<Utc>::MAX_UTC - Duration::minutes(1);
+    extreme_timestamp.expires_at = chrono::DateTime::<Utc>::MAX_UTC;
+    assert!(
+        insert_action_proposal(&pool, community, &extreme_timestamp)
+            .await
+            .is_err(),
+        "extreme timestamps must return an error rather than panic"
+    );
+    let mut wrong_operation_hash = new_proposal.clone();
+    wrong_operation_hash.id = Uuid::new_v4();
+    wrong_operation_hash.nonce = Uuid::new_v4();
+    wrong_operation_hash.items[0].canonical_operation_hash[0] ^= 0xff;
+    assert!(
+        insert_action_proposal(&pool, community, &wrong_operation_hash)
+            .await
+            .is_err(),
+        "operation hash mismatch must reject the whole bundle"
+    );
+    let mut spliced_member = new_proposal.clone();
+    spliced_member.id = Uuid::new_v4();
+    spliced_member.nonce = Uuid::new_v4();
+    spliced_member.items[1].target_hash[0] ^= 0xff;
+    assert!(
+        insert_action_proposal(&pool, community, &spliced_member)
+            .await
+            .is_err(),
+        "a field spliced into a member must reject the whole bundle"
+    );
+    let mut wrong_bundle_hash = new_proposal.clone();
+    wrong_bundle_hash.id = Uuid::new_v4();
+    wrong_bundle_hash.nonce = Uuid::new_v4();
+    wrong_bundle_hash.ordered_members_hash[0] ^= 0xff;
+    assert!(
+        insert_action_proposal(&pool, community, &wrong_bundle_hash)
+            .await
+            .is_err(),
+        "bundle hash mismatch must reject insertion"
+    );
+    let mut reordered_bundle = new_proposal.clone();
+    reordered_bundle.id = Uuid::new_v4();
+    reordered_bundle.nonce = Uuid::new_v4();
+    reordered_bundle.items.swap(0, 1);
+    assert!(
+        insert_action_proposal(&pool, community, &reordered_bundle)
+            .await
+            .is_err(),
+        "reordering members without a new bundle hash must reject insertion"
+    );
+    insert_action_proposal(&pool, community, &new_proposal)
+        .await
+        .expect("insert atomic cross-provider action bundle");
+    let stored_count: i16 = sqlx::query_scalar(
+        "SELECT member_count FROM external_action_proposals WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load derived member count");
+    assert_eq!(stored_count, 2);
+    let wrong_broker_decision = sqlx::query(
+        "UPDATE external_action_proposals SET status='approved', signer_pubkey=$3, \
+         decision_broker_pubkey=$4, decision_event_hash=$5, decided_at=NOW() \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .bind(&signer)
+    .bind(vec![3_u8; 32])
+    .bind(vec![17_u8; 32])
+    .execute(&pool)
+    .await;
+    assert!(
+        wrong_broker_decision.is_err(),
+        "a decision addressed to another broker must be rejected"
+    );
+    sqlx::query(
+        "UPDATE external_action_proposals SET status='approved', signer_pubkey=$3, \
+         decision_broker_pubkey=$4, decision_event_hash=$5, decided_at=NOW() \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .bind(&signer)
+    .bind(&broker)
+    .bind(vec![17_u8; 32])
+    .execute(&pool)
+    .await
+    .expect("record owner decision addressed to broker");
+    assert!(
+        claim_action_execution(&pool, community, proposal_id, Uuid::new_v4(), Utc::now())
+            .await
+            .is_err(),
+        "proposed members must not dispatch before item-level approval"
+    );
+    sqlx::query(
+        "UPDATE external_action_proposal_items SET status='approved' \
+         WHERE community_id=$1 AND proposal_id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .execute(&pool)
+    .await
+    .expect("approve each displayed member");
+    sqlx::query(
+        "UPDATE approved_source_scopes SET status='paused' \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(google_scope_id)
+    .execute(&pool)
+    .await
+    .expect("pause one member scope");
+    assert!(
+        claim_action_execution(&pool, community, proposal_id, Uuid::new_v4(), Utc::now())
+            .await
+            .is_err(),
+        "a paused member scope must dispatch zero bundle operations"
+    );
+    sqlx::query(
+        "UPDATE approved_source_scopes SET status='active', can_read=true, can_write=false \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(google_scope_id)
+    .execute(&pool)
+    .await
+    .expect("make one member scope read-only");
+    assert!(
+        claim_action_execution(&pool, community, proposal_id, Uuid::new_v4(), Utc::now())
+            .await
+            .is_err(),
+        "a read-only member scope must dispatch zero bundle operations"
+    );
+    sqlx::query(
+        "UPDATE approved_source_scopes \
+         SET status='revoked', revoked_at=NOW(), can_write=true \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(google_scope_id)
+    .execute(&pool)
+    .await
+    .expect("revoke one member scope");
+    assert!(
+        claim_action_execution(&pool, community, proposal_id, Uuid::new_v4(), Utc::now())
+            .await
+            .is_err(),
+        "a revoked member scope must dispatch zero bundle operations"
+    );
+    let attempts_before_authorization: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM external_action_attempts WHERE community_id=$1 AND proposal_id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count attempts after authorization rejection");
+    assert_eq!(attempts_before_authorization, 0);
+    sqlx::query(
+        "UPDATE approved_source_scopes SET status='active', revoked_at=NULL, can_write=true \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(google_scope_id)
+    .execute(&pool)
+    .await
+    .expect("restore writable member scope");
+    sqlx::query("UPDATE connector_accounts SET status='paused' WHERE community_id=$1 AND id=$2")
+        .bind(community.as_uuid())
+        .bind(google_account_id)
+        .execute(&pool)
+        .await
+        .expect("pause one member account");
+    assert!(
+        claim_action_execution(&pool, community, proposal_id, Uuid::new_v4(), Utc::now())
+            .await
+            .is_err(),
+        "a paused connector account must dispatch zero bundle operations"
+    );
+    sqlx::query("UPDATE connector_accounts SET status='active' WHERE community_id=$1 AND id=$2")
+        .bind(community.as_uuid())
+        .bind(google_account_id)
+        .execute(&pool)
+        .await
+        .expect("restore active member account");
+
+    let now = Utc::now();
+    let worker_a = Uuid::new_v4();
+    let worker_b = Uuid::new_v4();
+    assert!(
+        claim_delta_scope(
+            &pool,
+            community,
+            account_id,
+            scope_id,
+            "items",
+            worker_a,
+            chrono::DateTime::<Utc>::MAX_UTC,
+            StdDuration::from_secs(30),
+        )
+        .await
+        .is_err(),
+        "extreme delta lease timestamp must return an error rather than panic"
+    );
+    let (a, b) = tokio::join!(
+        claim_action_execution(&pool, community, proposal_id, worker_a, now),
+        claim_action_execution(&pool, community, proposal_id, worker_b, now)
+    );
+    let claims = [
+        a.expect("first action claim"),
+        b.expect("second action claim"),
+    ];
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+    let claim = claims.into_iter().flatten().next().expect("one claim");
+    assert_eq!(claim.canonical_proposal, new_proposal.canonical_proposal);
+    assert_eq!(claim.operation_hash, new_proposal.operation_hash);
+    assert_eq!(
+        claim.ordered_members_hash,
+        new_proposal.ordered_members_hash
+    );
+    assert_eq!(claim.broker_pubkey, broker);
+    assert_eq!(
+        claim.proposed_at.timestamp_micros(),
+        proposed_at.timestamp_micros()
+    );
+    assert_eq!(claim.member_count, 2);
+    assert_eq!(claim.items.len(), 2);
+    assert_eq!(claim.items[0].item_index, 0);
+    assert_eq!(claim.items[0].operation_id, operation_ids[0]);
+    assert_eq!(claim.items[0].scope_id, scope_id);
+    assert_eq!(claim.items[0].idempotency_key, member_idempotency_keys[0]);
+    assert_eq!(
+        claim.items[0].operation,
+        ExternalOperation::OutlookCreateDraft
+    );
+    assert_eq!(
+        claim.items[0].canonical_operation_hash,
+        new_proposal.items[0].canonical_operation_hash
+    );
+    assert!(claim.items[0].expected_remote_version.is_none());
+    assert_eq!(claim.items[1].item_index, 1);
+    assert_eq!(claim.items[1].operation_id, operation_ids[1]);
+    assert_eq!(claim.items[1].scope_id, google_scope_id);
+    assert_eq!(claim.items[1].idempotency_key, member_idempotency_keys[1]);
+    assert_eq!(claim.items[1].operation, ExternalOperation::GoogleEditDoc);
+    assert_eq!(
+        claim.items[1].canonical_operation_hash,
+        new_proposal.items[1].canonical_operation_hash
+    );
+    assert_eq!(
+        claim.items[1].expected_remote_version.as_deref(),
+        Some("etag-1")
+    );
+    assert_eq!(claim.nonce.get_version_num(), 4);
+    let unbound_attempt = sqlx::query(
+        "INSERT INTO external_action_attempts \
+         (community_id, proposal_id, item_index, claim_id, attempt_number, started_at) \
+         VALUES ($1, $2, 0, $3, 2, NOW())",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(
+        unbound_attempt.is_err(),
+        "attempt claim_id must match the proposal's one-time claim"
+    );
+    let missing_member_attempt = sqlx::query(
+        "INSERT INTO external_action_attempts \
+         (community_id, proposal_id, item_index, claim_id, attempt_number, started_at) \
+         VALUES ($1, $2, 49, $3, 2, NOW())",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .bind(claim.claim_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        missing_member_attempt.is_err(),
+        "an attempt cannot splice in a member absent from the approved bundle"
+    );
+    let attempts = sqlx::query(
+        "SELECT item_index, id FROM external_action_attempts \
+         WHERE community_id=$1 AND proposal_id=$2 ORDER BY item_index",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .fetch_all(&pool)
+    .await
+    .expect("load per-member attempts");
+    let attempt_0: Uuid = attempts[0].try_get("id").expect("first attempt id");
+    let attempt_1: Uuid = attempts[1].try_get("id").expect("second attempt id");
+    let spliced_receipt = sqlx::query(
+        "INSERT INTO external_action_receipts \
+         (community_id, proposal_id, item_index, operation_id, member_hash, attempt_id, remote_result_id, remote_version, outcome) \
+         VALUES ($1, $2, 0, $3, $4, $5, 'draft-123', 'etag-2', 'succeeded')",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .bind(claim.items[0].operation_id)
+    .bind(&claim.items[0].member_hash)
+    .bind(attempt_1)
+    .execute(&pool)
+    .await;
+    assert!(
+        spliced_receipt.is_err(),
+        "a receipt for one member cannot cite another member's attempt"
+    );
+    let url_result_id = sqlx::query(
+        "INSERT INTO external_action_receipts \
+         (community_id, proposal_id, item_index, operation_id, member_hash, attempt_id, remote_result_id, remote_version, outcome) \
+         VALUES ($1, $2, 0, $3, $4, $5, 'https://graph.invalid/draft/123', 'etag-2', 'succeeded')",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .bind(claim.items[0].operation_id)
+    .bind(&claim.items[0].member_hash)
+    .bind(attempt_0)
+    .execute(&pool)
+    .await;
+    assert!(
+        url_result_id.is_err(),
+        "receipt result IDs must not store URLs"
+    );
+    assert!(sqlx::query(
+        "INSERT INTO external_action_receipts \
+         (community_id, proposal_id, item_index, operation_id, member_hash, attempt_id, outcome, reconciliation_state) \
+         VALUES ($1, $2, 1, $3, $4, $5, 'failed', 'pending')",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .bind(claim.items[1].operation_id)
+    .bind(&claim.items[1].member_hash)
+    .bind(attempt_1)
+    .execute(&pool)
+    .await
+    .is_err(), "ordinary outcomes cannot carry a reconciliation workflow state");
+    assert!(sqlx::query(
+        "INSERT INTO external_action_receipts \
+         (community_id, proposal_id, item_index, operation_id, member_hash, attempt_id, outcome, reconciliation_state) \
+         VALUES ($1, $2, 1, $3, $4, $5, 'reconciliation_required', 'reconciled')",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .bind(claim.items[1].operation_id)
+    .bind(&claim.items[1].member_hash)
+    .bind(attempt_1)
+    .execute(&pool)
+    .await
+    .is_err(), "reconciliation_required cannot claim a reconciled protocol status");
+    assert!(
+        sqlx::query(
+            "INSERT INTO external_action_receipts \
+             (community_id, proposal_id, item_index, operation_id, member_hash, attempt_id, \
+              remote_result_id, remote_version, outcome, reconciliation_state) \
+             VALUES ($1, $2, 0, $3, $4, $5, 'draft-reconciled', 'etag-3', \
+                     'succeeded', 'reconciled')",
+        )
+        .bind(community.as_uuid())
+        .bind(proposal_id)
+        .bind(claim.items[0].operation_id)
+        .bind(&claim.items[0].member_hash)
+        .bind(attempt_0)
+        .execute(&pool)
+        .await
+        .is_err(),
+        "reconciled receipt state must require reconciled_at"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO external_action_receipts \
+             (community_id, proposal_id, item_index, operation_id, member_hash, attempt_id, \
+              outcome, reconciliation_state, reconciled_at) \
+             VALUES ($1, $2, 1, $3, $4, $5, 'reconciliation_required', 'pending', NOW())",
+        )
+        .bind(community.as_uuid())
+        .bind(proposal_id)
+        .bind(claim.items[1].operation_id)
+        .bind(&claim.items[1].member_hash)
+        .bind(attempt_1)
+        .execute(&pool)
+        .await
+        .is_err(),
+        "pending receipt state must reject reconciled_at"
+    );
+    sqlx::query(
+        "INSERT INTO external_action_receipts \
+         (community_id, proposal_id, item_index, operation_id, member_hash, attempt_id, remote_result_id, remote_version, outcome, reconciliation_state) \
+         VALUES ($1, $2, 0, $3, $4, $5, 'draft-123', 'etag-2', 'succeeded', 'not_required'), \
+                ($1, $2, 1, $6, $7, $8, NULL, NULL, 'reconciliation_required', 'pending')",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .bind(claim.items[0].operation_id)
+    .bind(&claim.items[0].member_hash)
+    .bind(attempt_0)
+    .bind(claim.items[1].operation_id)
+    .bind(&claim.items[1].member_hash)
+    .bind(attempt_1)
+    .execute(&pool)
+    .await
+    .expect("record honest partial bundle outcomes");
+    sqlx::query(
+        "UPDATE external_action_receipts \
+         SET reconciliation_state='reconciled', reconciled_at=NOW() \
+         WHERE community_id=$1 AND proposal_id=$2 AND item_index=0",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .execute(&pool)
+    .await
+    .expect("record valid succeeded and reconciled receipt");
+    sqlx::query(
+        "UPDATE external_action_receipts SET reconciliation_state='manual_review' \
+         WHERE community_id=$1 AND proposal_id=$2 AND item_index=1",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .execute(&pool)
+    .await
+    .expect("record valid reconciliation-required manual-review receipt");
+    sqlx::query(
+        "UPDATE external_action_receipts \
+         SET outcome='failed', reconciliation_state='not_required' \
+         WHERE community_id=$1 AND proposal_id=$2 AND item_index=1",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .execute(&pool)
+    .await
+    .expect("record valid failed and not-required receipt");
+    let partial_outcomes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT outcome) FROM external_action_receipts \
+         WHERE community_id=$1 AND proposal_id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count distinct per-member outcomes");
+    assert_eq!(partial_outcomes, 2);
+    assert!(mark_action_timeout_for_reconciliation(
+        &pool,
+        community,
+        proposal_id,
+        claim.claim_id,
+        Utc::now(),
+    )
+    .await
+    .expect("mark timeout"));
+    assert!(
+        claim_action_execution(&pool, community, proposal_id, Uuid::new_v4(), Utc::now())
+            .await
+            .expect("claim after timeout")
+            .is_none(),
+        "a timeout must not reopen a blind retry"
+    );
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres with pgvector"]
+async fn cursor_leases_recover_by_generation_and_reject_stale_completion() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, _) = seed_community(&pool, "cursor").await;
+    let account_id = Uuid::new_v4();
+    let scope_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO connector_accounts \
+         (community_id, id, provider, owner_pubkey, external_account_id, credential_reference) \
+         VALUES ($1, $2, 'google_drive', $3, $4, $5)",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(vec![3_u8; 32])
+    .bind(format!("account-{account_id}"))
+    .bind(format!("kv-account-{account_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert cursor account");
+    sqlx::query(
+        "INSERT INTO approved_source_scopes \
+         (community_id, id, account_id, external_scope_id, scope_type, can_read, can_write) \
+         VALUES ($1, $2, $3, $4, 'shared_drive', true, false)",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .bind(account_id)
+    .bind(format!("scope-{scope_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert cursor scope");
+    sqlx::query(
+        "INSERT INTO connector_delta_cursors \
+         (community_id, account_id, scope_id, stream, encrypted_cursor, cursor_integrity_hash, cursor_key_version) \
+         VALUES ($1, $2, $3, 'items', $4, $5, 1)",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(scope_id)
+    .bind(vec![1_u8; 24])
+    .bind(vec![2_u8; 32])
+    .execute(&pool)
+    .await
+    .expect("insert encrypted cursor");
+
+    let now = Utc::now();
+    let worker_a = Uuid::new_v4();
+    let worker_b = Uuid::new_v4();
+    for invalid_stream in [
+        "https://graph.invalid/delta?token=secret".to_owned(),
+        "items\nsecret".to_owned(),
+        "x".repeat(129),
+    ] {
+        assert!(claim_delta_scope(
+            &pool,
+            community,
+            account_id,
+            scope_id,
+            &invalid_stream,
+            worker_a,
+            now,
+            StdDuration::from_secs(30),
+        )
+        .await
+        .is_err());
+    }
+    assert!(
+        sqlx::query(
+            "UPDATE approved_source_scopes SET can_read=false, can_write=true \
+         WHERE community_id=$1 AND id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(scope_id)
+        .execute(&pool)
+        .await
+        .is_err(),
+        "write-only connector scopes must be rejected by the database"
+    );
+    sqlx::query(
+        "UPDATE approved_source_scopes SET can_read=true, status='paused' \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .execute(&pool)
+    .await
+    .expect("pause cursor scope");
+    assert!(claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_a,
+        now,
+        StdDuration::from_secs(30),
+    )
+    .await
+    .expect("paused claim")
+    .is_none());
+    sqlx::query(
+        "UPDATE approved_source_scopes SET status='revoked', revoked_at=NOW() \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .execute(&pool)
+    .await
+    .expect("revoke cursor scope");
+    assert!(claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_a,
+        now,
+        StdDuration::from_secs(30),
+    )
+    .await
+    .expect("revoked claim")
+    .is_none());
+    sqlx::query(
+        "UPDATE approved_source_scopes SET status='active', revoked_at=NULL \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .execute(&pool)
+    .await
+    .expect("restore cursor scope");
+    let first = claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_a,
+        now,
+        StdDuration::from_secs(30),
+    )
+    .await
+    .expect("claim initial cursor")
+    .expect("initial cursor lease");
+    assert!(claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_a,
+        now,
+        StdDuration::from_secs(30),
+    )
+    .await
+    .expect("same-worker duplicate cursor claim")
+    .is_none());
+    assert!(claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_b,
+        now,
+        StdDuration::from_secs(30),
+    )
+    .await
+    .expect("contended cursor claim")
+    .is_none());
+    assert!(!fail_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_b,
+        first.generation,
+        "provider.transient",
+        now + Duration::seconds(1),
+        StdDuration::from_secs(20),
+    )
+    .await
+    .expect("reject stale-worker delta failure"));
+    assert!(fail_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_a,
+        first.generation,
+        "https://provider.invalid?secret=1",
+        now + Duration::seconds(1),
+        StdDuration::from_secs(20),
+    )
+    .await
+    .is_err());
+    assert!(fail_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_a,
+        first.generation,
+        "provider.transient",
+        now + Duration::seconds(1),
+        StdDuration::from_secs(20),
+    )
+    .await
+    .expect("fail current delta lease"));
+    assert!(claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_b,
+        now + Duration::seconds(20),
+        StdDuration::from_secs(30),
+    )
+    .await
+    .expect("claim before retry delay")
+    .is_none());
+    let recovered = claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_b,
+        now + Duration::seconds(21),
+        StdDuration::from_secs(30),
+    )
+    .await
+    .expect("recover cursor lease")
+    .expect("expired cursor lease can recover");
+    assert_eq!(recovered.generation, first.generation + 1);
+    assert!(!complete_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_a,
+        first.generation,
+        &[3_u8; 24],
+        &[4_u8; 32],
+        2,
+        now + Duration::seconds(22),
+    )
+    .await
+    .expect("stale cursor completion"));
+    assert!(complete_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "items",
+        worker_b,
+        recovered.generation,
+        &[5_u8; 24],
+        &[6_u8; 32],
+        2,
+        now + Duration::seconds(22),
+    )
+    .await
+    .expect("current cursor completion"));
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres with pgvector"]
+async fn audit_export_retry_preserves_order_and_checkpoints_before_export() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, _) = seed_community(&pool, "audit").await;
+    let version = AuditObjectVersion::new("v1").expect("valid version marker");
+    for marker in 1_u8..=3 {
+        append_audit_entry(
+            &pool,
+            community,
+            AuditEnvelope {
+                event_type: AuditEventType::SourceSync,
+                entity_type: AuditEntityType::SourceItem,
+                entity_id: Uuid::from_u128(u128::from(marker)),
+                object_hash: &[marker; 32],
+                version: Some(&version),
+                occurred_at: Utc::now() + Duration::seconds(i64::from(marker)),
+                outcome: AuditOutcome::Accepted,
+            },
+        )
+        .await
+        .expect("append audit entry");
+    }
+    assert!(
+        sqlx::query(
+            "INSERT INTO core_audit_outbox \
+         (community_id, sequence, event_type, entity_type, entity_id, object_hash, object_version, \
+          occurred_at, outcome, prior_entry_hash, entry_hash) \
+         VALUES ($1, 5, 'source_sync', 'source_item', $2, $3, 'v1', NOW(), \
+                 'accepted', $4, $5)",
+        )
+        .bind(community.as_uuid())
+        .bind(Uuid::new_v4())
+        .bind(vec![71_u8; 32])
+        .bind(vec![72_u8; 32])
+        .bind(vec![73_u8; 32])
+        .execute(&pool)
+        .await
+        .is_err(),
+        "database must reject an audit sequence/predecessor gap"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE core_audit_outbox SET object_hash=$2 \
+         WHERE community_id=$1 AND sequence=1",
+        )
+        .bind(community.as_uuid())
+        .bind(vec![74_u8; 32])
+        .execute(&pool)
+        .await
+        .is_err(),
+        "database must reject audit envelope mutation"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE core_audit_outbox SET export_state='exported', exported_at=NOW() \
+         WHERE community_id=$1 AND sequence=3",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "database must reject a skipped audit export transition"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE core_audit_outbox \
+         SET export_state='claimed', export_batch_id=$2, export_claimed_by=$3, \
+             export_claimed_at=NOW(), export_claim_until=NOW() + INTERVAL '30 seconds' \
+         WHERE community_id=$1 AND sequence=3",
+        )
+        .bind(community.as_uuid())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "database must reject claiming an unsigned audit row"
+    );
+    assert!(
+        sqlx::query("DELETE FROM core_audit_outbox WHERE community_id=$1 AND sequence=3",)
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .is_err(),
+        "database must reject audit outbox deletion"
+    );
+
+    let worker = Uuid::new_v4();
+    let now = Utc::now() + Duration::seconds(10);
+    assert!(
+        claim_audit_export_batch(
+            &pool,
+            community,
+            worker,
+            chrono::DateTime::<Utc>::MAX_UTC,
+            StdDuration::from_secs(30),
+            3,
+        )
+        .await
+        .is_err(),
+        "extreme audit lease timestamp must return an error rather than panic"
+    );
+    sqlx::query(
+        "UPDATE core_audit_outbox SET signing_state='signed', signer_identifier='audit-signer-v1', \
+         signature=$2 WHERE community_id=$1 AND sequence=2",
+    )
+    .bind(community.as_uuid())
+    .bind(vec![22_u8; 64])
+    .execute(&pool)
+    .await
+    .expect("sign later audit row");
+    assert!(
+        sqlx::query(
+            "UPDATE core_audit_outbox SET signature=$2 \
+         WHERE community_id=$1 AND sequence=2",
+        )
+        .bind(community.as_uuid())
+        .bind(vec![99_u8; 64])
+        .execute(&pool)
+        .await
+        .is_err(),
+        "database must reject mutation of a signed audit signature"
+    );
+    assert!(
+        claim_audit_export_batch(&pool, community, worker, now, StdDuration::from_secs(30), 3,)
+            .await
+            .expect("unsigned-head audit claim")
+            .is_none(),
+        "an unsigned chain head must block later signed rows"
+    );
+    sqlx::query(
+        "UPDATE core_audit_outbox SET signing_state='signed', signer_identifier='audit-signer-v1', \
+         signature=$2 WHERE community_id=$1 AND sequence=1",
+    )
+    .bind(community.as_uuid())
+    .bind(vec![21_u8; 64])
+    .execute(&pool)
+    .await
+    .expect("sign audit head");
+    let first =
+        claim_audit_export_batch(&pool, community, worker, now, StdDuration::from_secs(30), 3)
+            .await
+            .expect("claim audit batch")
+            .expect("audit batch available");
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(first.entries.iter().all(|entry| {
+        entry.signing_state == "signed"
+            && entry.signer_identifier.as_deref() == Some("audit-signer-v1")
+            && entry
+                .signature
+                .as_ref()
+                .is_some_and(|value| value.len() == 64)
+    }));
+    assert!(retry_audit_export_batch(
+        &pool,
+        community,
+        first.batch_id,
+        now + Duration::seconds(31),
+    )
+    .await
+    .expect("retry audit batch"));
+    sqlx::query(
+        "UPDATE core_audit_outbox SET signing_state='signed', signer_identifier='audit-signer-v1', \
+         signature=$2 WHERE community_id=$1 AND sequence=3",
+    )
+    .bind(community.as_uuid())
+    .bind(vec![23_u8; 64])
+    .execute(&pool)
+    .await
+    .expect("sign final audit row");
+    let retried = claim_audit_export_batch(
+        &pool,
+        community,
+        worker,
+        now + Duration::seconds(31),
+        StdDuration::from_secs(30),
+        2,
+    )
+    .await
+    .expect("reclaim audit batch")
+    .expect("retried audit batch available");
+    assert_eq!(
+        retried
+            .entries
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(complete_audit_export_batch(
+        &pool,
+        community,
+        retried.batch_id,
+        "https://vault.invalid/audit?sig=secret",
+        &[43_u8; 32],
+        "etag-secret",
+        now + Duration::seconds(32),
+    )
+    .await
+    .is_err());
+    assert!(complete_audit_export_batch(
+        &pool,
+        community,
+        retried.batch_id,
+        "audit/2026-08-03/sequence-1-2.ndjson",
+        &[44_u8; 32],
+        "etag-immutable",
+        now + Duration::seconds(32),
+    )
+    .await
+    .expect("complete audit export"));
+    let final_batch = claim_audit_export_batch(
+        &pool,
+        community,
+        worker,
+        now + Duration::seconds(33),
+        StdDuration::from_secs(30),
+        3,
+    )
+    .await
+    .expect("claim second audit batch")
+    .expect("final signed row available");
+    assert_eq!(
+        final_batch
+            .entries
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+    assert!(complete_audit_export_batch(
+        &pool,
+        community,
+        final_batch.batch_id,
+        "audit/2026-08-03/sequence-3.ndjson",
+        &[45_u8; 32],
+        "etag-immutable-2",
+        now + Duration::seconds(34),
+    )
+    .await
+    .expect("complete second audit export"));
+    let checkpoint: (i64, Vec<u8>) = sqlx::query_as(
+        "SELECT last_exported_sequence, last_entry_hash FROM core_audit_checkpoints \
+         WHERE community_id=$1 ORDER BY last_exported_sequence DESC LIMIT 1",
+    )
+    .bind(community.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .expect("read durable checkpoint");
+    assert_eq!(checkpoint.0, 3);
+    let checkpoint_history: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM core_audit_checkpoints WHERE community_id=$1")
+            .bind(community.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("count immutable checkpoint history");
+    assert_eq!(checkpoint_history, 2);
+    let sequence_one_hash: Vec<u8> = sqlx::query_scalar(
+        "SELECT entry_hash FROM core_audit_outbox WHERE community_id=$1 AND sequence=1",
+    )
+    .bind(community.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .expect("read prior audit hash for checkpoint backfill test");
+    assert!(
+        sqlx::query(
+            "INSERT INTO core_audit_checkpoints \
+         (community_id, last_exported_sequence, last_entry_hash, blob_object_key, \
+          blob_content_hash, blob_etag, checkpointed_at) \
+         VALUES ($1, 1, $2, 'audit/backfill.ndjson', $3, 'backfill', NOW())",
+        )
+        .bind(community.as_uuid())
+        .bind(sequence_one_hash)
+        .bind(vec![98_u8; 32])
+        .execute(&pool)
+        .await
+        .is_err(),
+        "database must reject a backfilled audit checkpoint"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE core_audit_checkpoints SET blob_etag='mutated' \
+         WHERE community_id=$1 AND last_exported_sequence=3",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "database must reject checkpoint mutation"
+    );
+    assert!(
+        sqlx::query(
+            "DELETE FROM core_audit_checkpoints \
+         WHERE community_id=$1 AND last_exported_sequence=3",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "database must reject checkpoint deletion"
+    );
+    let exported_before_checkpoint: i64 = sqlx::query(
+        "SELECT count(*) AS count FROM core_audit_outbox o \
+         WHERE o.community_id=$1 AND o.export_state='exported' \
+           AND NOT EXISTS (SELECT 1 FROM core_audit_checkpoints c \
+                           WHERE c.community_id=o.community_id \
+                             AND c.last_exported_sequence >= o.sequence)",
+    )
+    .bind(community.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .expect("check export/checkpoint ordering")
+    .get("count");
+    assert_eq!(exported_before_checkpoint, 0);
+
+    drop_scratch_db(&admin, pool, &name).await;
+}

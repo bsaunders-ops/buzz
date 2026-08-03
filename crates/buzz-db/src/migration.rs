@@ -515,6 +515,137 @@ mod tests {
             .collect()
     }
 
+    const CORE_MONTH1_TABLES: &[&str] = &[
+        "core_identity_bindings",
+        "connector_accounts",
+        "approved_source_scopes",
+        "connector_delta_cursors",
+        "embedding_versions",
+        "source_items",
+        "source_chunks",
+        "source_item_acls",
+        "assistant_insights",
+        "insight_daily_budgets",
+        "external_action_proposals",
+        "external_action_proposal_items",
+        "external_action_attempts",
+        "external_action_receipts",
+        "learning_revisions",
+        "learning_feedback",
+        "learning_heads",
+        "core_audit_outbox",
+        "core_audit_checkpoints",
+    ];
+
+    fn core_month1_definitions(sql: &str) -> Vec<(String, Vec<String>)> {
+        create_table_definitions(sql)
+            .into_iter()
+            .filter(|(table, _)| CORE_MONTH1_TABLES.contains(&table.as_str()))
+            .collect()
+    }
+
+    fn forbidden_secret_columns(sql: &str) -> Vec<String> {
+        const DENIED_COLUMN_FRAGMENTS: &[&str] = &[
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "openai_key",
+            "service_credential",
+            "private_key",
+            "signing_key",
+            "windows_key",
+            "delta_url",
+            "cursor_url",
+        ];
+
+        core_month1_definitions(sql)
+            .into_iter()
+            .flat_map(|(table, definitions)| {
+                definitions.into_iter().filter_map(move |definition| {
+                    let column = column_definition_name(&definition)?;
+                    DENIED_COLUMN_FRAGMENTS
+                        .iter()
+                        .any(|fragment| column.contains(fragment))
+                        .then(|| format!("{table}.{column}"))
+                })
+            })
+            .collect()
+    }
+
+    fn forbidden_audit_payload_columns(sql: &str) -> Vec<String> {
+        const DENIED_AUDIT_FRAGMENTS: &[&str] = &[
+            "prompt",
+            "content",
+            "body",
+            "chunk",
+            "transcript",
+            "token",
+            "mnpi",
+            "raw_",
+        ];
+
+        core_month1_definitions(sql)
+            .into_iter()
+            .filter(|(table, _)| table == "core_audit_outbox")
+            .flat_map(|(table, definitions)| {
+                definitions.into_iter().filter_map(move |definition| {
+                    let column = column_definition_name(&definition)?;
+                    DENIED_AUDIT_FRAGMENTS
+                        .iter()
+                        .any(|fragment| column.contains(fragment))
+                        .then(|| format!("{table}.{column}"))
+                })
+            })
+            .collect()
+    }
+
+    fn missing_required_state_checks(sql: &str) -> Vec<String> {
+        const REQUIRED: &[(&str, &str)] = &[
+            ("core_identity_bindings", "lifecycle_state"),
+            ("connector_accounts", "status"),
+            ("approved_source_scopes", "status"),
+            ("assistant_insights", "status"),
+            ("external_action_proposals", "status"),
+            ("external_action_attempts", "outcome"),
+            ("external_action_receipts", "reconciliation_state"),
+            ("learning_revisions", "state"),
+            ("learning_feedback", "outcome"),
+            ("learning_heads", "state"),
+            ("core_audit_outbox", "export_state"),
+        ];
+
+        let definitions = core_month1_definitions(sql);
+        REQUIRED
+            .iter()
+            .filter_map(|(table, column)| {
+                let checked = definitions
+                    .iter()
+                    .find(|(candidate, _)| candidate == table)
+                    .is_some_and(|(_, definitions)| {
+                        definitions.iter().any(|definition| {
+                            let normalized = normalize_sql(definition);
+                            normalized.contains("check") && normalized.contains(column)
+                        })
+                    });
+                (!checked).then(|| format!("{table}.{column}"))
+            })
+            .collect()
+    }
+
+    fn non_composite_tenant_relationships(sql: &str) -> Vec<String> {
+        let scoped = scoped_tables(sql);
+        scoped_constraint_lints(sql, &scoped)
+            .into_iter()
+            .filter(|constraint| constraint.kind == ConstraintKind::ForeignKey)
+            .filter(|constraint| CORE_MONTH1_TABLES.contains(&constraint.table.as_str()))
+            .filter(|constraint| {
+                constraint.columns.len() < 2
+                    && !normalize_sql(&constraint.description).contains("references communities")
+            })
+            .map(|constraint| format!("{}.{}", constraint.table, constraint.description))
+            .collect()
+    }
+
     fn has_channels_community_id_immutability_guard(sql: &str) -> bool {
         let normalized = normalize_sql(sql);
         normalized.contains("create trigger")
@@ -561,7 +692,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 26);
+        assert_eq!(migrations.len(), 27);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -919,6 +1050,318 @@ mod tests {
         assert!(heartbeat.contains("epoch"));
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
+
+        assert_eq!(migrations[26].version, 27);
+        let core_storage = migrations[26].sql.as_str();
+        assert!(core_storage.contains("CREATE EXTENSION IF NOT EXISTS vector"));
+        for table in CORE_MONTH1_TABLES {
+            assert!(
+                core_storage.contains(&format!("CREATE TABLE {table}")),
+                "migration 0027 must create {table}"
+            );
+        }
+        for private_kind in [44_300, 44_301, 44_310, 44_311, 44_312, 44_210, 30_179] {
+            assert!(
+                core_storage.contains(&private_kind.to_string()),
+                "migration 0027 must exclude private kind {private_kind} from events.search_tsv"
+            );
+        }
+        assert!(core_storage.contains("existing_expression"));
+        assert!(core_storage.contains("ELSE (%s) END"));
+    }
+
+    #[test]
+    fn migration_lint_detects_forbidden_secret_columns() {
+        let sql = r#"
+            CREATE TABLE connector_accounts (
+                community_id UUID NOT NULL,
+                id UUID NOT NULL,
+                oauth_access_token TEXT NOT NULL,
+                PRIMARY KEY (community_id, id)
+            );
+        "#;
+
+        assert_eq!(
+            forbidden_secret_columns(sql),
+            vec!["connector_accounts.oauth_access_token"]
+        );
+    }
+
+    #[test]
+    fn core_month1_storage_has_no_secret_or_sensitive_audit_columns() {
+        let sql = migration_sql();
+        assert_eq!(
+            core_month1_definitions(&sql).len(),
+            CORE_MONTH1_TABLES.len()
+        );
+        assert!(
+            forbidden_secret_columns(&sql).is_empty(),
+            "connector secrets must never be stored: {:?}",
+            forbidden_secret_columns(&sql)
+        );
+        assert!(
+            forbidden_audit_payload_columns(&sql).is_empty(),
+            "audit outbox must contain typed metadata only: {:?}",
+            forbidden_audit_payload_columns(&sql)
+        );
+    }
+
+    #[test]
+    fn core_month1_storage_requires_composite_tenant_relationships_and_state_checks() {
+        let sql = migration_sql();
+        assert!(
+            non_composite_tenant_relationships(&sql).is_empty(),
+            "tenant relationships must include community_id: {:?}",
+            non_composite_tenant_relationships(&sql)
+        );
+        assert!(
+            missing_required_state_checks(&sql).is_empty(),
+            "state columns must be constrained: {:?}",
+            missing_required_state_checks(&sql)
+        );
+    }
+
+    #[test]
+    fn core_month1_embeddings_use_indexed_pgvector_storage() {
+        let sql = normalize_sql(&migration_sql());
+        assert!(sql.contains("from pg_available_extensions where name = 'vector'"));
+        assert!(sql.contains("create extension if not exists vector"));
+        assert!(sql.contains("dimensions = 384"));
+        assert!(sql.contains("embedding vector(384)"));
+        assert!(
+            sql.contains("using hnsw (embedding vector_cosine_ops)"),
+            "local embeddings need a pgvector ANN index"
+        );
+    }
+
+    #[test]
+    fn core_month1_schema_binds_accounts_scopes_users_learning_and_actions() {
+        let sql = normalize_sql(&migration_sql());
+        assert!(sql.contains("'microsoft_graph', 'google_drive', 'core_crm'"));
+        for relationship in [
+            "foreign key (community_id, buzz_pubkey) references users (community_id, pubkey)",
+            "foreign key (community_id, owner_pubkey) references users (community_id, pubkey)",
+            "foreign key (community_id, account_id, scope_id) references approved_source_scopes (community_id, account_id, id)",
+        ] {
+            assert!(sql.contains(relationship), "missing relationship: {relationship}");
+        }
+        assert!(sql.contains("unique (community_id, account_id, id)"));
+        assert!(sql.contains("create unique index idx_learning_revisions_personal_identity"));
+        assert!(sql.contains("create unique index idx_learning_revisions_firm_identity"));
+        assert!(sql.contains("create unique index idx_learning_heads_personal_identity"));
+        assert!(sql.contains("create unique index idx_learning_heads_firm_identity"));
+        assert!(sql.contains("unique (community_id, sequence, entry_hash)"));
+        assert!(sql.contains("expires_at <= proposed_at + interval '15 minutes'"));
+        assert!(sql.contains("nonce uuid not null check (uuid_extract_version(nonce) = 4)"));
+    }
+
+    #[test]
+    fn core_month1_actions_audit_and_relationships_are_closed_and_non_spliceable() {
+        let sql = normalize_sql(&migration_sql());
+        for operation in [
+            "crm/add_note",
+            "crm/log_activity",
+            "crm/create_contact",
+            "crm/update_contact",
+            "crm/create_company",
+            "crm/update_company",
+            "crm/create_manual_task",
+            "crm/update_manual_task",
+            "crm/complete_manual_task",
+            "crm/create_project",
+            "crm/update_project",
+            "crm/add_tag",
+            "crm/link_granola_record",
+            "outlook/create_draft",
+            "outlook/update_buzz_owned_draft",
+            "outlook/attach_existing_file",
+            "outlook/attach_drive_link",
+            "google/create_doc",
+            "google/create_sheet",
+            "google/create_simple_slides",
+            "google/edit_doc",
+            "google/edit_sheet_range",
+            "google/replace_slides_text",
+        ] {
+            assert!(
+                sql.contains(&format!("'{operation}'")),
+                "missing operation {operation}"
+            );
+        }
+        for relationship in [
+            "foreign key (community_id, connector_account_id, buzz_pubkey) references connector_accounts (community_id, id, owner_pubkey)",
+            "foreign key (community_id, account_id, connector, owner_pubkey) references connector_accounts (community_id, id, provider, owner_pubkey)",
+            "foreign key (community_id, proposal_id, item_index, attempt_id) references external_action_attempts (community_id, proposal_id, item_index, id)",
+            "foreign key (community_id, active_revision_id, layer, owner_discriminator, domain, base_policy_version)",
+            "foreign key (community_id, rollback_revision_id, layer, owner_discriminator, domain, base_policy_version)",
+        ] {
+            assert!(sql.contains(relationship), "missing anti-splicing relationship: {relationship}");
+        }
+        assert!(sql.contains("object_version ~ '^[a-za-z0-9][a-za-z0-9._:-]{0,127}$'"));
+        assert!(sql.contains("signing_state = 'signed' and signer_identifier is not null"));
+        assert!(sql.contains("octet_length(signature) = 64"));
+        assert!(sql.contains("export_state = 'exported'"));
+        assert!(sql.contains("and exported_at is not null"));
+        assert!(sql.contains("export_state in ('pending', 'retry')"));
+    }
+
+    #[test]
+    fn core_identity_binding_keeps_history_with_one_live_entra_binding() {
+        let sql = normalize_sql(&migration_sql());
+        assert!(!sql.contains("unique (community_id, entra_object_id)"));
+        assert!(sql.contains("create unique index idx_core_identity_bindings_live_entra"));
+        assert!(sql.contains("on core_identity_bindings (community_id, entra_object_id)"));
+        assert!(sql.contains("where lifecycle_state in ('challenged', 'active')"));
+        assert!(sql.contains("unique (community_id, buzz_pubkey)"));
+        assert!(sql.contains(
+            "foreign key (community_id, revoked_by_pubkey) references users (community_id, pubkey)"
+        ));
+    }
+
+    #[test]
+    fn external_actions_bind_owner_private_channel_decision_and_attempt_claim() {
+        let sql = normalize_sql(&migration_sql());
+        for relationship in [
+            "foreign key (community_id, account_id, connector, owner_pubkey)",
+            "references connector_accounts (community_id, id, provider, owner_pubkey)",
+            "foreign key (community_id, channel_id, channel_visibility)",
+            "references channels (community_id, id, visibility)",
+            "foreign key (community_id, channel_id, owner_pubkey) references channel_members (community_id, channel_id, pubkey)",
+            "foreign key (community_id, proposal_id, claim_id) references external_action_proposals (community_id, id, execution_claim_id)",
+        ] {
+            assert!(sql.contains(relationship), "missing action binding: {relationship}");
+        }
+        assert!(sql.contains("channel_visibility = 'private'"));
+        assert!(sql.contains("decision_event_hash"));
+        assert!(sql.contains("signer_pubkey = owner_pubkey"));
+    }
+
+    #[test]
+    fn external_action_bundles_are_normalized_and_bind_per_item_outcomes() {
+        let sql = normalize_sql(&migration_sql());
+        for contract in [
+            "create table external_action_proposal_items",
+            "canonical_proposal bytea not null check (octet_length(canonical_proposal) between 1 and 65535)",
+            "operation_hash bytea not null check (octet_length(operation_hash) = 32)",
+            "ordered_members_hash bytea not null check (octet_length(ordered_members_hash) = 32)",
+            "member_count smallint not null check (member_count between 1 and 10)",
+            "primary key (community_id, proposal_id, item_index)",
+            "unique (community_id, proposal_id, member_hash)",
+            "foreign key (community_id, proposal_id, owner_pubkey) references external_action_proposals (community_id, id, owner_pubkey)",
+            "foreign key (community_id, account_id, connector, owner_pubkey) references connector_accounts (community_id, id, provider, owner_pubkey)",
+            "foreign key (community_id, account_id, scope_id) references approved_source_scopes (community_id, account_id, id)",
+            "foreign key (community_id, proposal_id, item_index) references external_action_proposal_items (community_id, proposal_id, item_index)",
+            "foreign key (community_id, proposal_id, item_index, member_hash, operation_id) references external_action_proposal_items (community_id, proposal_id, item_index, member_hash, operation_id)",
+            "foreign key (community_id, proposal_id, item_index, attempt_id) references external_action_attempts (community_id, proposal_id, item_index, id)",
+        ] {
+            assert!(sql.contains(contract), "missing bundle binding: {contract}");
+        }
+        for field in [
+            "item_index smallint not null",
+            "operation_id uuid not null",
+            "account_id uuid not null",
+            "scope_id uuid not null",
+            "target_hash bytea not null",
+            "canonical_operation bytea not null",
+            "canonical_operation_hash bytea not null",
+            "before_hash bytea",
+            "after_hash bytea",
+            "expected_remote_version text",
+            "idempotency_key uuid not null",
+            "member_hash bytea not null",
+        ] {
+            assert!(sql.contains(field), "missing bundle member field: {field}");
+        }
+        assert!(sql.contains("item_index between 0 and 9"));
+        assert!(sql.contains("after_hash bytea not null check (octet_length(after_hash) = 32)"));
+        assert!(sql.contains("uuid_extract_version(idempotency_key) = 4"));
+        assert!(sql.contains("default 'proposed'"));
+        assert!(sql.contains(
+            "status in ('proposed', 'approved', 'denied', 'executing', 'succeeded', 'failed', 'reconciliation_required')"
+        ));
+    }
+
+    #[test]
+    fn external_action_decisions_bind_owner_broker_and_private_channel() {
+        let sql = normalize_sql(&migration_sql());
+        for contract in [
+            "broker_pubkey bytea not null check (octet_length(broker_pubkey) = 32)",
+            "decision_broker_pubkey bytea",
+            "foreign key (community_id, broker_pubkey) references users (community_id, pubkey)",
+            "foreign key (community_id, channel_id, broker_pubkey) references channel_members (community_id, channel_id, pubkey)",
+            "decision_broker_pubkey = broker_pubkey",
+        ] {
+            assert!(sql.contains(contract), "missing broker binding: {contract}");
+        }
+        assert!(sql.contains("proposed_at timestamptz not null"));
+        assert!(sql.contains("expires_at > proposed_at"));
+        assert!(sql.contains("expires_at <= proposed_at + interval '15 minutes'"));
+        assert!(!sql.contains("expires_at > created_at and expires_at <= created_at"));
+    }
+
+    #[test]
+    fn external_action_proposal_hashes_canonical_context_separately_from_ordered_members() {
+        let sql = normalize_sql(&migration_sql());
+        for contract in [
+            "canonical_proposal bytea not null",
+            "octet_length(canonical_proposal) between 1 and 65535",
+            "canonical_operation_hash bytea not null check (octet_length(canonical_operation_hash) = 32)",
+            "ordered_members_hash bytea not null check (octet_length(ordered_members_hash) = 32)",
+            "canonical_operation_hash bytea not null check (octet_length(canonical_operation_hash) = 32)",
+            "octet_length(canonical_operation) between 1 and 65535",
+            "operation_id uuid not null check (uuid_extract_version(operation_id) = 4)",
+            "unique (community_id, proposal_id, operation_id)",
+        ] {
+            assert!(sql.contains(contract), "missing canonical action contract: {contract}");
+        }
+    }
+
+    #[test]
+    fn writable_source_scopes_always_require_read_authority() {
+        let sql = normalize_sql(&migration_sql());
+        assert!(sql.contains("check (not can_write or can_read)"));
+    }
+
+    #[test]
+    fn action_receipts_use_protocol_reconciliation_states_and_bind_operation_id() {
+        let sql = normalize_sql(&migration_sql());
+        assert!(sql.contains(
+            "outcome text not null check (outcome in ('succeeded', 'failed', 'reconciliation_required'))"
+        ));
+        assert!(sql.contains(
+            "reconciliation_state in ('not_required', 'pending', 'reconciled', 'manual_review')"
+        ));
+        assert!(sql.contains(
+            "foreign key (community_id, proposal_id, item_index, member_hash, operation_id) references external_action_proposal_items"
+        ));
+        assert!(sql.contains("(reconciliation_state = 'reconciled') = (reconciled_at is not null)"));
+    }
+
+    #[test]
+    fn learning_domains_are_closed_to_the_protocol_set() {
+        let sql = normalize_sql(&migration_sql());
+        let definitions = create_table_definitions(&sql);
+        let learning_sql = definitions
+            .into_iter()
+            .filter(|(table, _)| matches!(table.as_str(), "learning_revisions" | "learning_heads"))
+            .flat_map(|(_, definitions)| definitions)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for domain in [
+            "ranking_within_policy_tier",
+            "timing_within_allowed_feed_window",
+            "card_presentation_preference",
+            "writing_style_traits",
+            "relationship_priority_hints",
+            "source_quality_weights",
+            "buyer_selection_heuristics",
+            "research_heuristics",
+            "bounded_workflow_ordering",
+        ] {
+            assert!(learning_sql.matches(&format!("'{domain}'")).count() >= 2);
+        }
+        assert!(!learning_sql.contains("'permissions'"));
+        assert!(!learning_sql.contains("'unknown'"));
     }
 
     #[test]
@@ -1282,6 +1725,10 @@ mod tests {
         assert!(
             search_expression.contains("ELSE NULL::tsvector"),
             "fresh installs must default non-allowlisted kinds to NULL: {search_expression}"
+        );
+        assert!(
+            search_expression.contains("ARRAY[44300, 44301, 44310, 44311, 44312, 44210, 30179]"),
+            "Core private persistent kinds must be storage-level FTS NULL: {search_expression}"
         );
     }
 }

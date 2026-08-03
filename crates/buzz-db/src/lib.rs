@@ -17,6 +17,8 @@ pub mod api_token;
 pub mod archived_identities;
 /// Channel and membership persistence.
 pub mod channel;
+/// Tenant-scoped Core connector, retrieval, action, learning, and audit storage.
+pub mod core_storage;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
