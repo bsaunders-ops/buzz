@@ -4,6 +4,7 @@
 //! They use a Buzz ephemeral event kind and carry NIP-44 encrypted JSON in the
 //! event content so relays can route frames without reading ACP internals.
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use nostr::{nips::nip44, Event, Keys, PublicKey};
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
@@ -23,6 +24,23 @@ pub const NIP44_MIN_CONTENT_LEN: usize = 132;
 pub const NIP44_MAX_CONTENT_LEN: usize = 87_472;
 /// Maximum observer plaintext JSON size accepted by helpers.
 pub const OBSERVER_MAX_PLAINTEXT_LEN: usize = 65_535;
+
+/// A syntactic NIP-44 v2 envelope validation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum Nip44V2SyntacticError {
+    /// Encoded ciphertext falls outside the NIP-44 v2 size envelope.
+    #[error("is too short or too long for NIP-44 v2 (got {0} bytes)")]
+    CiphertextLength(usize),
+    /// Ciphertext is not canonical standard-base64 input.
+    #[error("is not valid standard base64")]
+    Base64,
+    /// Decoded ciphertext does not start with the NIP-44 v2 version byte.
+    #[error("is not NIP-44 v2 (expected 0x02 version prefix)")]
+    Version,
+    /// Decoded ciphertext does not have a permitted padded payload length.
+    #[error("has an invalid NIP-44 v2 padded length")]
+    PaddedLength,
+}
 
 /// Errors returned by observer payload encryption/decryption helpers.
 #[derive(Debug, Error)]
@@ -49,9 +67,44 @@ pub enum ObserverPayloadError {
     InvalidPayload(String),
 }
 
-/// Returns true when `content` fits the NIP-44 v2 ciphertext length envelope.
+/// Returns true when `content` fits only the encoded NIP-44 ciphertext length envelope.
+///
+/// Call [`validate_syntactic_nip44_v2`] before accepting an untrusted envelope.
 pub fn content_looks_like_nip44(content: &str) -> bool {
     (NIP44_MIN_CONTENT_LEN..=NIP44_MAX_CONTENT_LEN).contains(&content.len())
+}
+
+/// Validate standard base64, version byte, and exact NIP-44 v2 padded length.
+///
+/// This intentionally does not authenticate or decrypt the envelope. It rejects
+/// malformed framing before a relay stores or routes untrusted ciphertext.
+pub fn validate_syntactic_nip44_v2(content: &str) -> Result<(), Nip44V2SyntacticError> {
+    if !content_looks_like_nip44(content) {
+        return Err(Nip44V2SyntacticError::CiphertextLength(content.len()));
+    }
+    let decoded = BASE64_STANDARD
+        .decode(content)
+        .map_err(|_| Nip44V2SyntacticError::Base64)?;
+    if decoded.first() != Some(&2) {
+        return Err(Nip44V2SyntacticError::Version);
+    }
+    if decoded.len() < 99 || !is_valid_nip44_v2_padded_len(decoded.len() - 67) {
+        return Err(Nip44V2SyntacticError::PaddedLength);
+    }
+    Ok(())
+}
+
+fn is_valid_nip44_v2_padded_len(padded_len: usize) -> bool {
+    if (32..=256).contains(&padded_len) {
+        return padded_len.is_multiple_of(32);
+    }
+    if !(320..=65_536).contains(&padded_len) {
+        return false;
+    }
+
+    let bucket_ceiling = padded_len.next_power_of_two();
+    let chunk = bucket_ceiling / 8;
+    padded_len >= 5 * chunk && padded_len.is_multiple_of(chunk)
 }
 
 /// Serialize and NIP-44 encrypt an observer payload for `recipient`.

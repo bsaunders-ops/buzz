@@ -5,13 +5,14 @@ use std::{collections::HashMap, sync::Arc};
 use axum::body::Bytes;
 use tracing::{debug, error, info, warn};
 
+use buzz_core::core_protocol::is_core_kind;
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_unshared_gated_event, AUTHOR_ONLY_KINDS,
     KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
 };
 use buzz_core::observer::{
-    content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
+    validate_syntactic_nip44_v2, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
     OBSERVER_FRAME_TELEMETRY,
 };
 use buzz_core::tenant::TenantContext;
@@ -168,6 +169,25 @@ pub async fn filter_fanout_by_access(
                 }
                 // Foreign connection: allowed only if the event is shared.
                 !is_unshared_gated_event(&stored_event.event, &pk)
+            })
+            .collect()
+    } else {
+        matches
+    };
+
+    // Core routing metadata is private even for ephemeral events. Channel
+    // membership alone never grants visibility: only the exact author or sole
+    // `p` recipient may receive history or live fan-out.
+    let matches = if is_core_kind(event_kind_u32(&stored_event.event)) {
+        matches
+            .into_iter()
+            .filter(|(conn_id, _)| {
+                state
+                    .conn_manager
+                    .pubkey_for_conn(*conn_id)
+                    .is_some_and(|pubkey| {
+                        super::req::event_visible_to_reader(&stored_event.event, &pubkey)
+                    })
             })
             .collect()
     } else {
@@ -791,6 +811,19 @@ async fn handle_ephemeral_event(
         }
     }
 
+    if is_core_kind(event_kind_u32(&event)) {
+        if let Err(error) =
+            super::ingest::validate_core_event_authorization(&conn.tenant, &state, &event).await
+        {
+            let message = match error {
+                IngestError::Rejected(message) | IngestError::AuthFailed(message) => message,
+                IngestError::Internal(_) => "error: internal server error".to_string(),
+            };
+            conn.send(RelayMessage::ok(event_id_hex, false, &message));
+            return;
+        }
+    }
+
     // Special handling for presence events (kind:20001).
     if event_kind_u32(&event) == KIND_PRESENCE_UPDATE {
         // Accept both bare strings ("online") and legacy JSON ({"status":"online"}).
@@ -1092,7 +1125,7 @@ async fn handle_agent_observer_event(
 }
 
 fn agent_observer_route(event: &Event) -> Result<Option<AgentObserverRoute>, String> {
-    if !content_looks_like_nip44(&event.content) {
+    if validate_syntactic_nip44_v2(&event.content).is_err() {
         return Err("invalid: observer content must be NIP-44 encrypted".into());
     }
 
@@ -1310,6 +1343,25 @@ mod tests {
 
         let err = super::agent_observer_route(&event).expect_err("route should reject plaintext");
         assert!(err.contains("NIP-44"));
+    }
+
+    #[test]
+    fn agent_observer_route_rejects_wrong_nip44_padding_length() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        // Valid base64 and version byte, but 100 decoded bytes cannot be a
+        // NIP-44 v2 envelope (padded payload lengths advance in 32-byte steps).
+        let malformed = "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), malformed)
+            .tags([
+                Tag::parse(["p", &owner.public_key().to_hex()]).expect("p tag"),
+                Tag::parse([OBSERVER_AGENT_TAG, &agent.public_key().to_hex()]).expect("agent tag"),
+                Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]).expect("frame tag"),
+            ])
+            .sign_with_keys(&agent)
+            .expect("sign event");
+
+        assert!(super::agent_observer_route(&event).is_err());
     }
 
     #[tokio::test]
@@ -2131,6 +2183,51 @@ mod tests {
             )
             .await;
             assert_eq!(out, matches);
+        }
+
+        #[tokio::test]
+        async fn core_live_fanout_allows_only_author_and_recipient_for_all_lifetimes() {
+            let state = test_state().await;
+            let channel_id = Uuid::new_v4();
+            let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+            state
+                .channel_visibility_cache
+                .insert((community_id, channel_id), "open".to_string());
+
+            let author = Keys::generate();
+            let recipient = Keys::generate();
+            let bystander = Keys::generate();
+            let author_conn = register_conn(&state, Some(author.public_key().to_bytes().to_vec()));
+            let recipient_conn =
+                register_conn(&state, Some(recipient.public_key().to_bytes().to_vec()));
+            let bystander_conn =
+                register_conn(&state, Some(bystander.public_key().to_bytes().to_vec()));
+            let matches = vec![
+                (author_conn, "author".to_string()),
+                (recipient_conn, "recipient".to_string()),
+                (bystander_conn, "bystander".to_string()),
+            ];
+
+            for kind in [
+                buzz_core::kind::KIND_CORE_INSIGHT,
+                buzz_core::kind::KIND_CORE_CALL_CONTROL,
+            ] {
+                let event = EventBuilder::new(Kind::Custom(kind as u16), "ciphertext")
+                    .tags([
+                        nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h"),
+                        nostr::Tag::public_key(recipient.public_key()),
+                    ])
+                    .sign_with_keys(&author)
+                    .expect("sign Core event");
+                let stored = StoredEvent::new(event, Some(channel_id));
+                let out =
+                    filter_fanout_by_access(&state, community_id, &stored, matches.clone(), None)
+                        .await;
+                assert_eq!(
+                    out.iter().map(|(conn, _)| *conn).collect::<Vec<_>>(),
+                    vec![author_conn, recipient_conn]
+                );
+            }
         }
 
         #[tokio::test]

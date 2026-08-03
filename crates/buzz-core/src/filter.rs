@@ -11,10 +11,11 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
     filters.iter().any(|f| filter_match_one(f, event))
 }
 
-/// Result-level read authorization for relay-signed events whose content is
-/// private to a single viewer. Currently gates `KIND_DM_VISIBILITY` and
-/// `KIND_AGENT_TURN_METRIC`: the reader MUST equal the event's `#p` tag
-/// (owner). Returns `true` for every other kind.
+/// Result-level authorization for private event classes. Every Core kind,
+/// including ephemerals, is visible only to its author or exact sole `p`
+/// recipient. Relay-signed `KIND_DM_VISIBILITY` and
+/// `KIND_AGENT_TURN_METRIC` remain visible only to their `#p` owner. Returns
+/// `true` for every other kind.
 ///
 /// This guards every delivery surface — WS historical pull (`req.rs`), HTTP
 /// bridge (`bridge.rs`), and live fan-out (`event.rs`) — so a query that
@@ -22,6 +23,18 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
 /// a known event id) still cannot read another user's private event.
 pub fn reader_authorized_for_event(event: &nostr::Event, reader_pubkey_hex: &str) -> bool {
     let kind = crate::kind::event_kind_u32(event);
+    if crate::core_protocol::is_core_kind(kind) {
+        if event.pubkey.to_hex() == reader_pubkey_hex {
+            return true;
+        }
+        let p = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
+        let recipients: Vec<_> = event
+            .tags
+            .filter(nostr::TagKind::SingleLetter(p))
+            .filter_map(|tag| tag.content())
+            .collect();
+        return recipients.as_slice() == [reader_pubkey_hex];
+    }
     if kind != crate::kind::KIND_DM_VISIBILITY && kind != crate::kind::KIND_AGENT_TURN_METRIC {
         return true;
     }
@@ -296,5 +309,62 @@ mod tests {
             !reader_authorized_for_event(&metric, &agent_keys.public_key().to_hex()),
             "the authoring agent must NOT be authorized to read its own metric event (owner-only)"
         );
+    }
+
+    #[test]
+    fn reader_authorized_for_core_event_allows_only_author_or_exact_recipient() {
+        let author = Keys::generate();
+        let recipient = Keys::generate();
+        let attacker = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(crate::kind::KIND_CORE_INSIGHT as u16), "{}")
+            .tags([
+                Tag::parse(["h", "550e8400-e29b-41d4-a716-446655440000"]).unwrap(),
+                Tag::parse(["p", &recipient.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(&author)
+            .expect("sign");
+
+        assert!(reader_authorized_for_event(
+            &event,
+            &author.public_key().to_hex()
+        ));
+        assert!(reader_authorized_for_event(
+            &event,
+            &recipient.public_key().to_hex()
+        ));
+        assert!(!reader_authorized_for_event(
+            &event,
+            &attacker.public_key().to_hex()
+        ));
+    }
+
+    #[test]
+    fn reader_authorized_for_ephemeral_core_event_rejects_channel_bystander() {
+        let author = Keys::generate();
+        let recipient = Keys::generate();
+        let bystander = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::Custom(crate::kind::KIND_CORE_CALL_CONTROL as u16),
+            "A".repeat(crate::observer::NIP44_MIN_CONTENT_LEN),
+        )
+        .tags([
+            Tag::parse(["h", "550e8400-e29b-41d4-a716-446655440000"]).unwrap(),
+            Tag::parse(["p", &recipient.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(&author)
+        .expect("sign");
+
+        assert!(reader_authorized_for_event(
+            &event,
+            &author.public_key().to_hex()
+        ));
+        assert!(reader_authorized_for_event(
+            &event,
+            &recipient.public_key().to_hex()
+        ));
+        assert!(!reader_authorized_for_event(
+            &event,
+            &bystander.public_key().to_hex()
+        ));
     }
 }

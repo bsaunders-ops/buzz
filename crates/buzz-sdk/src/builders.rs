@@ -15,8 +15,8 @@ use buzz_core::{
         KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
-        content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
-        OBSERVER_FRAME_TELEMETRY,
+        validate_syntactic_nip44_v2, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL,
+        OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY,
     },
 };
 use nostr::{EventBuilder, Kind, Tag};
@@ -253,7 +253,7 @@ pub fn build_agent_observer_frame(
             "observer frame must be {OBSERVER_FRAME_TELEMETRY:?} or {OBSERVER_FRAME_CONTROL:?}"
         )));
     }
-    if !content_looks_like_nip44(encrypted_content) {
+    if validate_syntactic_nip44_v2(encrypted_content).is_err() {
         return Err(SdkError::InvalidInput(
             "observer frame content must be NIP-44 v2 ciphertext".into(),
         ));

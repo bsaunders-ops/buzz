@@ -13,10 +13,13 @@
 //! No keys are held here. No network calls are made.
 
 pub mod builders;
+/// Typed Core Month-1 payload parsers and private event builders.
+pub mod core_protocol;
 pub mod mentions;
 pub mod nip_oa;
 
 pub use builders::*;
+pub use core_protocol::*;
 
 /// Re-export kind constants so consumers don't need buzz-core directly.
 pub use buzz_core::kind;

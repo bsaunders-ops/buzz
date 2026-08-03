@@ -142,15 +142,29 @@ pub fn conversation_key(my_seckey: &SecretKey, their_pubkey: &PublicKey) -> Conv
 /// `d = lower_hex(HMAC-SHA256(K_c, "agent-memory/v1/d-tag" || 0x00 || slug))`,
 /// 64 hex characters.
 pub fn d_tag(k_c: &ConversationKey, slug: &str) -> String {
+    hex::encode(coordinate_hmac(k_c, D_TAG_DOMAIN, &[slug.as_bytes()]))
+}
+
+/// Compute a domain-separated HMAC coordinate from ordered byte components.
+pub(crate) fn coordinate_hmac(
+    k_c: &ConversationKey,
+    domain_separator: &[u8],
+    components: &[&[u8]],
+) -> [u8; 32] {
     // HMAC-SHA256 accepts a key of any byte length; `new_from_slice` only
     // returns `Err` for fixed-length MAC variants. This is infallible for
     // SHA-256 and propagating it would just add noise at every call site.
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(k_c.as_bytes())
         .expect("HMAC-SHA256 is keyed-prefix MAC; new_from_slice cannot fail");
-    mac.update(D_TAG_DOMAIN);
-    mac.update(&[0u8]);
-    mac.update(slug.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    mac.update(domain_separator);
+    for component in components {
+        mac.update(&[0u8]);
+        mac.update(component);
+    }
+    let digest = mac.finalize().into_bytes();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    output
 }
 
 /// A decoded engram body. The slug discriminates the variant.

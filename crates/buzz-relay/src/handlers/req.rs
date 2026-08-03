@@ -1051,6 +1051,25 @@ fn extract_channel_id_from_filters(filters: &[Filter]) -> Option<uuid::Uuid> {
 pub(crate) fn p_gated_filters_authorized(filters: &[Filter], authed_pubkey_hex: &str) -> bool {
     let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
     filters.iter().all(|filter| {
+        let targets_only_core = filter.kinds.as_ref().is_some_and(|kinds| {
+            !kinds.is_empty()
+                && kinds
+                    .iter()
+                    .all(|kind| buzz_core::core_protocol::is_core_kind(kind.as_u16() as u32))
+        });
+        if targets_only_core {
+            let authors_self = filter.authors.as_ref().is_some_and(|authors| {
+                !authors.is_empty()
+                    && authors
+                        .iter()
+                        .all(|author| author.to_hex().eq_ignore_ascii_case(authed_pubkey_hex))
+            });
+            let recipient_self = filter.generic_tags.get(&p_tag).is_some_and(|values| {
+                !values.is_empty() && values.iter().all(|value| value == authed_pubkey_hex)
+            });
+            return authors_self || recipient_self;
+        }
+
         let can_match_p_gated = filter.kinds.as_ref().is_none_or(|ks| {
             ks.iter()
                 .any(|kind| P_GATED_KINDS.contains(&(kind.as_u16() as u32)))
@@ -2079,5 +2098,74 @@ mod tests {
         ));
         // No #p tag — fallback required.
         assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
+    }
+
+    #[test]
+    fn core_filters_allow_exact_author_or_recipient_only() {
+        let (reader, other, _) = three_pubkeys();
+        let reader_key = nostr::PublicKey::from_hex(&reader).expect("reader key");
+        let other_key = nostr::PublicKey::from_hex(&other).expect("other key");
+        let author_self = Filter::new()
+            .kind(nostr::Kind::Custom(
+                buzz_core::kind::KIND_CORE_INSIGHT as u16,
+            ))
+            .author(reader_key);
+        let recipient_self = Filter::new()
+            .kind(nostr::Kind::Custom(
+                buzz_core::kind::KIND_CORE_INSIGHT as u16,
+            ))
+            .custom_tag(
+                nostr::SingleLetterTag::lowercase(nostr::Alphabet::P),
+                reader.clone(),
+            );
+        let foreign = Filter::new()
+            .kind(nostr::Kind::Custom(
+                buzz_core::kind::KIND_CORE_INSIGHT as u16,
+            ))
+            .author(other_key);
+
+        assert!(p_gated_filters_authorized(&[author_self], &reader));
+        assert!(p_gated_filters_authorized(&[recipient_self], &reader));
+        assert!(!p_gated_filters_authorized(&[foreign], &reader));
+    }
+
+    #[test]
+    fn core_history_http_and_count_paths_share_exact_result_gate() {
+        let author = nostr::Keys::generate();
+        let recipient = nostr::Keys::generate();
+        let bystander = nostr::Keys::generate();
+        for kind in [
+            buzz_core::kind::KIND_CORE_INSIGHT,
+            buzz_core::kind::KIND_CORE_CALL_CONTROL,
+        ] {
+            let event = nostr::EventBuilder::new(nostr::Kind::Custom(kind as u16), "content")
+                .tags([
+                    nostr::Tag::parse(["h", "550e8400-e29b-41d4-a716-446655440000"]).expect("h"),
+                    nostr::Tag::public_key(recipient.public_key()),
+                ])
+                .sign_with_keys(&author)
+                .expect("sign");
+            assert!(event_visible_to_reader(
+                &event,
+                &author.public_key().to_bytes()
+            ));
+            assert!(event_visible_to_reader(
+                &event,
+                &recipient.public_key().to_bytes()
+            ));
+            assert!(!event_visible_to_reader(
+                &event,
+                &bystander.public_key().to_bytes()
+            ));
+        }
+
+        let persistent = Filter::new().kind(nostr::Kind::Custom(
+            buzz_core::kind::KIND_CORE_INSIGHT as u16,
+        ));
+        let ephemeral = Filter::new().kind(nostr::Kind::Custom(
+            buzz_core::kind::KIND_CORE_CALL_CONTROL as u16,
+        ));
+        assert!(filter_can_match_result_gated_kinds(&persistent));
+        assert!(!filter_can_match_result_gated_kinds(&ephemeral));
     }
 }

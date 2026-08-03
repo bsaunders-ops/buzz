@@ -126,7 +126,17 @@ pub const AUTHOR_ONLY_KINDS: &[u32] = &[KIND_EVENT_REMINDER, KIND_PUSH_LEASE];
 ///
 /// Used by `filter_can_match_result_gated_kinds` to force the per-event
 /// fallback path in COUNT rather than the fast SQL `count_events()`.
-pub const RESULT_GATED_KINDS: &[u32] = &[KIND_DM_VISIBILITY, KIND_AGENT_TURN_METRIC];
+pub const RESULT_GATED_KINDS: &[u32] = &[
+    KIND_DM_VISIBILITY,
+    KIND_AGENT_TURN_METRIC,
+    KIND_CORE_INSIGHT,
+    KIND_CORE_INSIGHT_DISPOSITION,
+    KIND_CORE_ACTION_PROPOSAL,
+    KIND_CORE_ACTION_DECISION,
+    KIND_CORE_ACTION_RECEIPT,
+    KIND_CORE_LEARNING_RECORD,
+    KIND_CORE_LEARNING_BUNDLE_HEAD,
+];
 
 /// Kinds whose stored events have `#p`-bound read access — readable only by
 /// subscribers whose pubkey appears in the event's `#p` tag.
@@ -153,6 +163,16 @@ pub const P_GATED_KINDS: &[u32] = &[
     // readable by any unauthenticated or non-owner party, including via `ids`
     // filters — see NIP-AM §Relay Behavior.
     KIND_AGENT_TURN_METRIC,
+    KIND_CORE_INSIGHT,
+    KIND_CORE_INSIGHT_DISPOSITION,
+    KIND_CORE_ACTION_PROPOSAL,
+    KIND_CORE_ACTION_DECISION,
+    KIND_CORE_ACTION_RECEIPT,
+    KIND_CORE_LEARNING_RECORD,
+    KIND_CORE_LEARNING_BUNDLE_HEAD,
+    KIND_CORE_CALL_CONTROL,
+    KIND_CORE_TRANSCRIPT_SEGMENT,
+    KIND_CORE_COPILOT_SUGGESTION,
 ];
 
 /// NIP-AP: Agent Persona (parameterized replaceable, owner-authored).
@@ -531,6 +551,28 @@ pub const KIND_MEMBER_REMOVED_NOTIFICATION: u32 = 44101;
 /// See `docs/nips/NIP-AM.md`.
 pub const KIND_AGENT_TURN_METRIC: u32 = 44200;
 
+/// Core encrypted append-only learning record (pair-authored).
+pub const KIND_CORE_LEARNING_RECORD: u32 = 44210;
+/// Core proactive assistant insight (assistant agent-authored).
+pub const KIND_CORE_INSIGHT: u32 = 44300;
+/// Core owner disposition over an insight.
+pub const KIND_CORE_INSIGHT_DISPOSITION: u32 = 44301;
+/// Core broker proposal for an external write.
+pub const KIND_CORE_ACTION_PROPOSAL: u32 = 44310;
+/// Core owner decision over an exact proposed operation hash.
+pub const KIND_CORE_ACTION_DECISION: u32 = 44311;
+/// Core broker receipt for a decided external write.
+pub const KIND_CORE_ACTION_RECEIPT: u32 = 44312;
+/// Core encrypted learning bundle head (learning agent-authored, addressable).
+pub const KIND_CORE_LEARNING_BUNDLE_HEAD: u32 = 30179;
+
+/// Core encrypted ephemeral live-call control event.
+pub const KIND_CORE_CALL_CONTROL: u32 = 24820;
+/// Core encrypted ephemeral finalized transcript segment.
+pub const KIND_CORE_TRANSCRIPT_SEGMENT: u32 = 24821;
+/// Core encrypted ephemeral copilot suggestion.
+pub const KIND_CORE_COPILOT_SUGGESTION: u32 = 24822;
+
 // Forum / social (45000–45999)
 // V1 used addressable range (30001–30003) — wrong.
 /// A forum post (thread root).
@@ -711,6 +753,16 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_MEMBER_ADDED_NOTIFICATION,
     KIND_MEMBER_REMOVED_NOTIFICATION,
     KIND_AGENT_TURN_METRIC,
+    KIND_CORE_LEARNING_RECORD,
+    KIND_CORE_INSIGHT,
+    KIND_CORE_INSIGHT_DISPOSITION,
+    KIND_CORE_ACTION_PROPOSAL,
+    KIND_CORE_ACTION_DECISION,
+    KIND_CORE_ACTION_RECEIPT,
+    KIND_CORE_LEARNING_BUNDLE_HEAD,
+    KIND_CORE_CALL_CONTROL,
+    KIND_CORE_TRANSCRIPT_SEGMENT,
+    KIND_CORE_COPILOT_SUGGESTION,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
     KIND_USER_STATUS,
@@ -883,6 +935,40 @@ const _: () = assert!(!is_moderation_command_kind(KIND_REPORT));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_month1_kinds_are_registered_and_private() {
+        let persistent = [44_300, 44_301, 44_310, 44_311, 44_312, 44_210, 30_179];
+        let ephemeral = [24_820, 24_821, 24_822];
+
+        for kind in persistent.into_iter().chain(ephemeral) {
+            assert!(
+                ALL_KINDS.contains(&kind),
+                "Core kind {kind} is not registered"
+            );
+            assert!(
+                P_GATED_KINDS.contains(&kind),
+                "Core kind {kind} is not p-gated"
+            );
+        }
+        for kind in persistent {
+            assert!(
+                RESULT_GATED_KINDS.contains(&kind),
+                "persistent Core kind {kind} is not result-gated"
+            );
+        }
+        for kind in ephemeral {
+            assert!(
+                is_ephemeral(kind),
+                "Core call kind {kind} must be ephemeral"
+            );
+            assert!(
+                !RESULT_GATED_KINDS.contains(&kind),
+                "ephemeral Core kind {kind} cannot enter persisted result gates"
+            );
+        }
+        assert!(is_parameterized_replaceable(30_179));
+    }
 
     #[test]
     fn no_duplicate_kind_values() {

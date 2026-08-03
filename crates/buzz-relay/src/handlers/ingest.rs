@@ -10,6 +10,10 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use buzz_auth::Scope;
+use buzz_core::core_protocol::{
+    is_persistent_core_kind, validate_core_envelope, validate_core_plaintext_content,
+    CoreDirection, CoreEnvelope,
+};
 use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
@@ -229,6 +233,9 @@ fn map_push_accept_error(error: super::push_lease::AcceptError) -> IngestError {
 ///
 /// Returns `Err` for unknown kinds — the relay rejects them.
 fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static str> {
+    if is_persistent_core_kind(kind) {
+        return Ok(Scope::MessagesWrite);
+    }
     match kind {
         KIND_PROFILE => Ok(Scope::UsersWrite),
         KIND_TEXT_NOTE | KIND_LONG_FORM => Ok(Scope::MessagesWrite),
@@ -495,6 +502,9 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
 
 /// Kinds that require an `h` tag for channel scoping.
 pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
+    if is_persistent_core_kind(kind) {
+        return true;
+    }
     matches!(
         kind,
         KIND_STREAM_MESSAGE
@@ -523,6 +533,75 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_HUDDLE_ENDED
             | KIND_HUDDLE_GUIDELINES
     )
+}
+
+/// Validate the frozen Core envelope against current private-channel and pair state.
+pub(crate) async fn validate_core_event_authorization(
+    tenant: &TenantContext,
+    state: &AppState,
+    event: &Event,
+) -> Result<CoreEnvelope, IngestError> {
+    let envelope = validate_core_envelope(event)
+        .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+    validate_core_plaintext_content(event, Utc::now().timestamp())
+        .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+
+    let channel = state
+        .db
+        .get_channel(tenant.community(), envelope.channel_id)
+        .await
+        .map_err(|error| {
+            IngestError::Internal(format!("error: checking Core private channel: {error}"))
+        })?;
+    if channel.visibility != "private" {
+        return Err(IngestError::AuthFailed(
+            "restricted: Core events require a private channel".into(),
+        ));
+    }
+
+    let author = event.pubkey.to_bytes().to_vec();
+    let recipient = envelope.recipient.to_bytes().to_vec();
+    for endpoint in [&author, &recipient] {
+        let is_member = state
+            .db
+            .is_member(tenant.community(), envelope.channel_id, endpoint)
+            .await
+            .map_err(|error| {
+                IngestError::Internal(format!("error: checking Core channel membership: {error}"))
+            })?;
+        if !is_member {
+            return Err(IngestError::AuthFailed(
+                "restricted: both Core endpoints must be current channel members".into(),
+            ));
+        }
+    }
+
+    let agent_to_owner = state
+        .db
+        .is_agent_owner(tenant.community(), &author, &recipient)
+        .await
+        .map_err(|error| {
+            IngestError::Internal(format!("error: checking Core agent-owner pair: {error}"))
+        })?;
+    let owner_to_agent = state
+        .db
+        .is_agent_owner(tenant.community(), &recipient, &author)
+        .await
+        .map_err(|error| {
+            IngestError::Internal(format!("error: checking Core owner-agent pair: {error}"))
+        })?;
+    let authorized = match envelope.direction {
+        CoreDirection::AgentToOwner => agent_to_owner,
+        CoreDirection::OwnerToAgent => owner_to_agent,
+        CoreDirection::Either => agent_to_owner || owner_to_agent,
+    };
+    if !authorized {
+        return Err(IngestError::AuthFailed(
+            "restricted: invalid Core agent-owner direction".into(),
+        ));
+    }
+
+    Ok(envelope)
 }
 
 /// Check channel membership: member OR open-visibility channel.
@@ -1468,12 +1547,9 @@ fn parse_project_member_coordinate(coordinate: &str) -> Result<(), ProjectReject
 /// Validate that `content` is a syntactically plausible NIP-44 v2 ciphertext.
 ///
 /// Checks:
-/// - Non-empty.
-/// - Standard base64 alphabet only (A-Z, a-z, 0-9, +, /, =), with padding only
-///   at the end and total length a multiple of 4.
-/// - Decoded length >= 99 bytes (1 version + 32 nonce + 32 MAC + minimum 34
-///   bytes of length-prefixed padded ciphertext required by NIP-44 v2).
+/// - Standard base64 framing.
 /// - First decoded byte is `0x02` (NIP-44 version 2).
+/// - Exact NIP-44 v2 padded ciphertext length.
 ///
 /// This is an envelope sanity check, not full validation: the MAC and actual
 /// decryption happen at the reader. The intent is to refuse obvious junk so a
@@ -1481,59 +1557,8 @@ fn parse_project_member_coordinate(coordinate: &str) -> Result<(), ProjectReject
 /// be silently skipped by `validate_and_decrypt`. Mirrors the validator in
 /// `buzz-pair-relay::validate_nip44_content`.
 fn validate_engram_nip44_content(content: &str) -> Result<(), String> {
-    if content.is_empty() {
-        return Err("agent-engram content must not be empty (NIP-44 ciphertext)".to_string());
-    }
-    let bytes = content.as_bytes();
-    let len = bytes.len();
-    if !len.is_multiple_of(4) {
-        return Err("agent-engram content is not valid base64 (length)".to_string());
-    }
-    let mut pad_count = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => {
-                if pad_count > 0 {
-                    return Err("agent-engram content is not valid base64".to_string());
-                }
-            }
-            b'=' => {
-                if i < len - 2 {
-                    return Err("agent-engram content is not valid base64".to_string());
-                }
-                pad_count += 1;
-                if pad_count > 2 {
-                    return Err("agent-engram content is not valid base64".to_string());
-                }
-            }
-            _ => return Err("agent-engram content is not valid base64".to_string()),
-        }
-    }
-    let decoded_len = (len / 4) * 3 - pad_count;
-    if decoded_len < 99 {
-        return Err("agent-engram content too short for NIP-44 v2".to_string());
-    }
-    let b64_val = |c: u8| -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    };
-    let v0 =
-        b64_val(bytes[0]).ok_or_else(|| "agent-engram content is not valid base64".to_string())?;
-    let v1 =
-        b64_val(bytes[1]).ok_or_else(|| "agent-engram content is not valid base64".to_string())?;
-    let first_byte = (v0 << 2) | (v1 >> 4);
-    if first_byte != 0x02 {
-        return Err(
-            "agent-engram content is not NIP-44 v2 (expected 0x02 version prefix)".to_string(),
-        );
-    }
-    Ok(())
+    buzz_core::observer::validate_syntactic_nip44_v2(content)
+        .map_err(|error| format!("agent-engram content {error}"))
 }
 
 /// Validate the public envelope of a NIP-AM `kind:44200` event.
@@ -1932,6 +1957,10 @@ async fn ingest_event_inner(
             "restricted: insufficient scope (need {})",
             required
         )));
+    }
+
+    if is_persistent_core_kind(kind_u32) {
+        validate_core_event_authorization(tenant, state, &event).await?;
     }
 
     // Command kinds are routed AFTER signature verification, timestamp check,
@@ -2936,9 +2965,12 @@ mod tests {
     use super::*;
     use buzz_conformance::{TraceStep, Tracer};
     use buzz_core::kind::{
-        KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM,
-        KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE,
-        KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
+        KIND_CANVAS, KIND_CORE_ACTION_DECISION, KIND_CORE_ACTION_PROPOSAL,
+        KIND_CORE_ACTION_RECEIPT, KIND_CORE_INSIGHT, KIND_CORE_INSIGHT_DISPOSITION,
+        KIND_CORE_LEARNING_BUNDLE_HEAD, KIND_CORE_LEARNING_RECORD, KIND_FORUM_COMMENT,
+        KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_PERSONA,
+        KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF, KIND_TEAM,
+        KIND_USER_STATUS,
     };
     use nostr::{EventBuilder, Kind};
 
@@ -3178,6 +3210,31 @@ mod tests {
                 Scope::MessagesWrite,
                 "kind {kind} should require MessagesWrite scope"
             );
+        }
+    }
+
+    #[test]
+    fn persistent_core_kinds_require_message_write_and_channel_scope() {
+        let dummy = make_dummy_event();
+        for kind in [
+            KIND_CORE_INSIGHT,
+            KIND_CORE_INSIGHT_DISPOSITION,
+            KIND_CORE_ACTION_PROPOSAL,
+            KIND_CORE_ACTION_DECISION,
+            KIND_CORE_ACTION_RECEIPT,
+            KIND_CORE_LEARNING_RECORD,
+            KIND_CORE_LEARNING_BUNDLE_HEAD,
+        ] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy).ok(),
+                Some(Scope::MessagesWrite),
+                "Core kind {kind} must require MessagesWrite"
+            );
+            assert!(
+                requires_h_channel_scope(kind),
+                "Core kind {kind} must require h scope"
+            );
+            assert!(!is_global_only_kind(kind));
         }
     }
 
@@ -3678,6 +3735,17 @@ mod tests {
             err.contains("NIP-44 v2") || err.contains("0x02"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn engram_envelope_rejects_wrong_nip44_padding_length() {
+        let d = "a".repeat(64);
+        let p = "b".repeat(64);
+        // Valid base64 and version byte, but 100 decoded bytes cannot be a
+        // NIP-44 v2 envelope (padded payload lengths advance in 32-byte steps).
+        let bad = "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        let ev = make_engram(&[&["d", &d], &["p", &p]], bad);
+        assert!(validate_engram_envelope(&ev).is_err());
     }
 
     #[test]
