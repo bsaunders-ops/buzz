@@ -55,6 +55,9 @@ param caddyImage string
 @description('Explicit service activation gate. Foundation deployments leave the Compose project stopped.')
 param startCoreServices bool = false
 
+@description('Blake relay-owner x-only public key. May be empty while services remain disabled; activation fails closed without a valid 64-character hex key.')
+param relayOwnerPubkey string = ''
+
 @description('Explicit second-phase gate after the bootstrap bundle digest exists in ACR.')
 param enableHostBootstrap bool = false
 
@@ -148,6 +151,8 @@ module hostBootstrap 'modules/host-bootstrap.bicep' = if (enableHostBootstrap) {
     originFqdn: originFqdn
     originSecretName: originSecretName
     frontDoorId: edge.outputs.frontDoorId
+    publicHost: edge.outputs.publicHost
+    relayOwnerPubkey: relayOwnerPubkey
     bootstrapBundleImage: bootstrapBundleImage
     relayImage: relayImage
     postgresImage: postgresImage
@@ -178,6 +183,7 @@ module monitoringBackup 'modules/monitoring-backup.bicep' = {
     location: location
     vmName: compute.outputs.vmName
     vmResourceId: compute.outputs.vmResourceId
+    frontDoorProfileName: edge.outputs.profileName
     alertEmail: alertEmail
   }
 }

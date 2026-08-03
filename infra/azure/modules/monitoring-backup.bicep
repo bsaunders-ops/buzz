@@ -2,6 +2,7 @@ param namePrefix string
 param location string
 param vmName string
 param vmResourceId string
+param frontDoorProfileName string
 param alertEmail string
 
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
@@ -52,6 +53,68 @@ resource vmUnavailable 'Microsoft.Insights/metricAlerts@2018-03-01' = {
           metricName: 'VmAvailabilityMetric'
           operator: 'LessThan'
           threshold: 1
+          timeAggregation: 'Average'
+          criterionType: 'StaticThresholdCriterion'
+        }
+      ]
+    }
+    actions: [
+      {
+        actionGroupId: actionGroup.id
+      }
+    ]
+  }
+}
+
+resource frontDoorProfile 'Microsoft.Cdn/profiles@2024-09-01' existing = {
+  name: frontDoorProfileName
+}
+
+// Health-probe records and aggregate metrics contain no application bodies,
+// prompts, transcripts, or retrieved source excerpts. Access and WAF request
+// logs intentionally remain disabled because those categories can persist URLs
+// or matched request content.
+resource frontDoorDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  name: '${namePrefix}-front-door-content-free'
+  scope: frontDoorProfile
+  properties: {
+    workspaceId: workspace.id
+    logs: [
+      {
+        category: 'FrontDoorHealthProbeLog'
+        enabled: true
+      }
+    ]
+    metrics: [
+      {
+        category: 'AllMetrics'
+        enabled: true
+      }
+    ]
+  }
+}
+
+resource frontDoorOriginUnhealthy 'Microsoft.Insights/metricAlerts@2018-03-01' = {
+  name: '${namePrefix}-front-door-origin-unhealthy'
+  location: 'global'
+  properties: {
+    description: 'The single Core Front Door origin is below 100 percent health.'
+    severity: 1
+    enabled: true
+    scopes: [frontDoorProfile.id]
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT15M'
+    targetResourceType: 'Microsoft.Cdn/profiles'
+    targetResourceRegion: 'global'
+    criteria: {
+      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+      allOf: [
+        {
+          name: 'OriginHealth'
+          metricNamespace: 'Microsoft.Cdn/profiles'
+          metricName: 'OriginHealthPercentage'
+          operator: 'LessThan'
+          threshold: 100
           timeAggregation: 'Average'
           criterionType: 'StaticThresholdCriterion'
         }

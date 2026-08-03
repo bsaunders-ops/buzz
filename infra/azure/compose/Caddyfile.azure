@@ -7,22 +7,32 @@
   }
 }
 
-{$BUZZ_ORIGIN_FQDN}:8443 {
+:8443 {
   tls /run/buzz/caddy/origin.crt /run/buzz/caddy/origin.key
   encode zstd gzip
 
-  @invalid_fdid not header X-Azure-FDID {$AZURE_FRONT_DOOR_ID}
-  respond @invalid_fdid 403
+  route {
+    # X-FD-* client headers are stripped by Front Door. Only its synthetic
+    # GET/HEAD health probes arrive with this marker. The exception exposes
+    # only content-free readiness and never reaches an application route.
+    @front_door_health_probe {
+      path /origin-healthz
+      method GET HEAD
+      header X-FD-HealthProbe 1
+    }
+    handle @front_door_health_probe {
+      rewrite * /_readiness
+      reverse_proxy relay:3000
+    }
 
-  @invalid_origin_secret not header X-Buzz-Origin-Secret {$BUZZ_ORIGIN_SECRET}
-  respond @invalid_origin_secret 403
+    @invalid_fdid not header X-Azure-FDID {$AZURE_FRONT_DOOR_ID}
+    respond @invalid_fdid 403
 
-  handle /origin-healthz {
-    rewrite * /_readiness
-    reverse_proxy relay:3000
-  }
+    @invalid_origin_secret not header X-Buzz-Origin-Secret {$BUZZ_ORIGIN_SECRET}
+    respond @invalid_origin_secret 403
 
-  handle {
-    reverse_proxy relay:3000
+    handle {
+      reverse_proxy relay:3000
+    }
   }
 }

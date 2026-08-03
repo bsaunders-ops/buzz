@@ -55,7 +55,6 @@ resource origin 'Microsoft.Cdn/profiles/originGroups/origins@2024-09-01' = {
   properties: {
     enabledState: 'Enabled'
     hostName: originFqdn
-    originHostHeader: originFqdn
     httpPort: 80
     httpsPort: 443
     priority: 1
@@ -65,7 +64,7 @@ resource origin 'Microsoft.Cdn/profiles/originGroups/origins@2024-09-01' = {
   }
 }
 
-resource route 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-09-01' = {
+resource route 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-09-01' = if (!customDomainEnabled) {
   name: 'core-route'
   parent: endpoint
   dependsOn: [origin]
@@ -81,7 +80,10 @@ resource route 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-09-01' = {
     supportedProtocols: ['Https']
     patternsToMatch: ['/*']
     forwardingProtocol: 'HttpsOnly'
-    linkToDefaultDomain: 'Enabled'
+    // The Azure endpoint is the canonical public host only before a custom
+    // domain is configured. Once configured, do not leave a second tenant/auth
+    // host linked to this route.
+    linkToDefaultDomain: customDomainEnabled ? 'Disabled' : 'Enabled'
     httpsRedirect: 'Enabled'
     enabledState: 'Enabled'
     cacheConfiguration: null
@@ -218,5 +220,7 @@ resource originHeaderRule 'Microsoft.Cdn/profiles/ruleSets/rules@2024-09-01' = {
 }
 
 output endpointHostName string = endpoint.properties.hostName
+output publicHost string = customDomainEnabled ? customDomainHostName : endpoint.properties.hostName
+output profileName string = profile.name
 output frontDoorId string = profile.properties.frontDoorId
 output customDomainValidationToken string = customDomainEnabled ? customDomain!.properties.validationProperties.validationToken : ''

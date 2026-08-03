@@ -111,14 +111,6 @@ jobs:
         with:
           version: 11.4.0
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-        with:
-          workspaces: |
-            .
-            desktop/src-tauri
-          shared-key: azure-delivery-windows
-
       - name: Install dependencies
         shell: bash
         run: |
@@ -190,6 +182,8 @@ jobs:
             installer = $installer.Name
             sha256 = $installerHash
             signed = $false
+            signingProfile = $null
+            publisherSubject = $null
           }
           $versionManifest | ConvertTo-Json -Depth 10 | Set-Content `
             (Join-Path $artifactDirectory "version-manifest.json") -Encoding utf8
@@ -210,6 +204,8 @@ jobs:
                   sha = "${{ github.sha }}"
                   workflow = "${{ github.workflow_ref }}"
                   signed = $false
+                  signingProfile = $null
+                  publisherSubject = $null
                 }
                 internalParameters = [ordered]@{}
                 resolvedDependencies = @([ordered]@{
@@ -269,8 +265,10 @@ jobs:
           SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          EXPECTED_SIGNING_SUBJECT: ${{ vars.AZURE_SIGNING_SUBJECT }}
         run: |
-          if (-not $env:SIGNING_ENDPOINT -or -not $env:SIGNING_ACCOUNT -or -not $env:SIGNING_PROFILE) {
+          if (-not $env:SIGNING_ENDPOINT -or -not $env:SIGNING_ACCOUNT -or `
+              -not $env:SIGNING_PROFILE -or -not $env:EXPECTED_SIGNING_SUBJECT) {
             throw "Azure Artifact Signing environment variables are incomplete"
           }
 
@@ -295,11 +293,18 @@ jobs:
 
       - name: Verify signature and refresh manifest
         shell: pwsh
+        env:
+          EXPECTED_SIGNING_SUBJECT: ${{ vars.AZURE_SIGNING_SUBJECT }}
+          SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
         run: |
           $installer = Get-ChildItem windows-artifact -Filter *.exe | Select-Object -First 1
           if (-not $installer) { throw "Signed installer is missing" }
           $signature = Get-AuthenticodeSignature $installer.FullName
           if ($signature.Status -ne "Valid") { throw "Authenticode status is $($signature.Status)" }
+          if (-not $signature.SignerCertificate) { throw "Authenticode signer certificate is missing" }
+          if ($signature.SignerCertificate.Subject -ne $env:EXPECTED_SIGNING_SUBJECT) {
+            throw "Authenticode publisher does not match the approved Azure signing subject"
+          }
           $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 
           $syftArchive = Join-Path $env:RUNNER_TEMP "syft_1.44.0_windows_amd64.zip"
@@ -321,12 +326,16 @@ jobs:
           $versionManifest = Get-Content $versionManifestPath | ConvertFrom-Json
           $versionManifest.sha256 = $hash
           $versionManifest.signed = $true
+          $versionManifest.signingProfile = $env:SIGNING_PROFILE
+          $versionManifest.publisherSubject = $signature.SignerCertificate.Subject
           $versionManifest | ConvertTo-Json -Depth 10 | Set-Content $versionManifestPath -Encoding utf8
 
           $provenancePath = "windows-artifact/provenance.json"
           $provenance = Get-Content $provenancePath | ConvertFrom-Json
           $provenance.subject[0].digest.sha256 = $hash
           $provenance.predicate.buildDefinition.externalParameters.signed = $true
+          $provenance.predicate.buildDefinition.externalParameters.signingProfile = $env:SIGNING_PROFILE
+          $provenance.predicate.buildDefinition.externalParameters.publisherSubject = $signature.SignerCertificate.Subject
           $provenance | ConvertTo-Json -Depth 10 | Set-Content $provenancePath -Encoding utf8
 
           Get-ChildItem windows-artifact -File |

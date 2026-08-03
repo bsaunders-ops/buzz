@@ -53,6 +53,8 @@ key_vault_name=$(read_config_string keyVaultName)
 origin_fqdn=$(read_config_string originFqdn)
 origin_secret_name=$(read_config_string originSecretName)
 front_door_id=$(read_config_string frontDoorId)
+public_host=$(read_config_string publicHost)
+relay_owner_pubkey=$(read_config_string relayOwnerPubkey)
 bootstrap_bundle_image=$(read_config_string bootstrapBundleImage)
 relay_image=$(read_config_string relayImage)
 postgres_image=$(read_config_string postgresImage)
@@ -86,6 +88,19 @@ if [[ ! $front_door_id =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89
   echo "frontDoorId is invalid" >&2
   exit 2
 fi
+if [[ ! $public_host =~ ^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$ || $public_host != *.* || $public_host == *..* ]]; then
+  echo "publicHost is invalid" >&2
+  exit 2
+fi
+if [[ -n $relay_owner_pubkey && ! $relay_owner_pubkey =~ ^[0-9a-fA-F]{64}$ ]]; then
+  echo "relayOwnerPubkey must be empty or a 64-character hex public key" >&2
+  exit 2
+fi
+relay_owner_pubkey=${relay_owner_pubkey,,}
+if [[ $start_services == true && -z $relay_owner_pubkey ]]; then
+  echo "relayOwnerPubkey is required when startServices is true" >&2
+  exit 2
+fi
 
 image_pattern='^[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$'
 for image in "$bootstrap_bundle_image" "$relay_image" "$postgres_image" "$redis_image" "$minio_image" "$minio_mc_image" "$caddy_image"; do
@@ -107,10 +122,45 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+for early_guard in /usr/local/sbin/buzz-core-docker-activation /usr/local/sbin/buzz-core-container-firewall; do
+  if [[ ! -x $early_guard ]]; then
+    echo "bootstrap preload is missing $early_guard" >&2
+    exit 1
+  fi
+done
+/usr/local/sbin/buzz-core-docker-activation prepare
+
+azure_config_dir=''
+docker_config_dir=''
+tmp_config=''
+tmp_docker_dropin=''
+
+cleanup_bootstrap() {
+  if [[ -n $tmp_config ]]; then
+    rm -f -- "$tmp_config"
+  fi
+  if [[ -n $tmp_docker_dropin ]]; then
+    rm -f -- "$tmp_docker_dropin"
+  fi
+  if [[ -n $azure_config_dir && $azure_config_dir == /run/buzz/azure-cli.bootstrap.* ]]; then
+    rm -rf -- "$azure_config_dir"
+  fi
+  if [[ -n $docker_config_dir && $docker_config_dir == /run/buzz/docker.bootstrap.* ]]; then
+    rm -rf -- "$docker_config_dir"
+  fi
+}
+trap cleanup_bootstrap EXIT
+
+install -d -m 0700 /run/buzz
+azure_config_dir=$(mktemp -d /run/buzz/azure-cli.bootstrap.XXXXXX)
+docker_config_dir=$(mktemp -d /run/buzz/docker.bootstrap.XXXXXX)
+export AZURE_CONFIG_DIR=$azure_config_dir
+export DOCKER_CONFIG=$docker_config_dir
+
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl gnupg jq python3 xfsprogs
+  apt-get install -y --no-install-recommends ca-certificates curl gnupg iptables jq python3 util-linux xfsprogs
 }
 
 install_docker() {
@@ -129,6 +179,20 @@ install_docker() {
   apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }
 
+ensure_docker_running() {
+  install -d -m 0755 /etc/systemd/system/docker.service.d
+  tmp_docker_dropin=$(mktemp /etc/systemd/system/docker.service.d/20-buzz-imds-firewall.conf.XXXXXX)
+  cat >"$tmp_docker_dropin" <<'EOF'
+[Service]
+ExecStartPre=/usr/local/sbin/buzz-core-container-firewall --baseline
+ExecStartPost=/usr/local/sbin/buzz-core-container-firewall
+EOF
+  chmod 0644 "$tmp_docker_dropin"
+  mv -f "$tmp_docker_dropin" /etc/systemd/system/docker.service.d/20-buzz-imds-firewall.conf
+  tmp_docker_dropin=''
+  /usr/local/sbin/buzz-core-docker-activation start
+}
+
 install_azure_cli() {
   if command -v az >/dev/null 2>&1; then
     return
@@ -145,9 +209,37 @@ install_azure_cli() {
   apt-get install -y --no-install-recommends azure-cli
 }
 
+parent_disk() {
+  local node
+  local parent_name
+  node=$(readlink -f "$1")
+  parent_name=$(lsblk -ndo PKNAME "$node" | head -n1)
+  if [[ -n $parent_name ]]; then
+    readlink -f "/dev/$parent_name"
+  else
+    printf '%s\n' "$node"
+  fi
+}
+
 mount_data_disk() {
   local device=/dev/disk/azure/scsi1/lun0
   local resolved
+  local root_source
+  local root_disk
+  local resolved_disk
+  local existing_mount_source
+  local existing_mount_disk
+  local device_size
+  local expected_min_bytes=$((255 * 1024 * 1024 * 1024))
+  local expected_max_bytes=$((257 * 1024 * 1024 * 1024))
+  local filesystem_type
+  local filesystem_label
+  local signatures
+  local uuid
+  local existing_fstab_source
+  local -a topology
+  local -a mountpoints
+
   for _ in {1..60}; do
     [[ -e $device ]] && break
     sleep 2
@@ -157,13 +249,79 @@ mount_data_disk() {
     exit 1
   fi
   resolved=$(readlink -f "$device")
-  if ! blkid "$resolved" >/dev/null 2>&1; then
-    mkfs.xfs -f -L buzz-data "$resolved"
+  if [[ ! -b $resolved ]]; then
+    echo "Azure data disk LUN 0 did not resolve to a block device" >&2
+    exit 1
   fi
-  local uuid
+
+  root_source=$(findmnt -n -o SOURCE /)
+  root_disk=$(parent_disk "$root_source")
+  resolved_disk=$(parent_disk "$resolved")
+  if [[ $resolved == "$root_disk" || $resolved_disk == "$root_disk" ]]; then
+    echo "refusing to treat the OS/root disk as the Core data disk" >&2
+    exit 1
+  fi
+
+  existing_mount_source=$(findmnt -n -o SOURCE --mountpoint /srv/buzz 2>/dev/null || true)
+  if [[ -n $existing_mount_source ]]; then
+    existing_mount_disk=$(parent_disk "$existing_mount_source")
+    if [[ $existing_mount_disk != "$resolved_disk" ]]; then
+      echo "refusing to reuse /srv/buzz while it is mounted from another disk" >&2
+      exit 1
+    fi
+  fi
+
+  device_size=$(blockdev --getsize64 "$resolved")
+  if ((device_size < expected_min_bytes || device_size > expected_max_bytes)); then
+    echo "Core data disk must be the approved 256-GiB disk" >&2
+    exit 1
+  fi
+
+  mapfile -t topology < <(lsblk -nrpo NAME,TYPE "$resolved")
+  if ((${#topology[@]} != 1)) || [[ ${topology[0]} != "$resolved disk" ]]; then
+    echo "Core data disk must be a raw disk with no partitions or child devices" >&2
+    exit 1
+  fi
+
+  mapfile -t mountpoints < <(lsblk -nrpo MOUNTPOINT "$resolved" | sed '/^[[:space:]]*$/d')
+  if ((${#mountpoints[@]} > 1)) || ((${#mountpoints[@]} == 1)) && [[ ${mountpoints[0]} != /srv/buzz ]]; then
+    echo "Core data disk is mounted at an unexpected location" >&2
+    exit 1
+  fi
+
+  filesystem_type=$(blkid -s TYPE -o value "$resolved" 2>/dev/null || true)
+  filesystem_label=$(blkid -s LABEL -o value "$resolved" 2>/dev/null || true)
+  if [[ -z $filesystem_type ]]; then
+    if ((${#mountpoints[@]} != 0)); then
+      echo "blank Core data disk unexpectedly reports a mount" >&2
+      exit 1
+    fi
+    signatures=$(wipefs --noheadings --output TYPE "$resolved" | tr -d '[:space:]')
+    if [[ -n $signatures ]]; then
+      echo "refusing to format a Core data disk with an existing signature" >&2
+      exit 1
+    fi
+    mkfs.xfs -L buzz-data "$resolved"
+    filesystem_type=xfs
+    filesystem_label=buzz-data
+  fi
+  if [[ $filesystem_type != xfs || $filesystem_label != buzz-data ]]; then
+    echo "Core data disk must contain only the expected buzz-data XFS filesystem" >&2
+    exit 1
+  fi
+
   uuid=$(blkid -s UUID -o value "$resolved")
+  if [[ -z $uuid ]]; then
+    echo "Core data disk has no filesystem UUID" >&2
+    exit 1
+  fi
   install -d -m 0750 /srv/buzz
-  if ! grep -Fq "UUID=$uuid " /etc/fstab; then
+  existing_fstab_source=$(awk '$2 == "/srv/buzz" { print $1; exit }' /etc/fstab)
+  if [[ -n $existing_fstab_source && $existing_fstab_source != "UUID=$uuid" ]]; then
+    echo "existing /srv/buzz fstab entry targets a different device" >&2
+    exit 1
+  fi
+  if [[ -z $existing_fstab_source ]]; then
     printf 'UUID=%s /srv/buzz xfs defaults,nofail,nodev,nosuid 0 2\n' "$uuid" >> /etc/fstab
   fi
   if ! mountpoint -q /srv/buzz; then
@@ -173,10 +331,24 @@ mount_data_disk() {
 
 extract_verified_bundle() {
   local expected_digest=${bootstrap_bundle_image##*@}
+  local digest_hex=${expected_digest#sha256:}
   local actual_digest
-  local container_id
-  install -d -m 0750 /opt/buzz/bootstrap-bundle
-  rm -rf /opt/buzz/bootstrap-bundle/*
+  local container_id=''
+  local bundle_root=/opt/buzz/bootstrap-bundles
+  local bundle_target="$bundle_root/$digest_hex"
+  local staging_dir=''
+
+  cleanup_bundle_extract() {
+    if [[ -n $container_id ]]; then
+      docker rm -f "$container_id" >/dev/null 2>&1 || true
+    fi
+    if [[ -n $staging_dir && $staging_dir == "$bundle_root"/.* ]]; then
+      rm -rf -- "$staging_dir"
+    fi
+  }
+  trap cleanup_bundle_extract RETURN ERR
+
+  install -d -m 0750 "$bundle_root"
   az login --identity --allow-no-subscriptions --output none >/dev/null
   az acr login --name "$acr_name" --output none >/dev/null
   docker pull "$bootstrap_bundle_image" >/dev/null
@@ -184,23 +356,42 @@ extract_verified_bundle() {
     | awk -F@ -v expected="$expected_digest" '$2 == expected { print $2; exit }')
   if [[ $actual_digest != "$expected_digest" ]]; then
     echo "bootstrap bundle digest verification failed" >&2
-    exit 1
+    return 1
   fi
+
+  if [[ -f $bundle_target/.bundle-digest ]] && [[ $(<"$bundle_target/.bundle-digest") == "$expected_digest" ]]; then
+    asset_dir=$bundle_target
+    trap - RETURN ERR
+    return
+  fi
+
+  staging_dir=$(mktemp -d "$bundle_root/.${digest_hex}.XXXXXX")
   container_id=$(docker create "$bootstrap_bundle_image")
-  trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' RETURN
-  docker cp "$container_id:/bundle/." /opt/buzz/bootstrap-bundle/
+  docker cp "$container_id:/bundle/." "$staging_dir/"
   docker rm -f "$container_id" >/dev/null
-  trap - RETURN
+  container_id=''
+  printf '%s\n' "$expected_digest" >"$staging_dir/.bundle-digest"
+  chmod 0440 "$staging_dir/.bundle-digest"
+  if ! mv -T "$staging_dir" "$bundle_target" 2>/dev/null; then
+    if [[ ! -f $bundle_target/.bundle-digest ]] || [[ $(<"$bundle_target/.bundle-digest") != "$expected_digest" ]]; then
+      echo "verified bootstrap bundle target already exists with different contents" >&2
+      return 1
+    fi
+    rm -rf -- "$staging_dir"
+  fi
+  staging_dir=''
+  asset_dir=$bundle_target
+  trap - RETURN ERR
 }
 
 install_packages
 install_docker
+ensure_docker_running
 install_azure_cli
 mount_data_disk
 extract_verified_bundle
 
-asset_dir=/opt/buzz/bootstrap-bundle
-for asset in refresh-secrets.sh buzz-core.service compose.yml compose.azure.yml Caddyfile.azure; do
+for asset in compose-supervisor.sh container-firewall.sh docker-activation.sh docker-post-start.sh service-activation.sh refresh-secrets.sh buzz-core.service compose.yml compose.azure.yml Caddyfile.azure; do
   if [[ ! -f $asset_dir/$asset ]]; then
     echo "verified bootstrap bundle is missing $asset" >&2
     exit 1
@@ -212,17 +403,34 @@ install -d -m 0750 -o 1000 -g 1000 /srv/buzz/git /srv/buzz/minio
 install -d -m 0750 -o 999 -g 999 /srv/buzz/postgres /srv/buzz/redis
 
 install -m 0755 "$asset_dir/refresh-secrets.sh" /usr/local/sbin/buzz-core-refresh-secrets
+install -m 0755 "$asset_dir/container-firewall.sh" /usr/local/sbin/buzz-core-container-firewall
+install -m 0755 "$asset_dir/service-activation.sh" /usr/local/sbin/buzz-core-service-activation
+install -m 0755 "$asset_dir/compose-supervisor.sh" /usr/local/sbin/buzz-core-compose-supervisor
+install -m 0755 "$asset_dir/docker-activation.sh" /usr/local/sbin/buzz-core-docker-activation
+install -m 0755 "$asset_dir/docker-post-start.sh" /usr/local/sbin/buzz-core-docker-post-start
 install -m 0644 "$asset_dir/buzz-core.service" /etc/systemd/system/buzz-core.service
 install -m 0644 "$asset_dir/compose.yml" /opt/buzz/deploy/compose/compose.yml
 install -m 0644 "$asset_dir/compose.azure.yml" /opt/buzz/infra/azure/compose/compose.azure.yml
 install -m 0644 "$asset_dir/Caddyfile.azure" /opt/buzz/infra/azure/compose/Caddyfile.azure
 
+install -d -m 0755 /etc/systemd/system/docker.service.d
+tmp_docker_dropin=$(mktemp /etc/systemd/system/docker.service.d/20-buzz-imds-firewall.conf.XXXXXX)
+cat >"$tmp_docker_dropin" <<'EOF'
+[Service]
+ExecStartPre=/usr/local/sbin/buzz-core-container-firewall --baseline
+ExecStartPost=/usr/local/sbin/buzz-core-docker-post-start
+EOF
+chmod 0644 "$tmp_docker_dropin"
+mv -f "$tmp_docker_dropin" /etc/systemd/system/docker.service.d/20-buzz-imds-firewall.conf
+tmp_docker_dropin=''
+
 tmp_config=$(mktemp /etc/buzz/core.env.XXXXXX)
-trap 'rm -f "$tmp_config"' EXIT
 cat >"$tmp_config" <<EOF
 ACR_NAME=$acr_name
 KEY_VAULT_NAME=$key_vault_name
 BUZZ_ORIGIN_FQDN=$origin_fqdn
+BUZZ_PUBLIC_HOST=$public_host
+RELAY_OWNER_PUBKEY=$relay_owner_pubkey
 ORIGIN_SECRET_NAME=$origin_secret_name
 AZURE_FRONT_DOOR_ID=$front_door_id
 ORIGIN_TLS_CERT_SECRET_NAME=origin-tls-certificate
@@ -240,16 +448,12 @@ MINIO_IMAGE=$minio_image
 MINIO_MC_IMAGE=$minio_mc_image
 CADDY_IMAGE=$caddy_image
 BUZZ_AZURE_ASSET_ROOT=/opt/buzz/infra/azure
+DOCKER_CONFIG=/run/buzz/docker
 EOF
 chmod 0640 "$tmp_config"
 mv -f "$tmp_config" /etc/buzz/core.env
-trap - EXIT
+tmp_config=''
 
 systemctl daemon-reload
-systemctl enable docker.service
-if [[ $start_services == true ]]; then
-  systemctl enable --now buzz-core.service
-else
-  systemctl disable buzz-core.service >/dev/null 2>&1 || true
-  echo "Core assets installed; service activation remains gated."
-fi
+/usr/local/sbin/buzz-core-container-firewall
+/usr/local/sbin/buzz-core-service-activation "$start_services"

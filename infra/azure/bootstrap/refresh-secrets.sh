@@ -6,9 +6,27 @@ umask 077
 # shellcheck disable=SC1091
 . /etc/buzz/core.env
 
-install -d -m 0700 /run/buzz/secrets /run/buzz/caddy
+if [[ ${DOCKER_CONFIG:-} != /run/buzz/docker ]]; then
+  echo "DOCKER_CONFIG must be the volatile /run/buzz/docker directory" >&2
+  exit 1
+fi
+export DOCKER_CONFIG
+
+install -d -o 0 -g 0 -m 0700 /run/buzz /run/buzz/secrets /run/buzz/docker
+install -d -o 0 -g 1000 -m 0750 /run/buzz/caddy
 work_dir=$(mktemp -d /run/buzz/secrets.refresh.XXXXXX)
-trap 'rm -rf "$work_dir"' EXIT
+azure_config_dir=$(mktemp -d /run/buzz/azure-cli.refresh.XXXXXX)
+export AZURE_CONFIG_DIR=$azure_config_dir
+
+cleanup_refresh() {
+  if [[ $work_dir == /run/buzz/secrets.refresh.* ]]; then
+    rm -rf -- "$work_dir"
+  fi
+  if [[ $azure_config_dir == /run/buzz/azure-cli.refresh.* ]]; then
+    rm -rf -- "$azure_config_dir"
+  fi
+}
+trap cleanup_refresh EXIT
 
 az login --identity --allow-no-subscriptions --output none >/dev/null
 az acr login --name "$ACR_NAME" --output none >/dev/null

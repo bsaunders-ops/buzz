@@ -2,16 +2,15 @@ name: Azure foundation validation
 
 on:
   pull_request:
-    paths:
-      - "infra/azure/**"
-      - "deploy/compose/compose.yml"
-      - ".github/workflows/azure-foundation-validate.yml"
-      - ".github/workflows/azure-delivery.yml"
-      - "docs/azure-foundation-runbook.md"
   workflow_dispatch:
     inputs:
       enable_what_if:
         description: "Run the OIDC-authenticated subscription what-if (requires environment approval)"
+        type: boolean
+        required: true
+        default: false
+      enable_clean_volume_smoke:
+        description: "Build the relay and run the isolated blank-volume migration smoke"
         type: boolean
         required: true
         default: false
@@ -39,8 +38,14 @@ jobs:
           az bicep build --file infra/azure/main.bicep --stdout >/dev/null
           bash -n infra/azure/audit/lock-retention.sh
 
-      - name: Run offline structural and Compose contracts
-        run: python3 infra/azure/tests/test_contracts.py
+      - name: Run offline structural, Compose, and Caddy runtime contracts
+        env:
+          CADDY_TEST_IMAGE: docker.io/library/caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+          OPENSSL_TEST_IMAGE: docker.io/alpine/openssl@sha256:42c7389ef077aed0eb4e96d0abbd094083d701bbaff1313073b061c0c9cd8278
+          FIREWALL_TEST_IMAGE: docker.io/nicolaka/netshoot@sha256:a20c2531bf35436ed3766cd6cfe89d352b050ccc4d7005ce6400adf97503da1b
+          DIND_TEST_IMAGE: docker.io/library/docker@sha256:2a232a42256f70d78e3cc5d2b5d6b3276710a0de0596c145f627ecfae90282ac
+          DIND_WORKLOAD_IMAGE: docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+        run: bash infra/azure/tests/run.sh
 
       - name: Render hardened Compose project independently
         env:
@@ -56,7 +61,46 @@ jobs:
           BUZZ_S3_SECRET_KEY: validation-only
           BUZZ_ORIGIN_FQDN: origin.invalid
           AZURE_FRONT_DOOR_ID: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+          BUZZ_PUBLIC_HOST: buzz.validation.invalid
+          RELAY_OWNER_PUBKEY: 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
         run: docker compose -f deploy/compose/compose.yml -f infra/azure/compose/compose.azure.yml config --quiet
+
+  clean-volume-smoke:
+    name: Required blank-volume relay smoke
+    if: github.event_name == 'pull_request' || inputs.enable_clean_volume_smoke
+    needs: offline-contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Build the source relay runtime image
+        env:
+          SMOKE_RUST_BUILD_IMAGE: docker.io/library/rust@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+          SMOKE_NODE_BUILD_IMAGE: docker.io/library/node@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7
+          SMOKE_DEBIAN_RUNTIME_IMAGE: docker.io/library/debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+        run: |
+          docker build \
+            --build-arg RUST_BUILD_IMAGE="$SMOKE_RUST_BUILD_IMAGE" \
+            --build-arg NODE_BUILD_IMAGE="$SMOKE_NODE_BUILD_IMAGE" \
+            --build-arg DEBIAN_RUNTIME_IMAGE="$SMOKE_DEBIAN_RUNTIME_IMAGE" \
+            --target runtime \
+            --tag core-buzz-relay:azure-smoke \
+            .
+
+      - name: Run isolated blank-volume migration smoke
+        env:
+          SMOKE_POSTGRES_IMAGE: docker.io/pgvector/pgvector@sha256:7ae6051efd0e60444282c27c7e141af07f322ce033300e727a49c3dd11075e38
+          SMOKE_REDIS_IMAGE: docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+          SMOKE_MINIO_IMAGE: docker.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+          SMOKE_MINIO_MC_IMAGE: docker.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+          SMOKE_CADDY_IMAGE: docker.io/library/caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+        run: bash infra/azure/tests/smoke-clean-volume.sh core-buzz-relay:azure-smoke
 
   what-if:
     name: Approved Azure subscription what-if
@@ -83,6 +127,7 @@ jobs:
           ORIGIN_FQDN: ${{ vars.BUZZ_ORIGIN_FQDN }}
           ALERT_EMAIL: ${{ vars.AZURE_ALERT_EMAIL }}
           UBUNTU_IMAGE_VERSION: ${{ vars.AZURE_UBUNTU_IMAGE_VERSION }}
+          RELAY_OWNER_PUBKEY: ${{ vars.RELAY_OWNER_PUBKEY }}
           RELAY_IMAGE: ${{ vars.BUZZ_RELAY_IMAGE }}
           POSTGRES_IMAGE: ${{ vars.POSTGRES_IMAGE }}
           REDIS_IMAGE: ${{ vars.REDIS_IMAGE }}
@@ -95,6 +140,7 @@ jobs:
           for value in NAME_PREFIX ORIGIN_FQDN ALERT_EMAIL UBUNTU_IMAGE_VERSION; do
             [[ -n "${!value}" ]] || { echo "::error::$value is unset"; exit 1; }
           done
+          [[ "$RELAY_OWNER_PUBKEY" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "::error::RELAY_OWNER_PUBKEY is invalid"; exit 1; }
           for value in BOOTSTRAP_BUNDLE_IMAGE RELAY_IMAGE POSTGRES_IMAGE REDIS_IMAGE MINIO_IMAGE MINIO_MC_IMAGE CADDY_IMAGE; do
             [[ "${!value}" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "::error::$value is not digest-pinned"; exit 1; }
           done
@@ -118,6 +164,7 @@ jobs:
           ADMIN_PUBLIC_KEY: ${{ secrets.AZURE_ADMIN_PUBLIC_KEY }}
           ORIGIN_SECRET: ${{ secrets.BUZZ_ORIGIN_SECRET }}
           UBUNTU_IMAGE_VERSION: ${{ vars.AZURE_UBUNTU_IMAGE_VERSION }}
+          RELAY_OWNER_PUBKEY: ${{ vars.RELAY_OWNER_PUBKEY }}
           RELAY_IMAGE: ${{ vars.BUZZ_RELAY_IMAGE }}
           POSTGRES_IMAGE: ${{ vars.POSTGRES_IMAGE }}
           REDIS_IMAGE: ${{ vars.REDIS_IMAGE }}
@@ -138,6 +185,7 @@ jobs:
               ubuntuImageVersion="$UBUNTU_IMAGE_VERSION" \
               originFqdn="$ORIGIN_FQDN" \
               originSecret="$ORIGIN_SECRET" \
+              relayOwnerPubkey="$RELAY_OWNER_PUBKEY" \
               bootstrapBundleImage="$BOOTSTRAP_BUNDLE_IMAGE" \
               alertEmail="$ALERT_EMAIL" \
               relayImage="$RELAY_IMAGE" \

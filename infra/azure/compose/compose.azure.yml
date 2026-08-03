@@ -11,16 +11,29 @@ x-hardening: &hardening
 services:
   relay:
     <<: *hardening
+    restart: "no"
     image: ${BUZZ_RELAY_IMAGE:?set BUZZ_RELAY_IMAGE to an ACR digest reference}
     user: "1000:1000"
     env_file: !override
       - path: /run/buzz/secrets/relay.env
         required: false
     environment:
-      DATABASE_URL: null
-      REDIS_URL: null
-      BUZZ_S3_ACCESS_KEY: null
-      BUZZ_S3_SECRET_KEY: null
+      DATABASE_URL: !reset null
+      REDIS_URL: !reset null
+      BUZZ_S3_ACCESS_KEY: !reset null
+      BUZZ_S3_SECRET_KEY: !reset null
+      RELAY_URL: wss://${BUZZ_PUBLIC_HOST:?set BUZZ_PUBLIC_HOST to the canonical Front Door host}
+      RELAY_OWNER_PUBKEY: ${RELAY_OWNER_PUBKEY:?set RELAY_OWNER_PUBKEY before activation}
+      BUZZ_AUTO_MIGRATE: "true"
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
+      BUZZ_REQUIRE_AUTH_TOKEN: "true"
+      BUZZ_ALLOW_NIP_OA_AUTH: "false"
+      BUZZ_PUSH_GATEWAY_DELIVERY_URL: ""
+      BUZZ_WEB_DIR: ""
+      BUZZ_ADMIN_WEB_DIR: ""
+      BUZZ_GIT_ENABLED: "false"
+      BUZZ_SERVE_GIT_WEB_GUI: "false"
+      BUZZ_HUDDLE_AUDIO_AVAILABLE: "false"
     ports: !reset []
     volumes: !override
       - /srv/buzz/git:/data/git
@@ -30,7 +43,6 @@ services:
       - edge
       - relay-data
       - broker
-      - egress
     deploy:
       resources:
         limits:
@@ -42,13 +54,14 @@ services:
 
   postgres:
     <<: *hardening
+    restart: "no"
     image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE to a pgvector digest reference}
     user: "999:999"
     env_file: !override
       - path: /run/buzz/secrets/postgres.env
         required: false
     environment:
-      POSTGRES_PASSWORD: null
+      POSTGRES_PASSWORD: !reset null
     volumes: !override
       - /srv/buzz/postgres:/var/lib/postgresql/data
     tmpfs:
@@ -67,13 +80,14 @@ services:
 
   redis:
     <<: *hardening
+    restart: "no"
     image: ${REDIS_IMAGE:?set REDIS_IMAGE to a digest reference}
     user: "999:999"
     env_file: !override
       - path: /run/buzz/secrets/redis.env
         required: false
     environment:
-      REDIS_PASSWORD: null
+      REDIS_PASSWORD: !reset null
     command:
       - /bin/sh
       - -euc
@@ -95,14 +109,15 @@ services:
 
   minio:
     <<: *hardening
+    restart: "no"
     image: ${MINIO_IMAGE:?set MINIO_IMAGE to a digest reference}
     user: "1000:1000"
     env_file: !override
       - path: /run/buzz/secrets/minio.env
         required: false
     environment:
-      MINIO_ROOT_USER: null
-      MINIO_ROOT_PASSWORD: null
+      MINIO_ROOT_USER: !reset null
+      MINIO_ROOT_PASSWORD: !reset null
     volumes: !override
       - /srv/buzz/minio:/data
     tmpfs:
@@ -120,14 +135,15 @@ services:
 
   minio-init:
     <<: *hardening
+    restart: "no"
     image: ${MINIO_MC_IMAGE:?set MINIO_MC_IMAGE to a digest reference}
     user: "1000:1000"
     env_file: !override
       - path: /run/buzz/secrets/minio-init.env
         required: false
     environment:
-      BUZZ_S3_ACCESS_KEY: null
-      BUZZ_S3_SECRET_KEY: null
+      BUZZ_S3_ACCESS_KEY: !reset null
+      BUZZ_S3_SECRET_KEY: !reset null
       MC_CONFIG_DIR: /tmp/mc
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=1770
@@ -150,6 +166,7 @@ services:
 
   caddy:
     <<: *hardening
+    restart: "no"
     image: ${CADDY_IMAGE:?set CADDY_IMAGE to a digest reference}
     user: "1000:1000"
     depends_on:
@@ -179,10 +196,9 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-    restart: unless-stopped
     networks: !override
+      - ingress
       - edge
-      - egress
     deploy:
       resources:
         limits:
@@ -201,17 +217,33 @@ volumes:
       com.buzz.volume: caddy-config
 
 networks:
+  ingress:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: buzz-ingress
   edge:
     driver: bridge
     internal: true
+    driver_opts:
+      com.docker.network.bridge.name: buzz-edge
   relay-data:
     driver: bridge
     internal: true
+    driver_opts:
+      com.docker.network.bridge.name: buzz-data
   broker:
     driver: bridge
     internal: true
+    driver_opts:
+      com.docker.network.bridge.name: buzz-broker
   connector-internal:
     driver: bridge
     internal: true
+    driver_opts:
+      com.docker.network.bridge.name: buzz-connector
   egress:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: buzz-egress
+    # Reserved for future constrained connector egress. No Month-1 service
+    # joins this network. Caddy uses its dedicated ingress bridge instead.

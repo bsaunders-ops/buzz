@@ -11,17 +11,26 @@ The subscription-scoped `infra/azure/main.bicep` creates one East US 2 resource
 group and composes focused network, security, compute, Front Door/WAF,
 monitoring/backup, audit-storage, and budget modules. The VM is Ubuntu 24.04
 Trusted Launch on `Standard_D4as_v5`, with a 256-GiB P15 data disk. Its NSG has
-one custom inbound allow: TCP 443 from `AzureFrontDoor.Backend`. There is no
-permanent public administration rule; use Entra VM login with JIT or Azure Run
-Command.
+one custom inbound allow: TCP 443 from `AzureFrontDoor.Backend`. An explicit
+priority-200 deny follows it, overriding Azure's default VNet inbound allow for
+all other traffic, including future peers. There is no permanent public
+administration rule; use Entra VM login with JIT or Azure Run Command.
 
-Front Door adds `X-Buzz-Origin-Secret` and probes `/origin-healthz`. Caddy
-requires both that secret and the exact profile GUID in `X-Azure-FDID`, then
-presents an operator-provided origin certificate. The service-tag IPs are shared
-by Front Door customers, so either header check by itself is insufficient. The
+Front Door adds `X-Buzz-Origin-Secret` to routed client requests and probes
+`/origin-healthz`. Only an exact `GET` or `HEAD` to that path carrying Front
+Door's reserved `X-FD-HealthProbe: 1` marker bypasses the route headers and is
+proxied to relay readiness. Ordinary traffic requires both the exact profile
+GUID in `X-Azure-FDID` and the route-added origin secret. Caddy then presents an operator-provided
+origin certificate. The service-tag IPs are shared by Front Door customers, so
+either ordinary-traffic header check by itself is insufficient. The
 Compose overlay runs only services that exist in the supported single-node
 bundle. The reserved `connector-internal` network is intentionally empty until
-real connector binaries are delivered; do not add stand-in images.
+real connector binaries are delivered; do not add stand-in images. Caddy alone
+joins the non-internal `ingress` bridge for host-published TLS and the internal
+`edge` bridge for relay access; it never joins general `egress`. Stable bridge
+names let the persistent `DOCKER-USER`/`INPUT` firewall reject container access
+to IMDS, Caddy-initiated external forwarding, and new traffic from every Core bridge to the host
+while preserving published ingress replies and host-managed-identity access.
 
 The approved Standard tier supports custom WAF and rate-limit rules but not the
 Microsoft-managed Default/Bot rule sets. Those require Front Door Premium and
@@ -59,8 +68,11 @@ Each gate needs a separate approval; one approval does not imply the next.
 7. **Immutability lock:** approve only after a disposable account rehearsal and
    restore evidence. A locked policy is irreversible.
 8. **Windows signing:** provision the Artifact Signing account/profile and
-   approve the `azure-trusted-signing` environment. Unsigned build approval does
-   not authorize signing or Intune distribution.
+   approved certificate subject, then configure `AZURE_SIGNING_ENDPOINT`,
+   `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE`, and
+   `AZURE_SIGNING_SUBJECT` in the protected `azure-trusted-signing`
+   environment. Unsigned build approval does not authorize signing or Intune
+   distribution.
 
 ## Prerequisites
 
@@ -95,9 +107,12 @@ Activate the repository toolchain first:
 
 ```bash
 . ./bin/activate-hermit
-python3 infra/azure/tests/test_contracts.py
 az bicep build --file infra/azure/main.bicep --stdout >/dev/null
 bash -n infra/azure/audit/lock-retention.sh
+export CADDY_TEST_IMAGE='docker.io/library/caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d'
+export OPENSSL_TEST_IMAGE='docker.io/alpine/openssl@sha256:42c7389ef077aed0eb4e96d0abbd094083d701bbaff1313073b061c0c9cd8278'
+export FIREWALL_TEST_IMAGE='docker.io/nicolaka/netshoot@sha256:a20c2531bf35436ed3766cd6cfe89d352b050ccc4d7005ce6400adf97503da1b'
+bash infra/azure/tests/run.sh
 ```
 
 Render the merged Compose model with non-secret validation values. Every image
@@ -115,10 +130,24 @@ export BUZZ_S3_ACCESS_KEY=validation-only BUZZ_S3_SECRET_KEY=validation-only
 export BUZZ_ORIGIN_FQDN=origin.invalid
 export BUZZ_ORIGIN_SECRET=validation-only
 export AZURE_FRONT_DOOR_ID=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+export BUZZ_PUBLIC_HOST=buzz.validation.invalid
+export RELAY_OWNER_PUBKEY=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
 docker compose \
   -f deploy/compose/compose.yml \
   -f infra/azure/compose/compose.azure.yml \
   config --quiet
+```
+
+Before approving a relay image, exercise the production binary against truly
+blank, isolated storage. The smoke script creates a unique Compose project and
+temporary bind roots and removes only those resources when it exits. It is a
+required job for every pull request; manual dispatches use
+`enable_clean_volume_smoke=true`. The Dockerfile frontend, build stages, and
+every Compose dependency are supplied by immutable digest:
+
+```bash
+docker build --target runtime --tag core-buzz-relay:azure-smoke .
+bash infra/azure/tests/smoke-clean-volume.sh core-buzz-relay:azure-smoke
 ```
 
 If `az`/Bicep or Compose is missing, record the absence and use the
@@ -141,7 +170,7 @@ az deployment sub what-if \
 ```
 
 Export the JSON what-if result for review and confirm: no inbound destination
-other than 443, no broad source prefix, no VM power-off schedule, no DNS record,
+other than 443, no broad source prefix on an allow rule, no VM power-off schedule, no DNS record,
 no immutable `Locked` state, and no service activation. Treat replacement of a
 VM, disk, vault, Front Door profile, storage account, or public IP as a stop.
 
@@ -152,7 +181,27 @@ then use the separate image-publication gate to import the `FROM scratch`
 bootstrap bundle into the new ACR. Record its registry digest, rerun what-if
 with `bootstrapBundleImage=<acr>/...@sha256:<digest>` and
 `enableHostBootstrap=true`, and obtain a second deployment approval. Keep
-`startCoreServices=false` during that second phase.
+`startCoreServices=false` during that second phase. The bootstrap derives the
+canonical public relay host from the custom domain when configured and from the
+Front Door endpoint otherwise. Supply Blake's 64-character x-only public key as
+`relayOwnerPubkey` before activation; `startCoreServices=true` fails closed when
+that value is empty or malformed. Re-running bootstrap with
+`startCoreServices=false` executes `disable --now` and fails if the running
+service cannot be stopped; `true` restarts an already-active unit so refreshed
+assets and secrets take effect.
+
+Docker never owns Core restart behavior: every Compose service uses
+`restart: "no"`. The foreground supervisor runs the initializer as a preflight,
+watches only long-running services with `--abort-on-container-exit`, and maps
+even an unexpected clean exit to failure. Systemd bounds recovery to five
+attempts per ten minutes. Bootstrap masks Docker and its socket before package
+installation, preloads the firewall without depending on Docker, and installs
+a pre-start baseline before unmasking the daemon. That baseline blocks
+forwarded IMDS traffic and new host traffic from every `buzz-*` bridge before
+retained restart-policy containers can return. `PartOf=docker.service` stops
+Core during a Docker restart; Docker's post-start hook restores the full
+firewall before queuing an enabled Core unit. Container logs are not attached to journald, and
+`ExecStopPost` removes partial containers even when preflight fails.
 
 ## Secret provisioning and activation
 
@@ -164,11 +213,33 @@ Seed these exact Key Vault names through an approved secure operator session:
 - `frontdoor-origin-secret`
 - `origin-tls-certificate`, `origin-tls-private-key`
 
+`frontdoor-origin-secret` must be the exact generated value supplied as the
+deployment's secure `originSecret` parameter; generating a second value causes
+a complete origin outage. During the approved activation session, with shell
+tracing disabled, compare hashes without printing either value:
+
+```bash
+set +x
+expected_origin_hash=$(printf %s "$ORIGIN_SECRET" | sha256sum | cut -d' ' -f1)
+vault_origin_hash=$(az keyvault secret show \
+  --vault-name "$KEY_VAULT_NAME" --name frontdoor-origin-secret \
+  --query value --output tsv | sha256sum | cut -d' ' -f1)
+[[ $expected_origin_hash == "$vault_origin_hash" ]] || {
+  echo 'Front Door and Key Vault origin secrets do not match' >&2
+  exit 1
+}
+unset expected_origin_hash vault_origin_hash ORIGIN_SECRET
+```
+
 The dotenv values must be non-empty, single-line values limited to
 letters, digits, `.`, `_`, `~`, `+`, `/`, `=`, and `-`. The PEM certificate and
 private key retain their normal multiline form. `refresh-secrets.sh` retrieves
 only this allowlist, writes per-service files under `/run/buzz`, authenticates to
-ACR with the VM's managed identity, and never prints secret values.
+ACR with the VM's managed identity, and never prints secret values. Azure CLI
+tokens use a per-run `AZURE_CONFIG_DIR` under volatile `/run/buzz` and are
+deleted when refresh finishes. Docker's short-lived ACR login is retained only
+under root-only `/run/buzz/docker` so the immediately following Compose pull can
+use it; reboot clears it.
 
 After DNS and certificate verification, activate with Run Command rather than a
 permanent administration port:
@@ -185,13 +256,26 @@ Verify `systemctl status buzz-core`, `docker compose ps`, Caddy TLS, and relay
 readiness through Run Command. Do not enable Tauri self-update; the Windows
 workflow explicitly sets `createUpdaterArtifacts` to false.
 
+On the live VM, also verify `iptables -S DOCKER-USER` begins with the IMDS deny,
+followed by the established-reply allow and ingress-originated reject, and that
+`iptables -S INPUT` has established-reply allows before rejects for all six
+named `buzz-*` bridges. Restart Docker and `buzz-core`, then repeat the
+checks; the Docker drop-in and Core `ExecStartPre` must both restore policy.
+From a disposable test container, confirm DNS resolution still works while
+connections to `169.254.169.254`, either bridge gateway, and an external test
+listener fail. Confirm HTTPS through Front Door remains healthy.
+
 ## Front Door and WebSocket verification
 
-Before DNS cutover, verify the Front Door endpoint and then the custom domain:
+When no custom domain is configured, the Front Door endpoint is the canonical
+public host. Once a custom domain is configured, only that domain is linked to
+the route and the `azurefd.net` endpoint alias must not reach the relay. Before
+DNS cutover, resolve the validated custom name to Front Door locally and test
+the canonical name:
 
 ```bash
-curl --fail --show-error --silent 'https://<front-door-host>/_liveness'
-websocat -n1 'wss://<front-door-host>/' <<'EOF'
+curl --fail --show-error --silent 'https://<canonical-public-host>/_liveness'
+websocat -n1 'wss://<canonical-public-host>/' <<'EOF'
 ["REQ","origin-probe",{"kinds":[39000],"limit":1}]
 EOF
 ```
@@ -202,9 +286,13 @@ Front Door health probe remains healthy. Through VM Run Command, test Caddy's
 two independent header controls without printing their values: load
 `AZURE_FRONT_DOOR_ID` from `/etc/buzz/core.env` and `BUZZ_ORIGIN_SECRET` from
 `/run/buzz/secrets/caddy.env`, then require 403 for missing/wrong FDID with the
-correct secret, 403 for missing/wrong secret with the correct FDID, and 200 for
-both exact headers at `/origin-healthz`. Review Front Door metrics for origin
-health, 4xx/5xx, WAF blocks, and WebSocket disconnects.
+correct secret and 403 for missing/wrong secret with the correct FDID on an
+ordinary relay path. For `/origin-healthz`, require 403 without the exact
+`X-FD-HealthProbe: 1` marker, require 403 for `POST` even with the marker, and
+require 200 for exact `GET` and `HEAD` with only the marker (no FDID or route
+secret). Confirm the `azurefd.net` alias is unreachable after custom-domain
+activation. Review Front Door metrics for origin health, 4xx/5xx, WAF blocks,
+and WebSocket disconnects.
 
 Both Front Door routes explicitly disable caching so WebSocket Upgrade headers
 reach the relay. Front Door closes idle WebSockets after five minutes and can
@@ -223,6 +311,7 @@ Read-only checks:
 ```bash
 az monitor metrics alert list --resource-group '<approved-rg>' -o table
 az monitor action-group list --resource-group '<approved-rg>' -o table
+az monitor diagnostic-settings list --resource '<front-door-profile-resource-id>' -o jsonc
 az consumption budget show --budget-name '<approved-budget>' -o jsonc
 az consumption usage list --start-date '<yyyy-mm-01>' --end-date '<yyyy-mm-dd>' -o table
 ```
@@ -231,6 +320,11 @@ Sending an action-group test notification or deliberately stopping the VM is a
 separate operational mutation. Obtain approval, notify pilot users, run the
 test, confirm common-alert-schema delivery, then restore service immediately.
 Do not use auto-shutdown for Postgres, Redis, MinIO, or the relay.
+
+The Front Door diagnostic setting exports only `FrontDoorHealthProbeLog` and
+aggregate `AllMetrics`. Access and WAF request logs remain disabled because they
+can retain request URLs or matched body content. Inspect WAF blocks through
+aggregate metrics; do not enable content-bearing categories for this pilot.
 
 ## Backup restore rehearsal
 

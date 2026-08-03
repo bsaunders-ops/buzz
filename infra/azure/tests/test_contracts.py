@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 
@@ -65,7 +66,22 @@ class BicepContracts(unittest.TestCase):
         self.assertRegex(network, r"destinationPortRange:\s*'443'")
         self.assertNotRegex(network, r"destinationPortRange:\s*'22'")
         self.assertNotRegex(network, r"(?i)(allow|inbound).{0,40}ssh")
-        self.assertNotRegex(network, r"sourceAddressPrefix:\s*'\*'")
+        allow_rule = network[
+            network.index("name: 'AllowFrontDoorBackendHttps'") : network.index(
+                "name: 'DenyAllInbound'"
+            )
+        ]
+        self.assertNotRegex(allow_rule, r"sourceAddressPrefix:\s*'\*'")
+        deny_rule = network[network.index("name: 'DenyAllInbound'") :]
+        for expected in (
+            "priority: 200",
+            "access: 'Deny'",
+            "direction: 'Inbound'",
+            "protocol: '*'",
+            "destinationPortRange: '*'",
+            "sourceAddressPrefix: '*'",
+        ):
+            self.assertIn(expected, deny_rule)
 
     def test_compute_is_trusted_launch_with_required_disk(self) -> None:
         compute = read("infra/azure/modules/compute.bicep")
@@ -84,7 +100,6 @@ class BicepContracts(unittest.TestCase):
         edge = read("infra/azure/modules/edge.bicep")
         for expected in (
             "Standard_AzureFrontDoor",
-            "originHostHeader",
             "X-Buzz-Origin-Secret",
             "healthProbeSettings",
             "WebApplicationFirewall",
@@ -95,6 +110,24 @@ class BicepContracts(unittest.TestCase):
         self.assertRegex(edge, r"enabledState:\s*'Enabled'")
         self.assertRegex(edge, r"certificateType:\s*'ManagedCertificate'")
         self.assertEqual(edge.count("cacheConfiguration: null"), 2)
+        self.assertNotIn(
+            "originHostHeader",
+            edge,
+            "Front Door must preserve the public Host used for tenant and NIP auth binding",
+        )
+        self.assertIn(
+            "linkToDefaultDomain: customDomainEnabled ? 'Disabled' : 'Enabled'",
+            edge,
+        )
+        self.assertRegex(
+            edge,
+            r"resource\s+route\s+'[^']+'\s*=\s*if\s*\(!customDomainEnabled\)",
+            "default and custom-domain routes must be mutually exclusive",
+        )
+        self.assertRegex(
+            edge,
+            r"output\s+publicHost\s+string\s*=\s*customDomainEnabled\s*\?\s*customDomainHostName\s*:\s*endpoint\.properties\.hostName",
+        )
 
     def test_front_door_rate_limit_explicitly_covers_all_client_addresses(self) -> None:
         edge = read("infra/azure/modules/edge.bicep")
@@ -142,6 +175,27 @@ class BicepContracts(unittest.TestCase):
             )
         self.assertNotRegex(main + monitoring, r"(?i)auto.?shutdown")
 
+    def test_front_door_emits_content_free_health_diagnostics_and_alerts(self) -> None:
+        monitoring = read("infra/azure/modules/monitoring-backup.bicep")
+        main = read("infra/azure/main.bicep")
+        edge = read("infra/azure/modules/edge.bicep")
+        self.assertRegex(edge, r"output\s+profileName\s+string")
+        self.assertIn("frontDoorProfileName: edge.outputs.profileName", main)
+        self.assertIn("Microsoft.Cdn/profiles", monitoring)
+        self.assertIn("FrontDoorHealthProbeLog", monitoring)
+        self.assertIn("OriginHealthPercentage", monitoring)
+        self.assertIn("AllMetrics", monitoring)
+        self.assertNotIn(
+            "FrontDoorAccessLog",
+            monitoring,
+            "access logs can persist request URLs and are outside the no-content logging boundary",
+        )
+        self.assertNotIn(
+            "FrontDoorWebApplicationFirewallLog",
+            monitoring,
+            "WAF request logs can persist matched request content; use WAF metrics instead",
+        )
+
     def test_audit_retention_is_modeled_but_lock_requires_explicit_opt_in(self) -> None:
         audit = read("infra/azure/modules/audit-storage.bicep")
         lock = read("infra/azure/audit/lock-retention.sh")
@@ -168,6 +222,57 @@ class ComposeContracts(unittest.TestCase):
     def setUpClass(cls) -> None:
         if not shutil.which("docker"):
             raise unittest.SkipTest("docker executable is unavailable")
+        cls._fixture_dir = tempfile.TemporaryDirectory(prefix="buzz-compose-contract-")
+        fixture_dir = Path(cls._fixture_dir.name)
+        secret_values = {
+            "relay.env": {
+                "DATABASE_URL": "postgres://buzz:file-postgres@postgres:5432/buzz",
+                "REDIS_URL": "redis://:file-redis@redis:6379",
+                "BUZZ_S3_ACCESS_KEY": "file-access",
+                "BUZZ_S3_SECRET_KEY": "file-secret",
+                "BUZZ_RELAY_PRIVATE_KEY": "1" * 64,
+                "BUZZ_GIT_HOOK_HMAC_SECRET": "2" * 64,
+            },
+            "postgres.env": {"POSTGRES_PASSWORD": "file-postgres"},
+            "redis.env": {"REDIS_PASSWORD": "file-redis"},
+            "minio.env": {
+                "MINIO_ROOT_USER": "file-access",
+                "MINIO_ROOT_PASSWORD": "file-secret",
+            },
+            "minio-init.env": {
+                "BUZZ_S3_ACCESS_KEY": "file-access",
+                "BUZZ_S3_SECRET_KEY": "file-secret",
+            },
+            "caddy.env": {"BUZZ_ORIGIN_SECRET": "file-origin-secret"},
+        }
+        for name, values in secret_values.items():
+            (fixture_dir / name).write_text(
+                "".join(f"{key}={value}\n" for key, value in values.items()),
+                encoding="utf-8",
+            )
+        cls.secret_values = secret_values
+        env_override = fixture_dir / "secret-files.compose.yml"
+        services = {
+            "relay": "relay.env",
+            "postgres": "postgres.env",
+            "redis": "redis.env",
+            "minio": "minio.env",
+            "minio-init": "minio-init.env",
+            "caddy": "caddy.env",
+        }
+        override_lines = ["services:"]
+        for service, env_name in services.items():
+            env_path = json.dumps((fixture_dir / env_name).as_posix())
+            override_lines.extend(
+                (
+                    f"  {service}:",
+                    "    env_file: !override",
+                    f"      - path: {env_path}",
+                    "        required: true",
+                )
+            )
+        env_override.write_text("\n".join(override_lines) + "\n", encoding="utf-8")
+
         env = os.environ.copy()
         digest = "sha256:" + "a" * 64
         env.update(
@@ -178,13 +283,14 @@ class ComposeContracts(unittest.TestCase):
                 "MINIO_IMAGE": f"quay.io/minio/minio@{digest}",
                 "MINIO_MC_IMAGE": f"quay.io/minio/mc@{digest}",
                 "CADDY_IMAGE": f"docker.io/library/caddy@{digest}",
-                "POSTGRES_PASSWORD": "contract-postgres",
-                "REDIS_PASSWORD": "contract-redis",
-                "BUZZ_S3_ACCESS_KEY": "contract-access",
-                "BUZZ_S3_SECRET_KEY": "contract-secret",
+                "POSTGRES_PASSWORD": "interpolation-postgres",
+                "REDIS_PASSWORD": "interpolation-redis",
+                "BUZZ_S3_ACCESS_KEY": "interpolation-access",
+                "BUZZ_S3_SECRET_KEY": "interpolation-secret",
                 "BUZZ_ORIGIN_FQDN": "origin.invalid",
-                "BUZZ_ORIGIN_SECRET": "contract-origin-secret",
                 "AZURE_FRONT_DOOR_ID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "BUZZ_PUBLIC_HOST": "buzz.contract.invalid",
+                "RELAY_OWNER_PUBKEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
             }
         )
         command = [
@@ -194,6 +300,8 @@ class ComposeContracts(unittest.TestCase):
             str(ROOT / "deploy" / "compose" / "compose.yml"),
             "-f",
             str(AZURE / "compose" / "compose.azure.yml"),
+            "-f",
+            str(env_override),
             "config",
             "--format",
             "json",
@@ -209,6 +317,50 @@ class ComposeContracts(unittest.TestCase):
         if result.returncode != 0:
             raise AssertionError(f"docker compose config failed:\n{result.stderr}")
         cls.config = json.loads(result.stdout)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if hasattr(cls, "_fixture_dir"):
+            cls._fixture_dir.cleanup()
+
+    def test_per_service_secret_files_survive_compose_merge(self) -> None:
+        for service, env_file in (
+            ("relay", "relay.env"),
+            ("postgres", "postgres.env"),
+            ("redis", "redis.env"),
+            ("minio", "minio.env"),
+            ("minio-init", "minio-init.env"),
+            ("caddy", "caddy.env"),
+        ):
+            rendered = self.config["services"][service]["environment"]
+            for key, expected in self.secret_values[env_file].items():
+                self.assertEqual(
+                    rendered.get(key),
+                    expected,
+                    f"{service} must receive {key} from its least-privilege env file",
+                )
+
+    def test_relay_migrates_a_blank_database_before_readiness(self) -> None:
+        relay_env = self.config["services"]["relay"]["environment"]
+        self.assertEqual(relay_env.get("BUZZ_AUTO_MIGRATE"), "true")
+
+    def test_relay_uses_closed_month1_configuration(self) -> None:
+        relay_env = self.config["services"]["relay"]["environment"]
+        expected = {
+            "RELAY_URL": "wss://buzz.contract.invalid",
+            "RELAY_OWNER_PUBKEY": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            "BUZZ_REQUIRE_RELAY_MEMBERSHIP": "true",
+            "BUZZ_REQUIRE_AUTH_TOKEN": "true",
+            "BUZZ_ALLOW_NIP_OA_AUTH": "false",
+            "BUZZ_PUSH_GATEWAY_DELIVERY_URL": "",
+            "BUZZ_WEB_DIR": "",
+            "BUZZ_ADMIN_WEB_DIR": "",
+            "BUZZ_GIT_ENABLED": "false",
+            "BUZZ_SERVE_GIT_WEB_GUI": "false",
+            "BUZZ_HUDDLE_AUDIO_AVAILABLE": "false",
+        }
+        for key, value in expected.items():
+            self.assertEqual(relay_env.get(key), value, f"closed relay setting {key} drifted")
 
     def test_all_images_are_digest_pinned(self) -> None:
         for service, config in self.config["services"].items():
@@ -236,15 +388,19 @@ class ComposeContracts(unittest.TestCase):
             self.assertFalse(config.get("privileged", False), f"{service} must not be privileged")
 
     def test_networks_separate_edge_data_broker_connector_and_egress(self) -> None:
-        expected_active = {"edge", "relay-data", "broker", "egress"}
+        expected_active = {"ingress", "edge", "relay-data", "broker"}
         self.assertTrue(expected_active.issubset(self.config["networks"]))
         overlay = read("infra/azure/compose/compose.azure.yml")
         self.assertRegex(overlay, r"(?m)^\s{2}connector-internal:\s*$")
+        self.assertRegex(overlay, r"(?m)^\s{2}egress:\s*$")
         self.assertNotRegex(overlay, r"(?m)^\s{2}(connector|sanitizer|indexer|executor):\s*$")
-        self.assertEqual(set(self.config["services"]["caddy"]["networks"]), {"edge", "egress"})
+        self.assertEqual(
+            set(self.config["services"]["caddy"]["networks"]),
+            {"ingress", "edge"},
+        )
         self.assertEqual(
             set(self.config["services"]["relay"]["networks"]),
-            {"edge", "relay-data", "broker", "egress"},
+            {"edge", "relay-data", "broker"},
         )
         self.assertEqual(set(self.config["services"]["postgres"]["networks"]), {"relay-data"})
         self.assertEqual(set(self.config["services"]["redis"]["networks"]), {"broker"})
@@ -252,6 +408,26 @@ class ComposeContracts(unittest.TestCase):
             overlay,
             r"(?ms)^\s{2}connector-internal:\s*\n(?:\s{4}.+\n)*?\s{4}internal:\s*true\s*$",
         )
+        egress_services = {
+            service
+            for service, config in self.config["services"].items()
+            if "egress" in config.get("networks", [])
+        }
+        self.assertEqual(egress_services, set(), "no Month-1 service may reach unrestricted egress")
+        expected_bridges = {
+            "ingress": "buzz-ingress",
+            "edge": "buzz-edge",
+            "relay-data": "buzz-data",
+            "broker": "buzz-broker",
+            "connector-internal": "buzz-connector",
+            "egress": "buzz-egress",
+        }
+        for network, bridge in expected_bridges.items():
+            self.assertLessEqual(len(bridge), 15)
+            self.assertRegex(
+                overlay,
+                rf"(?ms)^\s{{2}}{re.escape(network)}:\s*\n(?:\s{{4}}.+\n)*?\s{{6}}com\.docker\.network\.bridge\.name:\s*{bridge}\s*$",
+            )
 
     def test_only_caddy_publishes_origin_https(self) -> None:
         for service, config in self.config["services"].items():
@@ -263,8 +439,17 @@ class ComposeContracts(unittest.TestCase):
             else:
                 self.assertEqual(ports, [], f"{service} must not publish a host port")
 
+    def test_systemd_exclusively_owns_container_restart_policy(self) -> None:
+        for service in ("relay", "postgres", "redis", "minio", "minio-init", "caddy"):
+            self.assertEqual(
+                self.config["services"][service].get("restart"),
+                "no",
+                f"{service} must not be revived by Docker before the host firewall",
+            )
+
     def test_caddy_rejects_missing_origin_secret_and_proxies_websockets(self) -> None:
         caddy = read("infra/azure/compose/Caddyfile.azure")
+        self.assertRegex(caddy, r"(?m)^:8443\s*\{")
         self.assertIn("X-Buzz-Origin-Secret", caddy)
         self.assertRegex(
             caddy,
@@ -276,8 +461,14 @@ class ComposeContracts(unittest.TestCase):
             r"@invalid_origin_secret\s+not\s+header\s+X-Buzz-Origin-Secret\s+\{\$BUZZ_ORIGIN_SECRET\}",
         )
         self.assertRegex(caddy, r"respond\s+@invalid_origin_secret\s+403")
+        self.assertRegex(
+            caddy,
+            r"(?s)@front_door_health_probe\s*\{.*?path\s+/origin-healthz.*?method\s+GET\s+HEAD.*?header\s+X-FD-HealthProbe\s+1.*?\}",
+        )
         self.assertIn("/_readiness", caddy)
         self.assertRegex(caddy, r"reverse_proxy\s+relay:3000")
+        self.assertLess(caddy.index("@front_door_health_probe"), caddy.index("@invalid_fdid"))
+        self.assertLess(caddy.index("@invalid_fdid"), caddy.index("@invalid_origin_secret"))
 
 
 class HostAndDeliveryContracts(unittest.TestCase):
@@ -295,6 +486,11 @@ class HostAndDeliveryContracts(unittest.TestCase):
         self.assertRegex(main, r"module\s+\w+\s+'modules/host-bootstrap\.bicep'")
         self.assertIn("loadTextContent('../bootstrap/bootstrap.sh')", host_bootstrap)
         self.assertIn("configPayload = base64(string(", host_bootstrap)
+        self.assertRegex(main, r"param\s+relayOwnerPubkey\s+string")
+        self.assertIn("publicHost: edge.outputs.publicHost", main)
+        self.assertIn("relayOwnerPubkey: relayOwnerPubkey", main)
+        self.assertRegex(host_bootstrap, r"param\s+publicHost\s+string")
+        self.assertRegex(host_bootstrap, r"param\s+relayOwnerPubkey\s+string")
         self.assertIn("protectedSettings", host_bootstrap)
         self.assertIn("script: scriptPayload", host_bootstrap)
         self.assertNotIn("commandToExecute", host_bootstrap)
@@ -311,6 +507,8 @@ class HostAndDeliveryContracts(unittest.TestCase):
             "originFqdn": "origin.core.invalid",
             "originSecretName": "frontdoor-origin-secret",
             "frontDoorId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "publicHost": "buzz.core.invalid",
+            "relayOwnerPubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
             "bootstrapBundleImage": "corebuzzacr.azurecr.io/bootstrap@sha256:" + "a" * 64,
             "relayImage": "corebuzzacr.azurecr.io/relay@sha256:" + "a" * 64,
             "postgresImage": "docker.io/pgvector/pgvector@sha256:" + "a" * 64,
@@ -339,6 +537,8 @@ class HostAndDeliveryContracts(unittest.TestCase):
             ("acrName", "$(id)"),
             ("originSecretName", "secret\nINJECTED=value"),
             ("frontDoorId", "not-a-guid; id"),
+            ("publicHost", "buzz.invalid; id"),
+            ("relayOwnerPubkey", "not-a-pubkey"),
             ("relayImage", "registry.invalid/relay:latest"),
             ("bootstrapBundleImage", "registry.invalid/bootstrap@sha256:" + "g" * 64),
         ):
@@ -347,38 +547,669 @@ class HostAndDeliveryContracts(unittest.TestCase):
             rejected = validate(fixture)
             self.assertNotEqual(rejected.returncode, 0, f"accepted malicious {field}")
 
+        missing_owner = dict(valid)
+        missing_owner["relayOwnerPubkey"] = ""
+        missing_owner["startServices"] = True
+        rejected = validate(missing_owner)
+        self.assertNotEqual(
+            rejected.returncode,
+            0,
+            "service activation must fail closed without a valid relay owner",
+        )
+
     def test_bootstrap_is_valid_idempotent_shell_and_unit_refreshes_secrets(self) -> None:
         bootstrap = ROOT / "infra" / "azure" / "bootstrap" / "bootstrap.sh"
         refresh = ROOT / "infra" / "azure" / "bootstrap" / "refresh-secrets.sh"
+        clean_volume_smoke = (
+            ROOT / "infra" / "azure" / "tests" / "smoke-clean-volume.sh"
+        )
+        caddy_runtime = (
+            ROOT / "infra" / "azure" / "tests" / "test-caddy-origin-policy.sh"
+        )
+        firewall_runtime = (
+            ROOT / "infra" / "azure" / "tests" / "test-container-firewall-runtime.sh"
+        )
+        docker_restart_runtime = (
+            ROOT / "infra" / "azure" / "tests" / "test-docker-daemon-restart.sh"
+        )
+        docker_first_start_runtime = (
+            ROOT / "infra" / "azure" / "tests" / "test-docker-first-start.sh"
+        )
+        systemd_order_runtime = (
+            ROOT / "infra" / "azure" / "tests" / "test-systemd-boot-order.sh"
+        )
+        container_firewall = (
+            ROOT / "infra" / "azure" / "bootstrap" / "container-firewall.sh"
+        )
+        service_activation = (
+            ROOT / "infra" / "azure" / "bootstrap" / "service-activation.sh"
+        )
+        docker_post_start = (
+            ROOT / "infra" / "azure" / "bootstrap" / "docker-post-start.sh"
+        )
+        docker_activation = (
+            ROOT / "infra" / "azure" / "bootstrap" / "docker-activation.sh"
+        )
+        compose_supervisor = (
+            ROOT / "infra" / "azure" / "bootstrap" / "compose-supervisor.sh"
+        )
         unit = read("infra/azure/bootstrap/buzz-core.service")
-        for script in (bootstrap, refresh):
+        for script in (
+            bootstrap,
+            refresh,
+            container_firewall,
+            service_activation,
+            docker_activation,
+            docker_post_start,
+            compose_supervisor,
+            clean_volume_smoke,
+            caddy_runtime,
+            firewall_runtime,
+            docker_restart_runtime,
+            docker_first_start_runtime,
+            systemd_order_runtime,
+        ):
             self.assertTrue(script.is_file(), f"missing {script.relative_to(ROOT)}")
             result = subprocess.run(
                 ["bash", "-n", str(script)], text=True, capture_output=True, check=False
             )
             self.assertEqual(result.returncode, 0, result.stderr)
         bootstrap_text = bootstrap.read_text(encoding="utf-8")
-        for expected in ("blkid", "mountpoint", "install -d", "systemctl enable"):
+        for expected in ("blkid", "mountpoint", "install -d"):
             self.assertIn(expected, bootstrap_text)
         refresh_text = refresh.read_text(encoding="utf-8")
         for expected in ("az login --identity", "az acr login", "az keyvault secret show"):
             self.assertIn(expected, refresh_text)
         self.assertIn("RequiresMountsFor=/srv/buzz", unit)
+        self.assertIn("ExecStartPre=/usr/local/sbin/buzz-core-container-firewall", unit)
+        self.assertIn("PartOf=docker.service", unit)
+        self.assertIn("StartLimitBurst=5", unit)
+        self.assertIn("StartLimitIntervalSec=10min", unit)
+        self.assertIn("ExecStart=/usr/local/sbin/buzz-core-compose-supervisor supervise", unit)
+        self.assertIn("ExecStopPost=-/usr/local/sbin/buzz-core-compose-supervisor down", unit)
+        self.assertNotIn("up --detach", unit)
         self.assertIn("ExecStartPre=/usr/local/sbin/buzz-core-refresh-secrets", unit)
+        self.assertLess(
+            unit.index("ExecStartPre=/usr/local/sbin/buzz-core-container-firewall"),
+            unit.index("ExecStartPre=/usr/bin/docker compose"),
+        )
         self.assertIn("docker compose", unit)
+        self.assertIn("buzz-core-docker-activation prepare", bootstrap_text)
+        self.assertIn("buzz-core-docker-activation start", bootstrap_text)
+        self.assertIn("buzz-core-docker-post-start", bootstrap_text)
+        self.assertIn("docker.service.d/20-buzz-imds-firewall.conf", bootstrap_text)
+        activation_text = service_activation.read_text(encoding="utf-8")
+        self.assertIn('disable --now buzz-core.service', activation_text)
+        self.assertIn('restart buzz-core.service', activation_text)
+        self.assertNotIn('disable --now buzz-core.service >/dev/null 2>&1 || true', activation_text)
+        self.assertLess(
+            bootstrap_text.index("buzz-core-docker-activation start"),
+            bootstrap_text.rindex("\nextract_verified_bundle\n"),
+        )
+        self.assertNotIn("rm -rf /opt/buzz/bootstrap-bundle/*", bootstrap_text)
+        extract_block = bootstrap_text[
+            bootstrap_text.index("extract_verified_bundle()") : bootstrap_text.index(
+                "\ninstall_packages\n"
+            )
+        ]
+        self.assertNotIn(
+            "exit 1",
+            extract_block,
+            "bundle extraction must return through its cleanup trap on failure",
+        )
+        self.assertIn(
+            "trap cleanup_bundle_extract RETURN ERR",
+            extract_block,
+            "unexpected command failures must clean staged bundle data and containers",
+        )
+        self.assertRegex(
+            refresh_text,
+            r"install\s+-d\s+-o\s+0\s+-g\s+1000\s+-m\s+0750\s+[^\n]*/caddy",
+        )
+        self.assertIn("AZURE_CONFIG_DIR", bootstrap_text)
+        self.assertIn("AZURE_CONFIG_DIR", refresh_text)
+        self.assertIn(
+            "export DOCKER_CONFIG",
+            refresh_text,
+            "ACR login must receive the volatile Docker credential directory",
+        )
+        self.assertIn("/run/buzz", bootstrap_text + refresh_text)
         self.assertNotRegex(bootstrap_text + refresh_text + unit, r"(?i)(client_secret|azure_credentials)")
+
+    def test_docker_post_start_applies_firewall_before_restarting_enabled_core(self) -> None:
+        post_start = ROOT / "infra" / "azure" / "bootstrap" / "docker-post-start.sh"
+        with tempfile.TemporaryDirectory(prefix="buzz-docker-post-start-") as directory:
+            root = Path(directory)
+            calls = root / "calls"
+            firewall = root / "firewall"
+            systemctl = root / "systemctl"
+            firewall.write_text(
+                "#!/usr/bin/env bash\nprintf '%s\\n' firewall >>\"${POST_START_CALLS:?}\"\n",
+                encoding="utf-8",
+            )
+            systemctl.write_text(
+                """#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >>"${POST_START_CALLS:?}"
+if [[ ${1:-} == is-enabled ]]; then exit "${IS_ENABLED_RC:-0}"; fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            firewall.chmod(0o755)
+            systemctl.chmod(0o755)
+            env = os.environ | {
+                "FIREWALL_BIN": str(firewall),
+                "SYSTEMCTL_BIN": str(systemctl),
+                "POST_START_CALLS": str(calls),
+            }
+            enabled = subprocess.run(
+                ["bash", str(post_start)], env=env, text=True, capture_output=True, check=False
+            )
+            self.assertEqual(enabled.returncode, 0, enabled.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                [
+                    "firewall",
+                    "systemctl is-enabled --quiet buzz-core.service",
+                    "systemctl --no-block start buzz-core.service",
+                ],
+            )
+
+            calls.unlink()
+            disabled = subprocess.run(
+                ["bash", str(post_start)],
+                env=env | {"IS_ENABLED_RC": "1"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(disabled.returncode, 0, disabled.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                ["firewall", "systemctl is-enabled --quiet buzz-core.service"],
+            )
+
+    def test_docker_activation_masks_install_window_and_applies_baseline_before_start(self) -> None:
+        activation = ROOT / "infra" / "azure" / "bootstrap" / "docker-activation.sh"
+        with tempfile.TemporaryDirectory(prefix="buzz-docker-activation-") as directory:
+            root = Path(directory)
+            calls = root / "calls"
+            systemctl = root / "systemctl"
+            firewall = root / "firewall"
+            docker = root / "docker"
+            systemctl.write_text(
+                "#!/usr/bin/env bash\nprintf 'systemctl %s\\n' \"$*\" >>\"${ACTIVATION_CALLS:?}\"\n",
+                encoding="utf-8",
+            )
+            firewall.write_text(
+                "#!/usr/bin/env bash\nprintf 'firewall %s\\n' \"$*\" >>\"${ACTIVATION_CALLS:?}\"\n",
+                encoding="utf-8",
+            )
+            docker.write_text(
+                "#!/usr/bin/env bash\nprintf 'docker %s\\n' \"$*\" >>\"${ACTIVATION_CALLS:?}\"\n",
+                encoding="utf-8",
+            )
+            for executable in (systemctl, firewall, docker):
+                executable.chmod(0o755)
+            env = os.environ | {
+                "ACTIVATION_CALLS": str(calls),
+                "SYSTEMCTL_BIN": str(systemctl),
+                "FIREWALL_BIN": str(firewall),
+                "DOCKER_BIN": str(docker),
+            }
+
+            prepared = subprocess.run(
+                ["bash", str(activation), "prepare"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                ["systemctl mask --now docker.service docker.socket"],
+            )
+
+            calls.unlink()
+            started = subprocess.run(
+                ["bash", str(activation), "start"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                [
+                    "systemctl daemon-reload",
+                    "firewall --baseline",
+                    "systemctl unmask docker.service docker.socket",
+                    "systemctl enable docker.service",
+                    "systemctl start docker.service",
+                    "docker info",
+                ],
+            )
+
+    def test_clean_volume_smoke_rejects_missing_or_floating_dependency_images(self) -> None:
+        smoke = ROOT / "infra" / "azure" / "tests" / "smoke-clean-volume.sh"
+        with tempfile.TemporaryDirectory(prefix="buzz-smoke-validation-") as directory:
+            root = Path(directory)
+            marker = root / "docker-called"
+            fake = root / "docker"
+            fake.write_text(
+                "#!/usr/bin/env bash\nprintf called >\"${DOCKER_MARKER:?}\"\nexit 99\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            base_env = os.environ | {
+                "PATH": f"{root}:{os.environ['PATH']}",
+                "DOCKER_MARKER": str(marker),
+            }
+            missing = subprocess.run(
+                ["bash", str(smoke), "local-relay:test"],
+                env=base_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("SMOKE_POSTGRES_IMAGE", missing.stderr)
+            self.assertFalse(marker.exists(), "dependency validation must precede Docker")
+
+            digest = "sha256:" + "a" * 64
+            invalid_env = base_env | {
+                "SMOKE_POSTGRES_IMAGE": "docker.io/pgvector/pgvector:pg17",
+                "SMOKE_REDIS_IMAGE": f"docker.io/library/redis@{digest}",
+                "SMOKE_MINIO_IMAGE": f"docker.io/minio/minio@{digest}",
+                "SMOKE_MINIO_MC_IMAGE": f"docker.io/minio/mc@{digest}",
+                "SMOKE_CADDY_IMAGE": f"docker.io/library/caddy@{digest}",
+            }
+            floating = subprocess.run(
+                ["bash", str(smoke), "local-relay:test"],
+                env=invalid_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(floating.returncode, 2)
+            self.assertIn("digest-pinned", floating.stderr)
+            self.assertFalse(marker.exists(), "invalid image refs must fail before Docker")
+
+    def test_service_activation_stops_disabled_services_and_propagates_failures(self) -> None:
+        activation = ROOT / "infra" / "azure" / "bootstrap" / "service-activation.sh"
+        with tempfile.TemporaryDirectory(prefix="buzz-systemctl-") as directory:
+            root = Path(directory)
+            calls = root / "calls"
+            fake = root / "systemctl"
+            fake.write_text(
+                """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:?}"
+if [[ ${1:-} == disable && ${FAIL_DISABLE:-0} == 1 ]]; then exit 42; fi
+if [[ ${1:-} == is-active ]]; then exit "${IS_ACTIVE_RC:-3}"; fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            base_env = os.environ | {
+                "SYSTEMCTL_BIN": str(fake),
+                "SYSTEMCTL_CALLS": str(calls),
+            }
+
+            for _ in range(2):
+                stopped = subprocess.run(
+                    ["bash", str(activation), "false"],
+                    env=base_env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                ["disable --now buzz-core.service"] * 2,
+            )
+
+            calls.unlink()
+            failed = subprocess.run(
+                ["bash", str(activation), "false"],
+                env=base_env | {"FAIL_DISABLE": "1"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(failed.returncode, 42)
+            self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["disable --now buzz-core.service"])
+
+            calls.unlink()
+            restarted = subprocess.run(
+                ["bash", str(activation), "true"],
+                env=base_env | {"IS_ACTIVE_RC": "0"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(restarted.returncode, 0, restarted.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                [
+                    "enable buzz-core.service",
+                    "is-active --quiet buzz-core.service",
+                    "restart buzz-core.service",
+                ],
+            )
+
+            calls.unlink()
+            started = subprocess.run(
+                ["bash", str(activation), "true"],
+                env=base_env | {"IS_ACTIVE_RC": "3"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                [
+                    "enable buzz-core.service",
+                    "is-active --quiet buzz-core.service",
+                    "start buzz-core.service",
+                ],
+            )
+
+    def test_compose_supervisor_preflights_init_and_treats_every_long_exit_as_failure(self) -> None:
+        supervisor = ROOT / "infra" / "azure" / "bootstrap" / "compose-supervisor.sh"
+        with tempfile.TemporaryDirectory(prefix="buzz-compose-supervisor-") as directory:
+            root = Path(directory)
+            calls = root / "calls"
+            fake = root / "docker"
+            fake.write_text(
+                """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${DOCKER_CALLS:?}"
+if [[ " $* " == *" --abort-on-container-exit "* ]]; then
+  exit "${SUPERVISE_RC:-0}"
+fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            env = os.environ | {"DOCKER_BIN": str(fake), "DOCKER_CALLS": str(calls)}
+
+            prepared = subprocess.run(
+                ["bash", str(supervisor), "prepare"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            prepare_calls = calls.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(prepare_calls), 3)
+            self.assertIn("up --detach --wait postgres redis minio", prepare_calls[0])
+            self.assertIn("run --rm --no-deps minio-init", prepare_calls[1])
+            self.assertIn("up --detach --no-deps --wait relay", prepare_calls[2])
+
+            calls.unlink()
+            clean_exit = subprocess.run(
+                ["bash", str(supervisor), "supervise"],
+                env=env | {"SUPERVISE_RC": "0"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(clean_exit.returncode, 1)
+            supervise_call = calls.read_text(encoding="utf-8").strip()
+            self.assertIn("--abort-on-container-exit", supervise_call)
+            for service in ("postgres", "redis", "minio", "relay", "caddy"):
+                self.assertIn(f"--no-attach {service}", supervise_call)
+            self.assertNotIn("minio-init", supervise_call)
+
+            calls.unlink()
+            failed_exit = subprocess.run(
+                ["bash", str(supervisor), "supervise"],
+                env=env | {"SUPERVISE_RC": "42"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(failed_exit.returncode, 42)
+
+            calls.unlink()
+            cleaned = subprocess.run(
+                ["bash", str(supervisor), "down"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+            self.assertIn(" down", f" {calls.read_text(encoding='utf-8').strip()}")
+
+    def test_container_firewall_blocks_imds_idempotently_without_touching_host_output(self) -> None:
+        firewall = ROOT / "infra" / "azure" / "bootstrap" / "container-firewall.sh"
+        text = firewall.read_text(encoding="utf-8")
+        self.assertIn("DOCKER-USER", text)
+        self.assertIn("INPUT", text)
+        self.assertIn("169.254.169.254/32", text)
+        self.assertIn("buzz-ingress", text)
+        self.assertIn("buzz-edge", text)
+        for bridge in (
+            "buzz-data",
+            "buzz-broker",
+            "buzz-connector",
+            "buzz-egress",
+        ):
+            self.assertIn(bridge, text)
+        self.assertIn("ESTABLISHED,RELATED", text)
+        self.assertIn("-C", text)
+        self.assertIn("-I", text)
+        self.assertNotRegex(
+            text,
+            r"(?m)^[^#\n]*\bOUTPUT\b",
+            "host managed-identity access must remain available",
+        )
+
+        with tempfile.TemporaryDirectory(prefix="buzz-iptables-") as directory:
+            root = Path(directory)
+            state = root / "rules"
+            fake = root / "iptables"
+            fake.write_text(
+                """#!/usr/bin/env bash
+set -euo pipefail
+state=${IPTABLES_STATE:?}
+args=("$@")
+if [[ ${args[0]} == -w ]]; then args=("${args[@]:1}"); fi
+if [[ ${args[*]} == "-n -L DOCKER-USER" ]]; then exit 0; fi
+op=${args[0]}
+chain=${args[1]}
+case "$op" in
+  -C|-D) rule="${args[*]:2}" ;;
+  -I)
+    [[ ${args[2]} == 1 ]]
+    rule="${args[*]:3}"
+    ;;
+  *) exit 2 ;;
+esac
+key="$chain|$rule"
+case "$op" in
+  -C) [[ -f $state ]] && grep -Fxq -- "$key" "$state" ;;
+  -D)
+    line=$(grep -nFx -- "$key" "$state" | head -n1 | cut -d: -f1)
+    sed -i "${line}d" "$state"
+    ;;
+  -I)
+    { printf '%s\n' "$key"; [[ ! -f $state ]] || cat "$state"; } >"$state.tmp"
+    mv "$state.tmp" "$state"
+    ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            env = os.environ | {"IPTABLES_BIN": str(fake), "IPTABLES_STATE": str(state)}
+            for _ in range(2):
+                result = subprocess.run(
+                    ["bash", str(firewall)], env=env, text=True, capture_output=True, check=False
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                state.read_text(encoding="utf-8").splitlines(),
+                [
+                    "INPUT|-i buzz-ingress -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "INPUT|-i buzz-ingress -j REJECT",
+                    "INPUT|-i buzz-edge -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "INPUT|-i buzz-edge -j REJECT",
+                    "INPUT|-i buzz-data -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "INPUT|-i buzz-data -j REJECT",
+                    "INPUT|-i buzz-broker -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "INPUT|-i buzz-broker -j REJECT",
+                    "INPUT|-i buzz-connector -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "INPUT|-i buzz-connector -j REJECT",
+                    "INPUT|-i buzz-egress -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "INPUT|-i buzz-egress -j REJECT",
+                    "DOCKER-USER|-d 169.254.169.254/32 -j REJECT",
+                    "DOCKER-USER|-i buzz-ingress -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "DOCKER-USER|-i buzz-ingress -j REJECT",
+                    "INPUT|-i buzz-+ -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "INPUT|-i buzz-+ -j REJECT",
+                    "FORWARD|-d 169.254.169.254/32 -j REJECT",
+                ],
+            )
+
+    def test_bootstrap_data_disk_formatting_fails_closed(self) -> None:
+        bootstrap = read("infra/azure/bootstrap/bootstrap.sh")
+        mount_block = bootstrap[
+            bootstrap.index("mount_data_disk()") : bootstrap.index(
+                "\nextract_verified_bundle()"
+            )
+        ]
+        for required_guard in (
+            "findmnt -n -o SOURCE /",
+            "blockdev --getsize64",
+            "expected_min_bytes=$((255 * 1024 * 1024 * 1024))",
+            "expected_max_bytes=$((257 * 1024 * 1024 * 1024))",
+            "lsblk -nrpo NAME,TYPE",
+            "lsblk -nrpo MOUNTPOINT",
+            "findmnt -n -o SOURCE --mountpoint /srv/buzz",
+            "wipefs --noheadings --output TYPE",
+            'filesystem_type != xfs',
+            'filesystem_label != buzz-data',
+        ):
+            self.assertIn(required_guard, mount_block)
+        self.assertIn('resolved == "$root_disk"', mount_block)
+        self.assertIn("mkfs.xfs -L buzz-data", mount_block)
+        self.assertNotIn("mkfs.xfs -f", mount_block)
+        self.assertRegex(bootstrap, r"apt-get install[^\n]+\butil-linux\b")
+
+    def test_bootstrap_bundle_image_supports_create_and_copy(self) -> None:
+        if not shutil.which("docker"):
+            self.skipTest("docker executable is unavailable")
+        tag = f"core-buzz-bootstrap-contract:{os.getpid()}"
+        container_id = ""
+        with tempfile.TemporaryDirectory(prefix="buzz-bootstrap-copy-") as destination:
+            try:
+                built = subprocess.run(
+                    [
+                        "docker",
+                        "build",
+                        "--target",
+                        "bundle",
+                        "--tag",
+                        tag,
+                        "--file",
+                        str(ROOT / "infra" / "azure" / "bootstrap" / "Dockerfile"),
+                        str(ROOT),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(built.returncode, 0, built.stderr)
+                created = subprocess.run(
+                    ["docker", "create", tag],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(created.returncode, 0, created.stderr)
+                container_id = created.stdout.strip()
+                copied = subprocess.run(
+                    ["docker", "cp", f"{container_id}:/bundle/.", destination],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(copied.returncode, 0, copied.stderr)
+                self.assertTrue((Path(destination) / "compose.azure.yml").is_file())
+                self.assertTrue((Path(destination) / "buzz-core.service").is_file())
+                self.assertTrue((Path(destination) / "docker-activation.sh").is_file())
+            finally:
+                if container_id:
+                    subprocess.run(
+                        ["docker", "rm", "--force", container_id],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                subprocess.run(
+                    ["docker", "image", "rm", "--force", tag],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
 
     def test_validation_workflow_is_offline_by_default_and_uses_oidc_for_what_if(self) -> None:
         workflow = read(".github/workflows/azure-foundation-validate.yml")
         assert_action_refs_are_pinned(self, workflow)
+        pull_request_trigger = workflow[
+            workflow.index("  pull_request:") : workflow.index("  workflow_dispatch:")
+        ]
+        self.assertNotIn(
+            "paths:",
+            pull_request_trigger,
+            "all relay image and migration inputs must trigger the required smoke",
+        )
         self.assertIn("id-token: write", workflow)
         self.assertIn("azure/login", workflow)
         self.assertIn("vars.AZURE_CLIENT_ID", workflow)
         self.assertIn("az deployment sub what-if", workflow)
         self.assertIn("enable_what_if", workflow)
-        self.assertIn("python3 infra/azure/tests/test_contracts.py", workflow)
         self.assertIn("az bicep build", workflow)
         self.assertIn("docker compose", workflow)
+        self.assertIn("bash infra/azure/tests/run.sh", workflow)
+        self.assertIn("CADDY_TEST_IMAGE", workflow)
+        self.assertIn("OPENSSL_TEST_IMAGE", workflow)
+        self.assertIn("FIREWALL_TEST_IMAGE", workflow)
+        self.assertIn("DIND_TEST_IMAGE", workflow)
+        self.assertIn("DIND_WORKLOAD_IMAGE", workflow)
+        self.assertIn("enable_clean_volume_smoke", workflow)
+        self.assertIn("bash infra/azure/tests/smoke-clean-volume.sh", workflow)
+        self.assertIn("github.event_name == 'pull_request'", workflow)
+        dockerfile = read("Dockerfile")
+        self.assertRegex(dockerfile.splitlines()[0], r"dockerfile:1\.7@sha256:[0-9a-f]{64}$")
+        for image in (
+            "SMOKE_RUST_BUILD_IMAGE",
+            "SMOKE_NODE_BUILD_IMAGE",
+            "SMOKE_DEBIAN_RUNTIME_IMAGE",
+        ):
+            self.assertRegex(workflow, rf"{image}:\s+[^\s]+@sha256:[0-9a-f]{{64}}")
+            self.assertIn(f"--build-arg {image.removeprefix('SMOKE_')}=\"${image}\"", workflow)
+        for image in (
+            "SMOKE_POSTGRES_IMAGE",
+            "SMOKE_REDIS_IMAGE",
+            "SMOKE_MINIO_IMAGE",
+            "SMOKE_MINIO_MC_IMAGE",
+            "SMOKE_CADDY_IMAGE",
+        ):
+            self.assertRegex(workflow, rf"{image}:\s+[^\s]+@sha256:[0-9a-f]{{64}}")
+        self.assertIn("BUZZ_PUBLIC_HOST", workflow)
+        self.assertIn("RELAY_OWNER_PUBKEY", workflow)
+        self.assertIn('relayOwnerPubkey="$RELAY_OWNER_PUBKEY"', workflow)
         self.assertNotRegex(workflow, r"(?i)(AZURE_CREDENTIALS|client[_-]?secret|AZURE[_-].*password\s*:)")
 
     def test_delivery_builds_unsigned_artifacts_and_gates_trusted_signing(self) -> None:
@@ -401,8 +1232,20 @@ class HostAndDeliveryContracts(unittest.TestCase):
             "provenance.json",
             "Get-AuthenticodeSignature",
             "signed = $true",
+            "AZURE_SIGNING_SUBJECT",
+            "SignerCertificate.Subject",
+            "signingProfile",
         ):
             self.assertIn(expected, workflow)
+        self.assertNotIn(
+            "Swatinem/rust-cache",
+            workflow,
+            "writable build-output caches must not feed a signed installer",
+        )
+        self.assertRegex(
+            workflow,
+            r"SignerCertificate\.Subject\s+-ne\s+\$env:EXPECTED_SIGNING_SUBJECT",
+        )
         self.assertNotRegex(workflow, r"(?i)(AZURE_CREDENTIALS|client[_-]?secret|AZURE[_-].*password\s*:)")
 
 

@@ -3,22 +3,28 @@ Description=Core Buzz pinned Compose project
 Wants=network-online.target docker.service
 After=network-online.target docker.service
 Requires=docker.service
+PartOf=docker.service
 RequiresMountsFor=/srv/buzz
+StartLimitIntervalSec=10min
+StartLimitBurst=5
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 EnvironmentFile=/etc/buzz/core.env
 WorkingDirectory=/opt/buzz/infra/azure/compose
+ExecStartPre=/usr/local/sbin/buzz-core-container-firewall
 ExecStartPre=/usr/local/sbin/buzz-core-refresh-secrets
 ExecStartPre=/usr/bin/docker compose --env-file /run/buzz/compose.env -f /opt/buzz/deploy/compose/compose.yml -f /opt/buzz/infra/azure/compose/compose.azure.yml config --quiet
 ExecStartPre=/usr/bin/docker compose --env-file /run/buzz/compose.env -f /opt/buzz/deploy/compose/compose.yml -f /opt/buzz/infra/azure/compose/compose.azure.yml pull --quiet
-ExecStart=/usr/bin/docker compose --env-file /run/buzz/compose.env -f /opt/buzz/deploy/compose/compose.yml -f /opt/buzz/infra/azure/compose/compose.azure.yml up --detach --remove-orphans --wait
-ExecStop=/usr/bin/docker compose --env-file /run/buzz/compose.env -f /opt/buzz/deploy/compose/compose.yml -f /opt/buzz/infra/azure/compose/compose.azure.yml down
+ExecStartPre=/usr/local/sbin/buzz-core-compose-supervisor prepare
+ExecStart=/usr/local/sbin/buzz-core-compose-supervisor supervise
+ExecStopPost=-/usr/local/sbin/buzz-core-compose-supervisor down
 TimeoutStartSec=15min
 TimeoutStopSec=5min
 Restart=on-failure
 RestartSec=30s
+StandardOutput=null
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
