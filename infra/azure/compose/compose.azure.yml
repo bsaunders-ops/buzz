@@ -1,0 +1,217 @@
+name: buzz-core
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+
+services:
+  relay:
+    <<: *hardening
+    image: ${BUZZ_RELAY_IMAGE:?set BUZZ_RELAY_IMAGE to an ACR digest reference}
+    user: "1000:1000"
+    env_file: !override
+      - path: /run/buzz/secrets/relay.env
+        required: false
+    environment:
+      DATABASE_URL: null
+      REDIS_URL: null
+      BUZZ_S3_ACCESS_KEY: null
+      BUZZ_S3_SECRET_KEY: null
+    ports: !reset []
+    volumes: !override
+      - /srv/buzz/git:/data/git
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=1770
+    networks: !override
+      - edge
+      - relay-data
+      - broker
+      - egress
+    deploy:
+      resources:
+        limits:
+          cpus: "2.00"
+          memory: 3G
+        reservations:
+          cpus: "0.50"
+          memory: 512M
+
+  postgres:
+    <<: *hardening
+    image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE to a pgvector digest reference}
+    user: "999:999"
+    env_file: !override
+      - path: /run/buzz/secrets/postgres.env
+        required: false
+    environment:
+      POSTGRES_PASSWORD: null
+    volumes: !override
+      - /srv/buzz/postgres:/var/lib/postgresql/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,uid=999,gid=999,mode=1770
+      - /run/postgresql:rw,noexec,nosuid,nodev,size=16m,uid=999,gid=999,mode=0770
+    networks: !override
+      - relay-data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.00"
+          memory: 4G
+        reservations:
+          cpus: "0.50"
+          memory: 1G
+
+  redis:
+    <<: *hardening
+    image: ${REDIS_IMAGE:?set REDIS_IMAGE to a digest reference}
+    user: "999:999"
+    env_file: !override
+      - path: /run/buzz/secrets/redis.env
+        required: false
+    environment:
+      REDIS_PASSWORD: null
+    command:
+      - /bin/sh
+      - -euc
+      - exec redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"
+    volumes: !override
+      - /srv/buzz/redis:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=999,gid=999,mode=1770
+    networks: !override
+      - broker
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 1G
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+
+  minio:
+    <<: *hardening
+    image: ${MINIO_IMAGE:?set MINIO_IMAGE to a digest reference}
+    user: "1000:1000"
+    env_file: !override
+      - path: /run/buzz/secrets/minio.env
+        required: false
+    environment:
+      MINIO_ROOT_USER: null
+      MINIO_ROOT_PASSWORD: null
+    volumes: !override
+      - /srv/buzz/minio:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=1770
+    networks: !override
+      - relay-data
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 2G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  minio-init:
+    <<: *hardening
+    image: ${MINIO_MC_IMAGE:?set MINIO_MC_IMAGE to a digest reference}
+    user: "1000:1000"
+    env_file: !override
+      - path: /run/buzz/secrets/minio-init.env
+        required: false
+    environment:
+      BUZZ_S3_ACCESS_KEY: null
+      BUZZ_S3_SECRET_KEY: null
+      MC_CONFIG_DIR: /tmp/mc
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=1770
+    healthcheck:
+      test: ["CMD", "mc", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 1s
+    networks: !override
+      - relay-data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 32M
+
+  caddy:
+    <<: *hardening
+    image: ${CADDY_IMAGE:?set CADDY_IMAGE to a digest reference}
+    user: "1000:1000"
+    depends_on:
+      relay:
+        condition: service_healthy
+    env_file:
+      - path: /run/buzz/secrets/caddy.env
+        required: false
+    environment:
+      BUZZ_ORIGIN_FQDN: ${BUZZ_ORIGIN_FQDN:?set BUZZ_ORIGIN_FQDN}
+      AZURE_FRONT_DOOR_ID: ${AZURE_FRONT_DOOR_ID:?set AZURE_FRONT_DOOR_ID}
+    ports:
+      - target: 8443
+        published: "443"
+        protocol: tcp
+        mode: host
+    volumes:
+      - ${BUZZ_AZURE_ASSET_ROOT:-/opt/buzz/infra/azure}/compose/Caddyfile.azure:/etc/caddy/Caddyfile:ro
+      - /run/buzz/caddy:/run/buzz/caddy:ro
+      - buzz-caddy-data:/data
+      - buzz-caddy-config:/config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=1770
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks: !override
+      - edge
+      - egress
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+
+volumes:
+  buzz-caddy-data:
+    labels:
+      com.buzz.volume: caddy-data
+  buzz-caddy-config:
+    labels:
+      com.buzz.volume: caddy-config
+
+networks:
+  edge:
+    driver: bridge
+    internal: true
+  relay-data:
+    driver: bridge
+    internal: true
+  broker:
+    driver: bridge
+    internal: true
+  connector-internal:
+    driver: bridge
+    internal: true
+  egress:
+    driver: bridge

@@ -1,0 +1,346 @@
+name: Azure delivery artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_linux:
+        description: "Build local OCI relay images without publishing"
+        type: boolean
+        required: true
+        default: true
+      build_windows:
+        description: "Build the unsigned Windows NSIS installer"
+        type: boolean
+        required: true
+        default: true
+      enable_signing:
+        description: "Request environment-approved Azure Artifact Signing"
+        type: boolean
+        required: true
+        default: false
+
+permissions: {}
+
+jobs:
+  linux-images:
+    name: Build Linux ${{ matrix.variant }} OCI image
+    if: inputs.build_linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: release
+            artifact: buzz-relay-release
+            image_name: buzz-relay
+            file: ./Dockerfile
+            target: runtime
+          - variant: debug
+            artifact: buzz-relay-debug
+            image_name: buzz-relay
+            file: ./Dockerfile
+            target: runtime-debug
+          - variant: bootstrap
+            artifact: buzz-bootstrap-bundle
+            image_name: bootstrap-bundle
+            file: ./infra/azure/bootstrap/Dockerfile
+            target: bundle
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5
+
+      - name: Build OCI image with SBOM and provenance attestations
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          tags: core-buzz/${{ matrix.image_name }}:${{ matrix.variant }}-${{ github.sha }}
+          push: false
+          outputs: type=oci,dest=/tmp/${{ matrix.artifact }}.tar
+          sbom: true
+          provenance: mode=max
+
+      - name: Emit SHA-256 manifest
+        run: |
+          cd /tmp
+          sha256sum "${{ matrix.artifact }}.tar" > "${{ matrix.artifact }}.SHA256SUMS"
+
+      - name: Upload OCI, SBOM/provenance attestations, and manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: buzz-linux-${{ matrix.variant }}-${{ github.sha }}
+          path: |
+            /tmp/${{ matrix.artifact }}.tar
+            /tmp/${{ matrix.artifact }}.SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-build:
+    name: Build unsigned Windows NSIS installer
+    if: inputs.build_windows
+    runs-on: windows-2025
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.14.1
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 11.4.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: |
+            .
+            desktop/src-tauri
+          shared-key: azure-delivery-windows
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          rustup target add "$TARGET"
+          pnpm install --frozen-lockfile
+
+      - name: Generate non-updating bundle config
+        shell: bash
+        run: |
+          cat > desktop/src-tauri/tauri.azure-delivery.conf.json <<'JSON'
+          {
+            "bundle": {
+              "createUpdaterArtifacts": false
+            }
+          }
+          JSON
+
+      - name: Build sidecars
+        shell: bash
+        run: |
+          cargo build --release --locked --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+
+      - name: Build unsigned NSIS installer
+        shell: bash
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: cd desktop && pnpm tauri build --target "$TARGET" --bundles nsis --config src-tauri/tauri.azure-delivery.conf.json
+
+      - name: Collect installer and SHA-256 manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p azure-windows-artifact
+          installer=$(find "desktop/src-tauri/target/${TARGET}/release/bundle/nsis" -type f -name '*.exe' -print -quit)
+          [[ -n "$installer" ]] || { echo "::error::NSIS installer was not produced"; exit 1; }
+          cp "$installer" azure-windows-artifact/
+
+      - name: Generate verified SBOM, provenance, and version manifest
+        shell: pwsh
+        run: |
+          $syftArchive = Join-Path $env:RUNNER_TEMP "syft_1.44.0_windows_amd64.zip"
+          $syftDirectory = Join-Path $env:RUNNER_TEMP "syft-1.44.0"
+          Invoke-WebRequest `
+            -Uri "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_windows_amd64.zip" `
+            -OutFile $syftArchive
+          $expectedSyftHash = "195e786eb84ec145854f20528992e86637c77d1968731dfe6ce850c90e28f47a"
+          $actualSyftHash = (Get-FileHash $syftArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSyftHash -ne $expectedSyftHash) {
+            throw "Syft archive digest mismatch: $actualSyftHash"
+          }
+          Expand-Archive -Path $syftArchive -DestinationPath $syftDirectory
+
+          $artifactDirectory = Join-Path $env:GITHUB_WORKSPACE "azure-windows-artifact"
+          $installer = Get-ChildItem $artifactDirectory -Filter *.exe | Select-Object -First 1
+          if (-not $installer) { throw "Unsigned installer is missing" }
+          $sbomPath = Join-Path $artifactDirectory "buzz-windows.spdx.json"
+          & (Join-Path $syftDirectory "syft.exe") $installer.FullName --output "spdx-json=$sbomPath"
+          if ($LASTEXITCODE -ne 0) { throw "Syft failed with exit code $LASTEXITCODE" }
+
+          $installerHash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $appVersion = (Get-Content desktop/package.json | ConvertFrom-Json).version
+          $versionManifest = [ordered]@{
+            schemaVersion = 1
+            product = "Buzz"
+            version = $appVersion
+            gitSha = "${{ github.sha }}"
+            target = $env:TARGET
+            installer = $installer.Name
+            sha256 = $installerHash
+            signed = $false
+          }
+          $versionManifest | ConvertTo-Json -Depth 10 | Set-Content `
+            (Join-Path $artifactDirectory "version-manifest.json") -Encoding utf8
+
+          $provenance = [ordered]@{
+            _type = "https://in-toto.io/Statement/v1"
+            subject = @([ordered]@{
+              name = $installer.Name
+              digest = [ordered]@{ sha256 = $installerHash }
+            })
+            predicateType = "https://slsa.dev/provenance/v1"
+            predicate = [ordered]@{
+              buildDefinition = [ordered]@{
+                buildType = "https://github.com/actions/workflow"
+                externalParameters = [ordered]@{
+                  repository = "${{ github.repository }}"
+                  ref = "${{ github.ref }}"
+                  sha = "${{ github.sha }}"
+                  workflow = "${{ github.workflow_ref }}"
+                  signed = $false
+                }
+                internalParameters = [ordered]@{}
+                resolvedDependencies = @([ordered]@{
+                  uri = "git+https://github.com/${{ github.repository }}"
+                  digest = [ordered]@{ gitCommit = "${{ github.sha }}" }
+                })
+              }
+              runDetails = [ordered]@{
+                builder = [ordered]@{
+                  id = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                }
+                metadata = [ordered]@{
+                  invocationId = "${{ github.run_id }}-${{ github.run_attempt }}"
+                }
+              }
+            }
+          }
+          $provenance | ConvertTo-Json -Depth 10 | Set-Content `
+            (Join-Path $artifactDirectory "provenance.json") -Encoding utf8
+
+          Get-ChildItem $artifactDirectory -File |
+            Where-Object Name -ne "SHA256SUMS" |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            } | Set-Content (Join-Path $artifactDirectory "SHA256SUMS") -Encoding ascii
+
+      - name: Upload unsigned installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: buzz-windows-unsigned-${{ github.sha }}
+          path: azure-windows-artifact/
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-signing:
+    name: Environment-approved Azure Artifact Signing
+    if: inputs.enable_signing && inputs.build_windows
+    needs: windows-build
+    runs-on: windows-2025
+    timeout-minutes: 20
+    environment: azure-trusted-signing
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download unsigned installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: buzz-windows-unsigned-${{ github.sha }}
+          path: windows-artifact
+
+      - name: Fail closed when signing configuration is incomplete
+        shell: pwsh
+        env:
+          SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+        run: |
+          if (-not $env:SIGNING_ENDPOINT -or -not $env:SIGNING_ACCOUNT -or -not $env:SIGNING_PROFILE) {
+            throw "Azure Artifact Signing environment variables are incomplete"
+          }
+
+      - name: OIDC login
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign NSIS installer
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\windows-artifact
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signature and refresh manifest
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem windows-artifact -Filter *.exe | Select-Object -First 1
+          if (-not $installer) { throw "Signed installer is missing" }
+          $signature = Get-AuthenticodeSignature $installer.FullName
+          if ($signature.Status -ne "Valid") { throw "Authenticode status is $($signature.Status)" }
+          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          $syftArchive = Join-Path $env:RUNNER_TEMP "syft_1.44.0_windows_amd64.zip"
+          $syftDirectory = Join-Path $env:RUNNER_TEMP "syft-1.44.0"
+          Invoke-WebRequest `
+            -Uri "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_windows_amd64.zip" `
+            -OutFile $syftArchive
+          $expectedSyftHash = "195e786eb84ec145854f20528992e86637c77d1968731dfe6ce850c90e28f47a"
+          $actualSyftHash = (Get-FileHash $syftArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSyftHash -ne $expectedSyftHash) {
+            throw "Syft archive digest mismatch: $actualSyftHash"
+          }
+          Expand-Archive -Path $syftArchive -DestinationPath $syftDirectory
+          & (Join-Path $syftDirectory "syft.exe") $installer.FullName `
+            --output "spdx-json=windows-artifact/buzz-windows.spdx.json"
+          if ($LASTEXITCODE -ne 0) { throw "Syft failed with exit code $LASTEXITCODE" }
+
+          $versionManifestPath = "windows-artifact/version-manifest.json"
+          $versionManifest = Get-Content $versionManifestPath | ConvertFrom-Json
+          $versionManifest.sha256 = $hash
+          $versionManifest.signed = $true
+          $versionManifest | ConvertTo-Json -Depth 10 | Set-Content $versionManifestPath -Encoding utf8
+
+          $provenancePath = "windows-artifact/provenance.json"
+          $provenance = Get-Content $provenancePath | ConvertFrom-Json
+          $provenance.subject[0].digest.sha256 = $hash
+          $provenance.predicate.buildDefinition.externalParameters.signed = $true
+          $provenance | ConvertTo-Json -Depth 10 | Set-Content $provenancePath -Encoding utf8
+
+          Get-ChildItem windows-artifact -File |
+            Where-Object Name -ne "SHA256SUMS" |
+            Sort-Object Name |
+            ForEach-Object {
+              $fileHash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$fileHash  $($_.Name)"
+            } | Set-Content windows-artifact/SHA256SUMS -Encoding ascii
+
+      - name: Upload signed installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: buzz-windows-signed-${{ github.sha }}
+          path: windows-artifact/
+          if-no-files-found: error
+          retention-days: 14

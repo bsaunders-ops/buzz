@@ -1,0 +1,151 @@
+name: Azure foundation validation
+
+on:
+  pull_request:
+    paths:
+      - "infra/azure/**"
+      - "deploy/compose/compose.yml"
+      - ".github/workflows/azure-foundation-validate.yml"
+      - ".github/workflows/azure-delivery.yml"
+      - "docs/azure-foundation-runbook.md"
+  workflow_dispatch:
+    inputs:
+      enable_what_if:
+        description: "Run the OIDC-authenticated subscription what-if (requires environment approval)"
+        type: boolean
+        required: true
+        default: false
+
+permissions: {}
+
+jobs:
+  offline-contracts:
+    name: Offline contracts and Bicep build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Bicep CLI
+        run: az bicep install --version v0.45.15
+
+      - name: Compile foundation and explicit lock module
+        run: |
+          az bicep build --file infra/azure/main.bicep --stdout >/dev/null
+          bash -n infra/azure/audit/lock-retention.sh
+
+      - name: Run offline structural and Compose contracts
+        run: python3 infra/azure/tests/test_contracts.py
+
+      - name: Render hardened Compose project independently
+        env:
+          BUZZ_RELAY_IMAGE: corebuzz.invalid/buzz-relay@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          POSTGRES_IMAGE: docker.io/pgvector/pgvector@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          REDIS_IMAGE: docker.io/library/redis@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          MINIO_IMAGE: quay.io/minio/minio@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          MINIO_MC_IMAGE: quay.io/minio/mc@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          CADDY_IMAGE: docker.io/library/caddy@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          POSTGRES_PASSWORD: validation-only
+          REDIS_PASSWORD: validation-only
+          BUZZ_S3_ACCESS_KEY: validation-only
+          BUZZ_S3_SECRET_KEY: validation-only
+          BUZZ_ORIGIN_FQDN: origin.invalid
+          AZURE_FRONT_DOOR_ID: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+        run: docker compose -f deploy/compose/compose.yml -f infra/azure/compose/compose.azure.yml config --quiet
+
+  what-if:
+    name: Approved Azure subscription what-if
+    if: github.event_name == 'workflow_dispatch' && inputs.enable_what_if
+    needs: offline-contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: azure-foundation-what-if
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_CORE_OUTPUT: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Fail closed when environment configuration is incomplete
+        shell: bash
+        env:
+          NAME_PREFIX: ${{ vars.AZURE_NAME_PREFIX }}
+          ORIGIN_FQDN: ${{ vars.BUZZ_ORIGIN_FQDN }}
+          ALERT_EMAIL: ${{ vars.AZURE_ALERT_EMAIL }}
+          UBUNTU_IMAGE_VERSION: ${{ vars.AZURE_UBUNTU_IMAGE_VERSION }}
+          RELAY_IMAGE: ${{ vars.BUZZ_RELAY_IMAGE }}
+          POSTGRES_IMAGE: ${{ vars.POSTGRES_IMAGE }}
+          REDIS_IMAGE: ${{ vars.REDIS_IMAGE }}
+          MINIO_IMAGE: ${{ vars.MINIO_IMAGE }}
+          MINIO_MC_IMAGE: ${{ vars.MINIO_MC_IMAGE }}
+          CADDY_IMAGE: ${{ vars.CADDY_IMAGE }}
+          BOOTSTRAP_BUNDLE_IMAGE: ${{ vars.BOOTSTRAP_BUNDLE_IMAGE }}
+        run: |
+          set -euo pipefail
+          for value in NAME_PREFIX ORIGIN_FQDN ALERT_EMAIL UBUNTU_IMAGE_VERSION; do
+            [[ -n "${!value}" ]] || { echo "::error::$value is unset"; exit 1; }
+          done
+          for value in BOOTSTRAP_BUNDLE_IMAGE RELAY_IMAGE POSTGRES_IMAGE REDIS_IMAGE MINIO_IMAGE MINIO_MC_IMAGE CADDY_IMAGE; do
+            [[ "${!value}" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "::error::$value is not digest-pinned"; exit 1; }
+          done
+
+      - name: OIDC login
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install pinned Bicep CLI
+        run: az bicep install --version v0.45.15
+
+      - name: Subscription what-if only
+        shell: bash
+        env:
+          NAME_PREFIX: ${{ vars.AZURE_NAME_PREFIX }}
+          ORIGIN_FQDN: ${{ vars.BUZZ_ORIGIN_FQDN }}
+          ALERT_EMAIL: ${{ vars.AZURE_ALERT_EMAIL }}
+          ADMIN_PUBLIC_KEY: ${{ secrets.AZURE_ADMIN_PUBLIC_KEY }}
+          ORIGIN_SECRET: ${{ secrets.BUZZ_ORIGIN_SECRET }}
+          UBUNTU_IMAGE_VERSION: ${{ vars.AZURE_UBUNTU_IMAGE_VERSION }}
+          RELAY_IMAGE: ${{ vars.BUZZ_RELAY_IMAGE }}
+          POSTGRES_IMAGE: ${{ vars.POSTGRES_IMAGE }}
+          REDIS_IMAGE: ${{ vars.REDIS_IMAGE }}
+          MINIO_IMAGE: ${{ vars.MINIO_IMAGE }}
+          MINIO_MC_IMAGE: ${{ vars.MINIO_MC_IMAGE }}
+          CADDY_IMAGE: ${{ vars.CADDY_IMAGE }}
+          BOOTSTRAP_BUNDLE_IMAGE: ${{ vars.BOOTSTRAP_BUNDLE_IMAGE }}
+        run: |
+          set -euo pipefail
+          [[ -n "$ADMIN_PUBLIC_KEY" && -n "$ORIGIN_SECRET" ]] || { echo "::error::approved secure parameters are unset"; exit 1; }
+          az deployment sub what-if \
+            --name "core-buzz-${GITHUB_RUN_ID}" \
+            --location eastus2 \
+            --template-file infra/azure/main.bicep \
+            --parameters \
+              namePrefix="$NAME_PREFIX" \
+              adminSshPublicKey="$ADMIN_PUBLIC_KEY" \
+              ubuntuImageVersion="$UBUNTU_IMAGE_VERSION" \
+              originFqdn="$ORIGIN_FQDN" \
+              originSecret="$ORIGIN_SECRET" \
+              bootstrapBundleImage="$BOOTSTRAP_BUNDLE_IMAGE" \
+              alertEmail="$ALERT_EMAIL" \
+              relayImage="$RELAY_IMAGE" \
+              postgresImage="$POSTGRES_IMAGE" \
+              redisImage="$REDIS_IMAGE" \
+              minioImage="$MINIO_IMAGE" \
+              minioMcImage="$MINIO_MC_IMAGE" \
+              caddyImage="$CADDY_IMAGE" \
+              enableHostBootstrap=false \
+              startCoreServices=false \
+            --no-pretty-print

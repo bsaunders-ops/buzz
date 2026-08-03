@@ -1,0 +1,28 @@
+{
+  admin off
+  auto_https off
+  https_port 8443
+  servers {
+    protocols h1 h2
+  }
+}
+
+{$BUZZ_ORIGIN_FQDN}:8443 {
+  tls /run/buzz/caddy/origin.crt /run/buzz/caddy/origin.key
+  encode zstd gzip
+
+  @invalid_fdid not header X-Azure-FDID {$AZURE_FRONT_DOOR_ID}
+  respond @invalid_fdid 403
+
+  @invalid_origin_secret not header X-Buzz-Origin-Secret {$BUZZ_ORIGIN_SECRET}
+  respond @invalid_origin_secret 403
+
+  handle /origin-healthz {
+    rewrite * /_readiness
+    reverse_proxy relay:3000
+  }
+
+  handle {
+    reverse_proxy relay:3000
+  }
+}
