@@ -16,6 +16,7 @@ import type {
 } from "@/features/home/lib/inbox";
 import { getProjectInboxReference } from "@/features/home/lib/projectInbox";
 import { ProjectInboxDetail } from "@/features/home/ui/ProjectInboxDetail";
+import { InsightCard } from "@/features/home/ui/InsightCard";
 import { ChannelMembersBar } from "@/features/channels/ui/ChannelMembersBar";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { formatInboxTypeLabel } from "@/features/home/lib/inbox";
@@ -117,6 +118,17 @@ type InboxDetailPaneProps = {
 
 /** Routes Inbox selections to their canonical message or Buzz Git detail. */
 export function InboxDetailPane(props: InboxDetailPaneProps) {
+  if (props.item?.item.kind === 44300) {
+    return (
+      <section
+        className="flex min-h-0 min-w-0 flex-col overflow-y-auto bg-background/60 pt-13"
+        data-testid="home-inbox-insight-detail"
+      >
+        <InsightCard payload={props.item.insight ?? null} />
+      </section>
+    );
+  }
+
   if (props.item && getProjectInboxReference(props.item.item)) {
     return (
       <ProjectInboxDetail
