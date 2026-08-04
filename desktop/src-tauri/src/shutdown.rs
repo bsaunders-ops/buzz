@@ -21,6 +21,8 @@ pub(crate) fn shut_down_app(app: &tauri::AppHandle, shutdown_done: &std::sync::a
         #[cfg(feature = "call-capture-platform")]
         crate::call_capture::stop_call_capture_for_shutdown(app);
         prevent_sleep::release(&app.state::<AppState>().prevent_sleep);
+        app.state::<crate::terminal_runtime::TerminalSessions>()
+            .shutdown_all();
         if let Err(error) = shutdown_managed_agents(app) {
             eprintln!("buzz-desktop: failed to stop managed agents: {error}");
         }
@@ -44,6 +46,8 @@ pub(crate) fn install_signal_handler(
         if !shutdown_done.swap(true, Ordering::SeqCst) {
             #[cfg(feature = "call-capture-platform")]
             crate::call_capture::stop_call_capture_for_shutdown(&app);
+            app.state::<crate::terminal_runtime::TerminalSessions>()
+                .shutdown_all();
             let _ = shutdown_managed_agents(&app);
             #[cfg(feature = "mesh-llm")]
             shutdown_mesh_runtime(&app);
