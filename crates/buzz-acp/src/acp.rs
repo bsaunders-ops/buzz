@@ -19,6 +19,13 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
+const CORE_SEALED_MODE_ENV: &str = "BUZZ_ACP_CORE_SEALED_MODE";
+
+fn core_sealed_mode_enabled() -> bool {
+    std::env::var(CORE_SEALED_MODE_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -483,7 +490,12 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
+        let core_sealed_mode = core_sealed_mode_enabled();
+
         let mut cmd = tokio::process::Command::new(command);
+        if core_sealed_mode {
+            cmd.env_clear();
+        }
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -503,11 +515,12 @@ impl AcpClient {
         //   • has_generated_codex_config=false: return None; any persona-supplied
         //     CODEX_CONFIG falls through to the normal operator-wins loop below.
         let has_codex_config = extra_env.iter().any(|(k, _)| k == "CODEX_CONFIG");
-        let parent_codex_config = if has_generated_codex_config && has_codex_config {
-            std::env::var("CODEX_CONFIG").ok()
-        } else {
-            None
-        };
+        let parent_codex_config =
+            if !core_sealed_mode && has_generated_codex_config && has_codex_config {
+                std::env::var("CODEX_CONFIG").ok()
+            } else {
+                None
+            };
         let codex_config_value = build_codex_config_env(
             extra_env,
             parent_codex_config.as_deref(),
@@ -522,7 +535,7 @@ impl AcpClient {
         // key replacement) and inherited parent env (via the parent-presence
         // check) override them.
         for &(key, value) in crate::config::default_agent_env(command) {
-            if std::env::var_os(key).is_none() {
+            if core_sealed_mode || std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
         }
@@ -532,7 +545,7 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            if std::env::var_os(key).is_none() {
+            if core_sealed_mode || std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
         }
@@ -3017,12 +3030,51 @@ mod tests {
         observed
     }
 
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    static ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_core_sealed_mode_scrubs_ambient_openai_key_from_model_child() {
+        let _env_lock = ENV_TEST_LOCK.lock().await;
+        let _sealed = EnvGuard::set("BUZZ_ACP_CORE_SEALED_MODE", "1");
+        let _ambient_secret = EnvGuard::set("OPENAI_API_KEY", "ambient-core-secret");
+
+        assert_eq!(
+            spawn_named_and_read_child_env("other-agent", "OPENAI_API_KEY", &[]).await,
+            "<unset>",
+            "Core sealed mode must clear inherited supervisor env before spawning the model child"
+        );
+    }
+
     /// Buzz-owned Hermes processes get the configured-MCP isolation default,
     /// and an explicit persona entry still overrides it (defaults are applied
     /// before `extra_env`, so the later `Command::env` write wins).
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_applies_runtime_env_defaults_with_extra_env_precedence() {
+        let _env_lock = ENV_TEST_LOCK.lock().await;
         const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
         if std::env::var_os(VAR).is_some() {
             // Inherited parent values win over both layers; the default and
