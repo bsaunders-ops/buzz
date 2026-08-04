@@ -582,6 +582,43 @@ async fn vanilla_postgres_migrates_without_installing_vector_storage() {
     drop_scratch_db(&admin, pool, &name).await;
 }
 
+#[tokio::test]
+#[ignore = "requires Postgres role privileges"]
+async fn connector_worker_can_delete_only_replaceable_source_children() {
+    let (admin, pool, name) = scratch_db().await;
+
+    for table in ["source_chunks", "source_item_acls"] {
+        let allowed: bool =
+            sqlx::query_scalar("SELECT has_table_privilege('core_connector_worker', $1, 'DELETE')")
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .expect("check connector worker delete privilege");
+        assert!(
+            allowed,
+            "connector worker must delete {table} during replacement"
+        );
+    }
+
+    for table in [
+        "source_items",
+        "connector_accounts",
+        "approved_source_scopes",
+        "connector_delta_cursors",
+        "core_audit_outbox",
+    ] {
+        let denied: bool =
+            sqlx::query_scalar("SELECT has_table_privilege('core_connector_worker', $1, 'DELETE')")
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .expect("check connector worker delete privilege");
+        assert!(!denied, "connector worker must not delete from {table}");
+    }
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
 #[test]
 fn pure_claim_decisions_fail_closed_at_boundaries() {
     let now = Utc::now();

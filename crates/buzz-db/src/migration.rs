@@ -692,7 +692,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 32);
+        assert_eq!(migrations.len(), 33);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1110,6 +1110,7 @@ mod tests {
 
         assert_eq!(migrations[30].version, 31);
         assert_eq!(migrations[31].version, 32);
+        assert_eq!(migrations[32].version, 33);
         let worker_roles = migrations[31].sql.as_str().to_ascii_lowercase();
         assert!(worker_roles.contains("create role core_connector_worker nologin"));
         assert!(worker_roles.contains("create role core_action_executor nologin"));
