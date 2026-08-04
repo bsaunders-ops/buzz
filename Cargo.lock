@@ -1005,7 +1005,9 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "chrono",
+ "futures-util",
  "hex",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1015,6 +1017,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

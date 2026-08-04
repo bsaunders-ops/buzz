@@ -7,6 +7,8 @@
 pub mod apply;
 /// Deterministic normalization and chunking.
 pub mod chunk;
+/// Bounded read-only Core CRM MCP adapter.
+pub mod core_crm;
 /// Provider-specific outbound network policy contracts.
 pub mod egress;
 /// Local embedding artifact and version contracts.
