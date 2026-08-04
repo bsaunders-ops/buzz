@@ -298,7 +298,10 @@ CREATE TABLE external_action_proposals (
     operation_hash        BYTEA NOT NULL CHECK (octet_length(operation_hash) = 32),
     ordered_members_hash  BYTEA NOT NULL CHECK (octet_length(ordered_members_hash) = 32),
     member_count          SMALLINT NOT NULL CHECK (member_count BETWEEN 1 AND 10),
-    nonce                 UUID NOT NULL CHECK (uuid_extract_version(nonce) = 4),
+    nonce                 UUID NOT NULL CHECK (
+                              (get_byte(uuid_send(nonce), 6) >> 4) = 4
+                              AND (get_byte(uuid_send(nonce), 8) & 192) = 128
+                          ),
     proposed_at           TIMESTAMPTZ NOT NULL,
     expires_at            TIMESTAMPTZ NOT NULL,
     status                TEXT NOT NULL DEFAULT 'proposed'
@@ -352,7 +355,10 @@ CREATE TABLE external_action_proposal_items (
     community_id          UUID NOT NULL REFERENCES communities(id),
     proposal_id           UUID NOT NULL,
     item_index            SMALLINT NOT NULL CHECK (item_index BETWEEN 0 AND 9),
-    operation_id          UUID NOT NULL CHECK (uuid_extract_version(operation_id) = 4),
+    operation_id          UUID NOT NULL CHECK (
+                              (get_byte(uuid_send(operation_id), 6) >> 4) = 4
+                              AND (get_byte(uuid_send(operation_id), 8) & 192) = 128
+                          ),
     account_id            UUID NOT NULL,
     scope_id              UUID NOT NULL,
     owner_pubkey          BYTEA NOT NULL CHECK (octet_length(owner_pubkey) = 32),
@@ -388,7 +394,10 @@ CREATE TABLE external_action_proposal_items (
     before_hash           BYTEA CHECK (before_hash IS NULL OR octet_length(before_hash) = 32),
     after_hash            BYTEA NOT NULL CHECK (octet_length(after_hash) = 32),
     expected_remote_version TEXT,
-    idempotency_key       UUID NOT NULL CHECK (uuid_extract_version(idempotency_key) = 4),
+    idempotency_key       UUID NOT NULL CHECK (
+                              (get_byte(uuid_send(idempotency_key), 6) >> 4) = 4
+                              AND (get_byte(uuid_send(idempotency_key), 8) & 192) = 128
+                          ),
     member_hash           BYTEA NOT NULL CHECK (octet_length(member_hash) = 32),
     status                TEXT NOT NULL DEFAULT 'proposed'
                           CHECK (status IN ('proposed', 'approved', 'denied', 'executing', 'succeeded', 'failed', 'reconciliation_required')),
@@ -463,7 +472,10 @@ CREATE TABLE external_action_receipts (
     id                    UUID NOT NULL DEFAULT gen_random_uuid(),
     proposal_id           UUID NOT NULL,
     item_index            SMALLINT NOT NULL,
-    operation_id          UUID NOT NULL CHECK (uuid_extract_version(operation_id) = 4),
+    operation_id          UUID NOT NULL CHECK (
+                              (get_byte(uuid_send(operation_id), 6) >> 4) = 4
+                              AND (get_byte(uuid_send(operation_id), 8) & 192) = 128
+                          ),
     member_hash           BYTEA NOT NULL CHECK (octet_length(member_hash) = 32),
     attempt_id            UUID NOT NULL,
     remote_result_id      TEXT CHECK (

@@ -1152,7 +1152,26 @@ mod tests {
         assert!(sql.contains("create unique index idx_learning_heads_firm_identity"));
         assert!(sql.contains("unique (community_id, sequence, entry_hash)"));
         assert!(sql.contains("expires_at <= proposed_at + interval '15 minutes'"));
-        assert!(sql.contains("nonce uuid not null check (uuid_extract_version(nonce) = 4)"));
+        assert!(sql.contains("nonce uuid not null check"));
+    }
+
+    #[test]
+    fn core_month1_uuid_v4_checks_run_on_the_compose_postgres_17_baseline() {
+        let sql = normalize_sql(&migration_sql());
+        assert!(
+            !sql.contains("uuid_extract_version("),
+            "uuid_extract_version is PostgreSQL 18-only, while Compose uses PostgreSQL 17"
+        );
+        for value in ["nonce", "operation_id", "idempotency_key"] {
+            assert!(
+                sql.contains(&format!("get_byte(uuid_send({value}), 6) >> 4")),
+                "missing UUID version-nibble check for {value}"
+            );
+            assert!(
+                sql.contains(&format!("get_byte(uuid_send({value}), 8) & 192")),
+                "missing RFC UUID variant check for {value}"
+            );
+        }
     }
 
     #[test]
@@ -1274,7 +1293,7 @@ mod tests {
         }
         assert!(sql.contains("item_index between 0 and 9"));
         assert!(sql.contains("after_hash bytea not null check (octet_length(after_hash) = 32)"));
-        assert!(sql.contains("uuid_extract_version(idempotency_key) = 4"));
+        assert!(sql.contains("get_byte(uuid_send(idempotency_key), 6) >> 4"));
         assert!(sql.contains("default 'proposed'"));
         assert!(sql.contains(
             "status in ('proposed', 'approved', 'denied', 'executing', 'succeeded', 'failed', 'reconciliation_required')"
@@ -1309,7 +1328,7 @@ mod tests {
             "ordered_members_hash bytea not null check (octet_length(ordered_members_hash) = 32)",
             "canonical_operation_hash bytea not null check (octet_length(canonical_operation_hash) = 32)",
             "octet_length(canonical_operation) between 1 and 65535",
-            "operation_id uuid not null check (uuid_extract_version(operation_id) = 4)",
+            "operation_id uuid not null check",
             "unique (community_id, proposal_id, operation_id)",
         ] {
             assert!(sql.contains(contract), "missing canonical action contract: {contract}");
