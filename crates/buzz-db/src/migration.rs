@@ -100,7 +100,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintKind {
@@ -692,7 +692,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 31);
+        assert_eq!(migrations.len(), 32);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1051,34 +1051,55 @@ mod tests {
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
 
+        // Channel-id lookup index (0027): serves the tenant-independent
+        // `channels` lookups that carry no community_id predicate, which no
+        // community_id-leading index can satisfy. Covering + partial so the
+        // planner can go index-only; asserted NOT UNIQUE because `id` alone is
+        // not unique in this table (the same channel id may exist under more
+        // than one community), so a unique index would encode a false
+        // constraint and fail to build on such a database.
         assert_eq!(migrations[26].version, 27);
-        let core_storage = migrations[26].sql.as_str();
+        let channel_id_index = migrations[26].sql.as_str();
+        assert!(channel_id_index.contains("idx_channels_id_live"));
+        assert!(channel_id_index.contains("INCLUDE (community_id)"));
+        assert!(channel_id_index.contains("WHERE deleted_at IS NULL"));
+        assert!(
+            !channel_id_index.contains("CREATE UNIQUE INDEX"),
+            "channels.id is not unique across communities — index must not be UNIQUE",
+        );
+        assert!(
+            desired_schema.contains("idx_channels_id_live"),
+            "desired-state schema must carry the channel-id lookup index",
+        );
+
+        assert_eq!(migrations[27].version, 28);
+        let core_storage = migrations[27].sql.as_str();
         assert!(core_storage.contains("CREATE EXTENSION IF NOT EXISTS vector"));
         for table in CORE_MONTH1_TABLES {
             assert!(
                 core_storage.contains(&format!("CREATE TABLE {table}")),
-                "migration 0027 must create {table}"
+                "migration 0028 must create {table}"
             );
         }
         for private_kind in [44_300, 44_301, 44_310, 44_311, 44_312, 44_210, 30_179] {
             assert!(
                 core_storage.contains(&private_kind.to_string()),
-                "migration 0027 must exclude private kind {private_kind} from events.search_tsv"
+                "migration 0028 must exclude private kind {private_kind} from events.search_tsv"
             );
         }
         assert!(core_storage.contains("existing_expression"));
         assert!(core_storage.contains("ELSE (%s) END"));
 
-        assert_eq!(migrations[27].version, 28);
-        let action_broker = migrations[27].sql.as_str();
+        assert_eq!(migrations[28].version, 29);
+        let action_broker = migrations[28].sql.as_str();
         assert!(action_broker.contains("ADD COLUMN decision_id UUID"));
         assert!(action_broker.contains("CREATE TABLE external_action_receipt_outbox"));
         assert!(action_broker.contains("get_byte(uuid_send(decision_id), 6) >> 4"));
         assert!(action_broker.contains("get_byte(uuid_send(receipt_id), 6) >> 4"));
         assert!(!action_broker.contains("uuid_extract_version("));
 
-        assert_eq!(migrations[28].version, 29);
-        let connector_hardening = migrations[28].sql.as_str();
+        assert_eq!(migrations[29].version, 30);
+        let connector_hardening = migrations[29].sql.as_str();
         assert!(connector_hardening.contains("last_page_digest"));
         assert!(connector_hardening.contains("start_char"));
         assert!(connector_hardening.contains("end_char"));
@@ -1087,9 +1108,9 @@ mod tests {
         assert!(connector_hardening.contains("trg_connector_account_purge_source_index"));
         assert!(connector_hardening.contains("trg_source_scope_purge_source_index"));
 
-        assert_eq!(migrations[29].version, 30);
         assert_eq!(migrations[30].version, 31);
-        let worker_roles = migrations[30].sql.as_str().to_ascii_lowercase();
+        assert_eq!(migrations[31].version, 32);
+        let worker_roles = migrations[31].sql.as_str().to_ascii_lowercase();
         assert!(worker_roles.contains("create role core_connector_worker nologin"));
         assert!(worker_roles.contains("create role core_action_executor nologin"));
         assert!(worker_roles.contains("all lifecycle writes\n-- remain broker-owned"));
@@ -1098,7 +1119,7 @@ mod tests {
         ));
         assert!(!worker_roles.contains("grant insert, update on\n    external_action_attempts"));
         assert!(!worker_roles.contains("grant select, insert, update on\n    learning_revisions"));
-        let action_event_binding = migrations[29].sql.as_str();
+        let action_event_binding = migrations[30].sql.as_str();
         assert!(action_event_binding.contains("ADD COLUMN proposal_event_hash BYTEA"));
         assert!(action_event_binding.contains("proposal_event_created_at = proposed_at"));
         assert!(action_event_binding.contains("external_action_proposals_event_hash_unique"));
@@ -1663,7 +1684,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(26));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
     }
 
     #[tokio::test]
