@@ -900,6 +900,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-assistant-broker"
+version = "0.1.0"
+dependencies = [
+ "buzz-connector-core",
+ "buzz-core",
+ "buzz-sdk",
+ "chrono",
+ "hex",
+ "nostr",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-audit"
 version = "0.1.0"
 dependencies = [

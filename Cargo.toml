@@ -28,6 +28,7 @@ members = [
     "crates/buzz-dev-mcp",
     "crates/buzz-voice",
     "crates/buzz-action-broker",
+    "crates/buzz-assistant-broker",
     "crates/buzz-connector-core",
     "crates/buzz-learning",
     "crates/buzz-signal-runner",
@@ -137,6 +138,7 @@ schemars = { version = "1", default-features = false }
 
 # Internal crates
 buzz-core = { path = "crates/buzz-core" }
+buzz-assistant-broker = { path = "crates/buzz-assistant-broker" }
 buzz-connector-core = { path = "crates/buzz-connector-core" }
 buzz-conformance = { path = "crates/buzz-conformance" }
 buzz-db = { path = "crates/buzz-db" }
