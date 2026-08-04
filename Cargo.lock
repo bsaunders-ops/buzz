@@ -1331,6 +1331,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-signal-runner"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+]
+
+[[package]]
 name = "buzz-test-client"
 version = "0.1.0"
 dependencies = [
