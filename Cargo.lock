@@ -1043,11 +1043,14 @@ name = "buzz-core-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "buzz-connector-core",
+ "chrono",
  "clap",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -13,8 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+buzz-connector-core = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }

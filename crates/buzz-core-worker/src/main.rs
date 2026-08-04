@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
+use buzz_core_worker::connector_iteration::{ConnectorIterationOutcome, ConnectorIterationRunner};
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlx::postgres::PgPoolOptions;
 
@@ -102,6 +103,16 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(role: WorkerRole) -> Result<()> {
+    serve_with_connector_registry(role, None).await
+}
+
+async fn serve_with_connector_registry(
+    role: WorkerRole,
+    mut connector_registry: Option<Box<dyn ConnectorIterationRunner>>,
+) -> Result<()> {
+    if matches!(role, WorkerRole::ConnectorWorker) && connector_registry.is_none() {
+        bail!("connector provider registry is not configured");
+    }
     validate_environment(role)?;
     let health_path = health_path();
     let database = if let Some(expected_role) = role.expected_database_role() {
@@ -122,6 +133,14 @@ async fn serve(role: WorkerRole) -> Result<()> {
     tracing::info!(role = role.slug(), "Core worker process boundary ready");
 
     loop {
+        if matches!(role, WorkerRole::ConnectorWorker) {
+            let outcome = run_connector_role_once(&mut connector_registry).await?;
+            tracing::info!(
+                role = role.slug(),
+                outcome = ?outcome,
+                "bounded connector iteration finished"
+            );
+        }
         tokio::time::sleep(Duration::from_secs(15)).await;
         if let Some(pool) = &database {
             sqlx::query_scalar::<_, i32>("SELECT 1")
@@ -131,6 +150,18 @@ async fn serve(role: WorkerRole) -> Result<()> {
         }
         write_heartbeat(&health_path, role)?;
     }
+}
+
+async fn run_connector_role_once(
+    connector_registry: &mut Option<Box<dyn ConnectorIterationRunner>>,
+) -> Result<ConnectorIterationOutcome> {
+    let runner = connector_registry
+        .as_mut()
+        .context("connector provider registry is not configured")?;
+    runner
+        .run_once()
+        .await
+        .context("connector iteration boundary failed")
 }
 
 fn validate_environment(role: WorkerRole) -> Result<()> {
@@ -194,7 +225,41 @@ fn health() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use buzz_core_worker::connector_iteration::{
+        ConnectorBoundaryError, ConnectorIterationOutcome, ConnectorIterationRunner,
+    };
+
     use super::*;
+
+    struct FakeConnectorRunner {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ConnectorIterationRunner for FakeConnectorRunner {
+        fn run_once(
+            &mut self,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = std::result::Result<
+                            ConnectorIterationOutcome,
+                            ConnectorBoundaryError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(ConnectorIterationOutcome::Idle) })
+        }
+    }
 
     #[test]
     fn only_agent_supervisor_may_receive_model_credentials() {
@@ -214,5 +279,35 @@ mod tests {
     #[test]
     fn agent_supervisor_never_receives_a_database_role() {
         assert_eq!(WorkerRole::AgentSupervisor.expected_database_role(), None);
+    }
+
+    #[tokio::test]
+    async fn connector_iteration_requires_an_injected_registry() {
+        let mut registry = None;
+
+        let error = run_connector_role_once(&mut registry)
+            .await
+            .expect_err("missing registry must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "connector provider registry is not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_iteration_calls_the_injected_runner_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = FakeConnectorRunner {
+            calls: Arc::clone(&calls),
+        };
+        let mut registry: Option<Box<dyn ConnectorIterationRunner>> = Some(Box::new(runner));
+
+        let outcome = run_connector_role_once(&mut registry)
+            .await
+            .expect("injected iteration succeeds");
+
+        assert_eq!(outcome, ConnectorIterationOutcome::Idle);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
