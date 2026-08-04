@@ -1,0 +1,25 @@
+[package]
+name = "buzz-action-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fail-closed durable external action broker for Core Buzz"
+
+[dependencies]
+buzz-core = { workspace = true }
+buzz-db = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+nostr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_json_canonicalizer = "=0.3.2"
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

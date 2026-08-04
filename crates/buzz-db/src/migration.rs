@@ -692,7 +692,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        assert_eq!(migrations.len(), 29);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1069,8 +1069,16 @@ mod tests {
         assert!(core_storage.contains("existing_expression"));
         assert!(core_storage.contains("ELSE (%s) END"));
 
-        assert_eq!(migrations[27].version, 29);
-        let connector_hardening = migrations[27].sql.as_str();
+        assert_eq!(migrations[27].version, 28);
+        let action_broker = migrations[27].sql.as_str();
+        assert!(action_broker.contains("ADD COLUMN decision_id UUID"));
+        assert!(action_broker.contains("CREATE TABLE external_action_receipt_outbox"));
+        assert!(action_broker.contains("get_byte(uuid_send(decision_id), 6) >> 4"));
+        assert!(action_broker.contains("get_byte(uuid_send(receipt_id), 6) >> 4"));
+        assert!(!action_broker.contains("uuid_extract_version("));
+
+        assert_eq!(migrations[28].version, 29);
+        let connector_hardening = migrations[28].sql.as_str();
         assert!(connector_hardening.contains("last_page_digest"));
         assert!(connector_hardening.contains("start_char"));
         assert!(connector_hardening.contains("end_char"));
@@ -1172,7 +1180,13 @@ mod tests {
             !sql.contains("uuid_extract_version("),
             "uuid_extract_version is PostgreSQL 18-only, while Compose uses PostgreSQL 17"
         );
-        for value in ["nonce", "operation_id", "idempotency_key"] {
+        for value in [
+            "nonce",
+            "operation_id",
+            "idempotency_key",
+            "decision_id",
+            "receipt_id",
+        ] {
             assert!(
                 sql.contains(&format!("get_byte(uuid_send({value}), 6) >> 4")),
                 "missing UUID version-nibble check for {value}"

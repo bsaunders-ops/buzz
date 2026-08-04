@@ -22,7 +22,10 @@ pub use action_hash::{
     ACTION_ORDERED_MEMBERS_HASH_DOMAIN,
 };
 pub use actions::{
-    claim_action_execution, insert_action_proposal, mark_action_timeout_for_reconciliation,
+    begin_action_remote_attempt, claim_action_execution, claim_action_receipt_publication,
+    complete_action_receipt_publication, insert_action_proposal,
+    mark_action_timeout_for_reconciliation, record_action_decision, record_action_member_outcome,
+    retry_action_receipt_publication,
 };
 pub use audit::{
     append_audit_entry, claim_audit_export_batch, complete_audit_export_batch,

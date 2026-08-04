@@ -27,6 +27,7 @@ members = [
     "crates/buzz-relay-mesh",
     "crates/buzz-dev-mcp",
     "crates/buzz-voice",
+    "crates/buzz-action-broker",
     "crates/buzz-connector-core",
     "crates/buzz-backend-kubernetes",
     "examples/countdown-bot",

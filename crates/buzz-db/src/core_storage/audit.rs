@@ -81,13 +81,28 @@ pub async fn append_audit_entry(
 ) -> crate::Result<CoreAuditOutboxRecord> {
     require_hash("object_hash", envelope.object_hash)?;
     let mut tx = pool.begin().await?;
-    lock_audit_chain(&mut tx, community_id).await?;
+    let record = append_audit_entry_tx(&mut tx, community_id, envelope).await?;
+    tx.commit().await?;
+    Ok(record)
+}
+
+/// Append an audit entry inside an existing state-change transaction.
+///
+/// Callers use this for security decisions and execution intent so neither the
+/// state mutation nor the audit record can commit independently.
+pub(crate) async fn append_audit_entry_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    envelope: AuditEnvelope<'_>,
+) -> crate::Result<CoreAuditOutboxRecord> {
+    require_hash("object_hash", envelope.object_hash)?;
+    lock_audit_chain(tx, community_id).await?;
     let previous = sqlx::query(
         "SELECT sequence, entry_hash FROM core_audit_outbox \
          WHERE community_id=$1 ORDER BY sequence DESC LIMIT 1",
     )
     .bind(community_id.as_uuid())
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let (sequence, prior_entry_hash) = match previous {
         Some(row) => (
@@ -122,9 +137,8 @@ pub async fn append_audit_entry(
     .bind(envelope.outcome.as_str())
     .bind(&prior_entry_hash)
     .bind(&entry_hash)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(CoreAuditOutboxRecord {
         community_id,
         sequence,

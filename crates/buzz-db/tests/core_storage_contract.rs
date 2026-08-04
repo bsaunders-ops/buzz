@@ -4,15 +4,19 @@ use buzz_core::CommunityId;
 use buzz_db::core_storage::{
     action_member_hash, action_member_operation_hash, action_operation_hash,
     action_ordered_members_hash, append_audit_entry, apply_source_change_page,
-    claim_action_execution, claim_audit_export_batch, claim_delta_scope, claim_insight_slot,
-    complete_audit_export_batch, complete_delta_scope, fail_delta_scope, insert_action_proposal,
-    mark_action_timeout_for_reconciliation, recheck_source_chunk, retry_audit_export_batch,
-    search_source_chunks, search_source_chunks_by_embedding, source_chunk_hash,
-    ActionClaimDecision, ActionMemberHashInput, ActionProposalStatus, ApprovedSourceScopeRecord,
-    AuditEntityType, AuditEnvelope, AuditEventType, AuditObjectVersion, AuditOutcome,
-    ConnectorAccountRecord, DeltaLeaseClaim, DeltaLeaseDecision, ExternalConnector,
-    ExternalOperation, IndexedSourceKind, InsightClaimDecision, InsightClaimOutcome,
-    InsightPriority, KeyVaultSecretName, NewAssistantInsight, NewExternalActionProposal,
+    begin_action_remote_attempt, claim_action_execution, claim_action_receipt_publication,
+    claim_audit_export_batch, claim_delta_scope, claim_insight_slot,
+    complete_action_receipt_publication, complete_audit_export_batch, complete_delta_scope,
+    fail_delta_scope, insert_action_proposal, mark_action_timeout_for_reconciliation,
+    recheck_source_chunk, record_action_decision, record_action_member_outcome,
+    retry_action_receipt_publication, retry_audit_export_batch, search_source_chunks,
+    search_source_chunks_by_embedding, source_chunk_hash, ActionClaimDecision,
+    ActionDecisionRecord, ActionDecisionRecordOutcome, ActionMemberHashInput, ActionMemberOutcome,
+    ActionProposalStatus, ApprovedSourceScopeRecord, AuditEntityType, AuditEnvelope,
+    AuditEventType, AuditObjectVersion, AuditOutcome, ConnectorAccountRecord, DeltaLeaseClaim,
+    DeltaLeaseDecision, ExternalConnector, ExternalOperation, IndexedSourceKind,
+    InsightClaimDecision, InsightClaimOutcome, InsightPriority, KeyVaultSecretName,
+    NewActionMemberOutcome, NewAssistantInsight, NewExternalActionProposal,
     NewExternalActionProposalItem, NewIndexedSourceChunk, NewIndexedSourceItem,
     NewSourceAclPrincipal, NewSourceChangePage, NewSourceTombstone, SourceCandidateRecheckRequest,
     SourceItemAclRecord, SourcePageApplyOutcome, SourceSearchRequest, SourceVectorSearchRequest,
@@ -1479,6 +1483,20 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     let proposal_id = Uuid::new_v4();
     let signer = vec![8_u8; 32];
     let broker = vec![4_u8; 32];
+    let third_member = vec![9_u8; 32];
+    sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+        .bind(community.as_uuid())
+        .bind(&third_member)
+        .execute(&pool)
+        .await
+        .expect("insert unauthorized third action-channel member");
+    sqlx::query("UPDATE users SET agent_owner_pubkey=$3 WHERE community_id=$1 AND pubkey=$2")
+        .bind(community.as_uuid())
+        .bind(&broker)
+        .bind(&signer)
+        .execute(&pool)
+        .await
+        .expect("bind broker agent to owner");
     sqlx::query(
         "INSERT INTO connector_accounts \
          (community_id, id, provider, owner_pubkey, external_account_id, credential_reference) \
@@ -1625,6 +1643,35 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
         member_hashes.push(member_hash);
     }
     new_proposal.ordered_members_hash = action_ordered_members_hash(&member_hashes).to_vec();
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+         VALUES ($1, $2, $3, 'member')",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&third_member)
+    .execute(&pool)
+    .await
+    .expect("add unauthorized third action-channel member");
+    let mut three_member_proposal = new_proposal.clone();
+    three_member_proposal.id = Uuid::new_v4();
+    three_member_proposal.nonce = Uuid::new_v4();
+    assert!(
+        insert_action_proposal(&pool, community, &three_member_proposal)
+            .await
+            .is_err(),
+        "a private action channel with a third current member must reject proposal insertion"
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NOW() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&third_member)
+    .execute(&pool)
+    .await
+    .expect("remove unauthorized third action-channel member");
     let mut mutated_operation_id = new_proposal.clone();
     mutated_operation_id.id = Uuid::new_v4();
     mutated_operation_id.nonce = Uuid::new_v4();
@@ -1805,50 +1852,143 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     .await
     .expect("load derived member count");
     assert_eq!(stored_count, 2);
-    let wrong_broker_decision = sqlx::query(
-        "UPDATE external_action_proposals SET status='approved', signer_pubkey=$3, \
-         decision_broker_pubkey=$4, decision_event_hash=$5, decided_at=NOW() \
-         WHERE community_id=$1 AND id=$2",
-    )
-    .bind(community.as_uuid())
-    .bind(proposal_id)
-    .bind(&signer)
-    .bind(vec![3_u8; 32])
-    .bind(vec![17_u8; 32])
-    .execute(&pool)
-    .await;
-    assert!(
-        wrong_broker_decision.is_err(),
-        "a decision addressed to another broker must be rejected"
+    let decision_id = Uuid::new_v4();
+    let wrong_broker_decision = ActionDecisionRecord {
+        decision_id,
+        proposal_id,
+        owner_pubkey: signer.clone(),
+        broker_pubkey: vec![3_u8; 32],
+        channel_id,
+        nonce: new_proposal.nonce,
+        operation_hash: new_proposal.operation_hash.clone(),
+        decision_event_hash: vec![17_u8; 32],
+        approved: true,
+        decided_at: Utc::now(),
+    };
+    assert_eq!(
+        record_action_decision(&pool, community, &wrong_broker_decision)
+            .await
+            .expect("reject mismatched broker decision"),
+        ActionDecisionRecordOutcome::Rejected
     );
+    let mut decision = wrong_broker_decision;
+    decision.broker_pubkey = broker.clone();
     sqlx::query(
-        "UPDATE external_action_proposals SET status='approved', signer_pubkey=$3, \
-         decision_broker_pubkey=$4, decision_event_hash=$5, decided_at=NOW() \
-         WHERE community_id=$1 AND id=$2",
+        "UPDATE channel_members SET removed_at=NULL \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
     )
     .bind(community.as_uuid())
-    .bind(proposal_id)
-    .bind(&signer)
-    .bind(&broker)
-    .bind(vec![17_u8; 32])
+    .bind(channel_id)
+    .bind(&third_member)
     .execute(&pool)
     .await
-    .expect("record owner decision addressed to broker");
+    .expect("restore third member before decision authorization check");
+    assert_eq!(
+        record_action_decision(&pool, community, &decision)
+            .await
+            .expect("reject decision in a three-member action channel"),
+        ActionDecisionRecordOutcome::Rejected
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NOW() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&third_member)
+    .execute(&pool)
+    .await
+    .expect("remove third member before exact decision authorization");
+    assert_eq!(
+        record_action_decision(&pool, community, &decision)
+            .await
+            .expect("record exact owner decision"),
+        ActionDecisionRecordOutcome::Approved
+    );
+    let decision_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM core_audit_outbox \
+         WHERE community_id=$1 AND entity_id=$2 AND event_type='action_proposal_decided'",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count decision audit");
+    assert_eq!(decision_audits, 1);
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NULL \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&third_member)
+    .execute(&pool)
+    .await
+    .expect("restore third member after approval");
     assert!(
         claim_action_execution(&pool, community, proposal_id, Uuid::new_v4(), Utc::now())
             .await
             .is_err(),
-        "proposed members must not dispatch before item-level approval"
+        "approval must not authorize execution while a third channel member is current"
     );
     sqlx::query(
-        "UPDATE external_action_proposal_items SET status='approved' \
-         WHERE community_id=$1 AND proposal_id=$2",
+        "UPDATE channel_members SET removed_at=NOW() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
     )
     .bind(community.as_uuid())
-    .bind(proposal_id)
+    .bind(channel_id)
+    .bind(&third_member)
     .execute(&pool)
     .await
-    .expect("approve each displayed member");
+    .expect("remove third member after claim rejection");
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NOW() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&broker)
+    .execute(&pool)
+    .await
+    .expect("remove broker after approval");
+    assert!(
+        claim_action_execution(&pool, community, proposal_id, Uuid::new_v4(), Utc::now())
+            .await
+            .is_err(),
+        "approval must not survive current private-channel revocation"
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NULL \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&broker)
+    .execute(&pool)
+    .await
+    .expect("restore broker after claim rejection");
+    sqlx::query("UPDATE users SET agent_owner_pubkey=NULL WHERE community_id=$1 AND pubkey=$2")
+        .bind(community.as_uuid())
+        .bind(&broker)
+        .execute(&pool)
+        .await
+        .expect("break owner/broker pair after approval");
+    assert!(
+        claim_action_execution(&pool, community, proposal_id, Uuid::new_v4(), Utc::now())
+            .await
+            .is_err(),
+        "approval must not survive owner/broker pair revocation"
+    );
+    sqlx::query(
+        "UPDATE users SET agent_owner_pubkey=$3 \
+         WHERE community_id=$1 AND pubkey=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(&broker)
+    .bind(&signer)
+    .execute(&pool)
+    .await
+    .expect("restore owner/broker pair");
     sqlx::query(
         "UPDATE approved_source_scopes SET status='paused' \
          WHERE community_id=$1 AND id=$2",
@@ -1960,6 +2100,17 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     ];
     assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
     let claim = claims.into_iter().flatten().next().expect("one claim");
+    let execution_intent_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM core_audit_outbox \
+         WHERE community_id=$1 AND entity_id=$2 AND event_type='action_execution' \
+           AND outcome='accepted'",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count execution-intent audit");
+    assert_eq!(execution_intent_audits, 1);
     assert_eq!(claim.canonical_proposal, new_proposal.canonical_proposal);
     assert_eq!(claim.operation_hash, new_proposal.operation_hash);
     assert_eq!(
@@ -2000,6 +2151,87 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
         Some("etag-1")
     );
     assert_eq!(claim.nonce.get_version_num(), 4);
+    let attempts_after_claim: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM external_action_attempts WHERE community_id=$1 AND proposal_id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(proposal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count remote attempts after durable claim");
+    assert_eq!(
+        attempts_after_claim, 0,
+        "claim intent must not be misreported as a provider dispatch"
+    );
+    sqlx::query(
+        "UPDATE approved_source_scopes SET can_write=false \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .execute(&pool)
+    .await
+    .expect("revoke first member write scope after claim");
+    assert!(
+        begin_action_remote_attempt(&pool, community, proposal_id, claim.claim_id, 0, Utc::now(),)
+            .await
+            .expect("fail closed after post-claim scope revocation")
+            .is_none(),
+        "a stale claim cannot authorize a provider dispatch after scope revocation"
+    );
+    sqlx::query(
+        "UPDATE approved_source_scopes SET can_write=true \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .execute(&pool)
+    .await
+    .expect("restore first member write scope");
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NULL \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&third_member)
+    .execute(&pool)
+    .await
+    .expect("restore third member after durable claim");
+    assert!(
+        begin_action_remote_attempt(&pool, community, proposal_id, claim.claim_id, 0, Utc::now())
+            .await
+            .expect("fail closed when private-pair membership changes after claim")
+            .is_none(),
+        "a durable claim must not authorize dispatch while a third member is current"
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NOW() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(&third_member)
+    .execute(&pool)
+    .await
+    .expect("remove third member before provider dispatch");
+    let remote_attempt_0 =
+        begin_action_remote_attempt(&pool, community, proposal_id, claim.claim_id, 0, Utc::now())
+            .await
+            .expect("begin first provider attempt")
+            .expect("first member is dispatchable");
+    let remote_attempt_1 =
+        begin_action_remote_attempt(&pool, community, proposal_id, claim.claim_id, 1, Utc::now())
+            .await
+            .expect("begin second provider attempt")
+            .expect("second member is dispatchable");
+    assert!(
+        begin_action_remote_attempt(&pool, community, proposal_id, claim.claim_id, 0, Utc::now(),)
+            .await
+            .expect("reject duplicate provider attempt")
+            .is_none(),
+        "a provider member must never receive a blind second dispatch"
+    );
     let unbound_attempt = sqlx::query(
         "INSERT INTO external_action_attempts \
          (community_id, proposal_id, item_index, claim_id, attempt_number, started_at) \
@@ -2028,17 +2260,8 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
         missing_member_attempt.is_err(),
         "an attempt cannot splice in a member absent from the approved bundle"
     );
-    let attempts = sqlx::query(
-        "SELECT item_index, id FROM external_action_attempts \
-         WHERE community_id=$1 AND proposal_id=$2 ORDER BY item_index",
-    )
-    .bind(community.as_uuid())
-    .bind(proposal_id)
-    .fetch_all(&pool)
-    .await
-    .expect("load per-member attempts");
-    let attempt_0: Uuid = attempts[0].try_get("id").expect("first attempt id");
-    let attempt_1: Uuid = attempts[1].try_get("id").expect("second attempt id");
+    let attempt_0 = remote_attempt_0.attempt_id;
+    let attempt_1 = remote_attempt_1.attempt_id;
     let spliced_receipt = sqlx::query(
         "INSERT INTO external_action_receipts \
          (community_id, proposal_id, item_index, operation_id, member_hash, attempt_id, remote_result_id, remote_version, outcome) \
@@ -2203,6 +2426,184 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
             .expect("claim after timeout")
             .is_none(),
         "a timeout must not reopen a blind retry"
+    );
+
+    let receipt_proposal_id = Uuid::new_v4();
+    let mut receipt_proposal = new_proposal.clone();
+    receipt_proposal.id = receipt_proposal_id;
+    receipt_proposal.nonce = Uuid::new_v4();
+    receipt_proposal.proposed_at = Utc::now();
+    receipt_proposal.expires_at = receipt_proposal.proposed_at + Duration::minutes(5);
+    receipt_proposal.canonical_proposal = br#"{"action":"receipt-outbox"}"#.to_vec();
+    receipt_proposal.operation_hash =
+        action_operation_hash(&receipt_proposal.canonical_proposal).to_vec();
+    receipt_proposal.items.truncate(1);
+    receipt_proposal.items[0].operation_id = Uuid::new_v4();
+    receipt_proposal.items[0].idempotency_key = Uuid::new_v4();
+    receipt_proposal.items[0].canonical_operation = br#"{"draft":"exact"}"#.to_vec();
+    receipt_proposal.items[0].canonical_operation_hash =
+        action_member_operation_hash(&receipt_proposal.items[0].canonical_operation).to_vec();
+    let receipt_member_hash = action_member_hash(ActionMemberHashInput {
+        account_id: receipt_proposal.items[0].account_id,
+        scope_id: receipt_proposal.items[0].scope_id,
+        operation_id: receipt_proposal.items[0].operation_id,
+        owner_pubkey: &receipt_proposal.owner_pubkey,
+        connector: receipt_proposal.items[0].connector,
+        operation: receipt_proposal.items[0].operation,
+        target_hash: &receipt_proposal.items[0].target_hash,
+        before_hash: receipt_proposal.items[0].before_hash.as_deref(),
+        after_hash: &receipt_proposal.items[0].after_hash,
+        expected_remote_version: receipt_proposal.items[0].expected_remote_version.as_deref(),
+        idempotency_key: receipt_proposal.items[0].idempotency_key,
+        canonical_operation_hash: &receipt_proposal.items[0].canonical_operation_hash,
+    });
+    receipt_proposal.items[0].member_hash = receipt_member_hash.to_vec();
+    receipt_proposal.ordered_members_hash =
+        action_ordered_members_hash(&[receipt_member_hash]).to_vec();
+    insert_action_proposal(&pool, community, &receipt_proposal)
+        .await
+        .expect("insert receipt-outbox proposal");
+    let receipt_decision = ActionDecisionRecord {
+        decision_id: Uuid::new_v4(),
+        proposal_id: receipt_proposal_id,
+        owner_pubkey: signer.clone(),
+        broker_pubkey: broker.clone(),
+        channel_id,
+        nonce: receipt_proposal.nonce,
+        operation_hash: receipt_proposal.operation_hash.clone(),
+        decision_event_hash: vec![0x66; 32],
+        approved: true,
+        decided_at: Utc::now(),
+    };
+    assert_eq!(
+        record_action_decision(&pool, community, &receipt_decision)
+            .await
+            .expect("approve receipt-outbox proposal"),
+        ActionDecisionRecordOutcome::Approved
+    );
+    let receipt_claim = claim_action_execution(
+        &pool,
+        community,
+        receipt_proposal_id,
+        Uuid::new_v4(),
+        Utc::now(),
+    )
+    .await
+    .expect("claim receipt-outbox proposal")
+    .expect("receipt-outbox claim");
+    let durable_outcome = NewActionMemberOutcome {
+        proposal_id: receipt_proposal_id,
+        claim_id: receipt_claim.claim_id,
+        item_index: 0,
+        attempt_id: None,
+        operation_id: receipt_claim.items[0].operation_id,
+        member_hash: receipt_claim.items[0].member_hash.clone(),
+        remote_result_id: None,
+        remote_version: None,
+        remote_resource_id_hash: None,
+        outcome: ActionMemberOutcome::Failed,
+        occurred_at: Utc::now(),
+    };
+    assert!(
+        record_action_member_outcome(&pool, community, &durable_outcome)
+            .await
+            .expect("record durable member outcome")
+    );
+    assert!(
+        !record_action_member_outcome(&pool, community, &durable_outcome)
+            .await
+            .expect("reject member outcome replay"),
+        "a durable outcome must not replay"
+    );
+    let publish_now = Utc::now();
+    let (publication_a, publication_b) = tokio::join!(
+        claim_action_receipt_publication(
+            &pool,
+            community,
+            Uuid::new_v4(),
+            publish_now,
+            StdDuration::from_secs(30),
+        ),
+        claim_action_receipt_publication(
+            &pool,
+            community,
+            Uuid::new_v4(),
+            publish_now,
+            StdDuration::from_secs(30),
+        )
+    );
+    let publications = [
+        publication_a.expect("first concurrent receipt claim"),
+        publication_b.expect("second concurrent receipt claim"),
+    ];
+    assert_eq!(
+        publications.iter().filter(|value| value.is_some()).count(),
+        1,
+        "only one receipt publisher may hold the durable lease"
+    );
+    let publication = publications
+        .into_iter()
+        .flatten()
+        .next()
+        .expect("receipt publication");
+    assert_eq!(publication.proposal_id, receipt_proposal_id);
+    assert_eq!(publication.decision_id, receipt_decision.decision_id);
+    assert_eq!(publication.results.len(), 1);
+    assert_eq!(publication.results[0].outcome, ActionMemberOutcome::Failed);
+    let receipt_remote_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM external_action_attempts \
+         WHERE community_id=$1 AND proposal_id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(receipt_proposal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count pre-dispatch remote attempts");
+    assert_eq!(
+        receipt_remote_attempts, 0,
+        "a deterministic pre-dispatch failure must record zero provider attempts"
+    );
+    assert!(retry_action_receipt_publication(
+        &pool,
+        community,
+        receipt_proposal_id,
+        publication.publish_claim_id,
+        publish_now,
+    )
+    .await
+    .expect("retry receipt publication"));
+    let publication = claim_action_receipt_publication(
+        &pool,
+        community,
+        Uuid::new_v4(),
+        publish_now,
+        StdDuration::from_secs(30),
+    )
+    .await
+    .expect("reclaim receipt publication")
+    .expect("retried receipt publication");
+    assert!(complete_action_receipt_publication(
+        &pool,
+        community,
+        receipt_proposal_id,
+        publication.publish_claim_id,
+        &[0x99; 32],
+        Utc::now(),
+    )
+    .await
+    .expect("complete receipt publication"));
+    assert!(
+        claim_action_receipt_publication(
+            &pool,
+            community,
+            Uuid::new_v4(),
+            Utc::now(),
+            StdDuration::from_secs(30),
+        )
+        .await
+        .expect("receipt outbox drained")
+        .is_none(),
+        "published receipts must not replay"
     );
 
     drop_scratch_db(&admin, pool, &name).await;

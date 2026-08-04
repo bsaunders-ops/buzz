@@ -859,6 +859,62 @@ pub enum ActionClaimDecision {
     AlreadyClaimed,
 }
 
+/// Exact signed owner decision fields accepted by the durable action CAS.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActionDecisionRecord {
+    /// Stable UUIDv4 from the signed decision payload.
+    pub decision_id: Uuid,
+    /// Proposal receiving the decision.
+    pub proposal_id: Uuid,
+    /// Exact owner signer public key.
+    pub owner_pubkey: Vec<u8>,
+    /// Exact registered broker recipient public key.
+    pub broker_pubkey: Vec<u8>,
+    /// Private owner/broker channel.
+    pub channel_id: Uuid,
+    /// One-time proposal nonce.
+    pub nonce: Uuid,
+    /// Exact domain-separated canonical proposal hash.
+    pub operation_hash: Vec<u8>,
+    /// Hash of the cryptographically verified Nostr decision event.
+    pub decision_event_hash: Vec<u8>,
+    /// `true` approves; `false` permanently denies.
+    pub approved: bool,
+    /// Signed decision timestamp.
+    pub decided_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for ActionDecisionRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActionDecisionRecord")
+            .field("decision_id", &"<redacted>")
+            .field("proposal_id", &"<redacted>")
+            .field("owner_pubkey", &"<redacted>")
+            .field("broker_pubkey", &"<redacted>")
+            .field("channel_id", &"<redacted>")
+            .field("nonce", &"<redacted>")
+            .field("operation_hash", &"<redacted>")
+            .field("decision_event_hash", &"<redacted>")
+            .field("approved", &self.approved)
+            .field("decided_at", &self.decided_at)
+            .finish()
+    }
+}
+
+/// Outcome of the atomic durable decision compare-and-swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionDecisionRecordOutcome {
+    /// Exact proposal and every member moved to approved.
+    Approved,
+    /// Exact proposal and every member moved permanently to denied.
+    Denied,
+    /// Proposal expired before the signed decision could be applied.
+    Expired,
+    /// Binding, pair, membership, replay, or state validation failed closed.
+    Rejected,
+}
+
 impl ActionClaimDecision {
     /// Evaluate approval, expiry, and one-time claim state.
     #[must_use]
@@ -881,7 +937,7 @@ impl ActionClaimDecision {
 }
 
 /// One immutable member of an approved external-action bundle.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ActionExecutionItem {
     /// Zero-based position committed by the proposal bundle hash.
     pub item_index: i16,
@@ -913,8 +969,21 @@ pub struct ActionExecutionItem {
     pub member_hash: Vec<u8>,
 }
 
+impl std::fmt::Debug for ActionExecutionItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActionExecutionItem")
+            .field("item_index", &self.item_index)
+            .field("connector", &self.connector)
+            .field("operation", &self.operation)
+            .field("canonical_operation", &"<redacted>")
+            .field("identifiers_and_hashes", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Exact immutable values returned to the sole action executor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ActionExecutionClaim {
     /// Tenant owning the action.
     pub community_id: CommunityId,
@@ -922,6 +991,8 @@ pub struct ActionExecutionClaim {
     pub proposal_id: Uuid,
     /// Unique one-time claim identifier.
     pub claim_id: Uuid,
+    /// Stable signed decision identifier needed by the receipt payload.
+    pub decision_id: Uuid,
     /// Owner and expected approving public key.
     pub owner_pubkey: Vec<u8>,
     /// Broker/agent public key addressed by the signed decision.
@@ -950,8 +1021,181 @@ pub struct ActionExecutionClaim {
     pub decision_event_hash: Vec<u8>,
 }
 
+impl std::fmt::Debug for ActionExecutionClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActionExecutionClaim")
+            .field("identifiers_pubkeys_hashes", &"<redacted>")
+            .field("canonical_proposal", &"<redacted>")
+            .field("member_count", &self.member_count)
+            .field("items", &self.items)
+            .field("proposed_at", &self.proposed_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Durable proof that exactly one provider call may now begin for a member.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActionRemoteAttempt {
+    /// Internal attempt identifier used to bind the durable outcome.
+    pub attempt_id: Uuid,
+    /// Ordered member receiving the sole provider dispatch.
+    pub item_index: i16,
+}
+
+impl std::fmt::Debug for ActionRemoteAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActionRemoteAttempt")
+            .field("attempt_id", &"<redacted>")
+            .field("item_index", &self.item_index)
+            .finish()
+    }
+}
+
+/// Closed durable outcome for one external-action member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionMemberOutcome {
+    /// Provider conclusively committed the operation.
+    Succeeded,
+    /// A pre-dispatch check or provider conclusively rejected the operation.
+    Failed,
+    /// A dispatched operation has an ambiguous remote result.
+    ReconciliationRequired,
+}
+
+impl ActionMemberOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::ReconciliationRequired => "reconciliation_required",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> crate::Result<Self> {
+        match value {
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "reconciliation_required" => Ok(Self::ReconciliationRequired),
+            _ => Err(crate::DbError::InvalidData(
+                "unknown external action outcome".into(),
+            )),
+        }
+    }
+}
+
+/// Exact durable outcome recorded after a pre-check or one provider dispatch.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewActionMemberOutcome {
+    /// Parent proposal.
+    pub proposal_id: Uuid,
+    /// One-time bundle claim.
+    pub claim_id: Uuid,
+    /// Ordered member index.
+    pub item_index: i16,
+    /// Attempt ID, absent only for a deterministic pre-dispatch failure.
+    pub attempt_id: Option<Uuid>,
+    /// Bound operation UUIDv4.
+    pub operation_id: Uuid,
+    /// Bound member hash.
+    pub member_hash: Vec<u8>,
+    /// Opaque provider result identifier, required only for success.
+    pub remote_result_id: Option<String>,
+    /// Provider version after success.
+    pub remote_version: Option<String>,
+    /// Optional hash of the provider resource identifier.
+    pub remote_resource_id_hash: Option<Vec<u8>>,
+    /// Closed final or reconciliation outcome.
+    pub outcome: ActionMemberOutcome,
+    /// Explicit durable observation time.
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for NewActionMemberOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewActionMemberOutcome")
+            .field("identifiers_hashes", &"<redacted>")
+            .field("item_index", &self.item_index)
+            .field("has_attempt", &self.attempt_id.is_some())
+            .field("remote_result", &"<redacted>")
+            .field("outcome", &self.outcome)
+            .finish()
+    }
+}
+
+/// One immutable member projected into a receipt publication.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActionReceiptPublicationItem {
+    /// Bound operation UUIDv4.
+    pub operation_id: Uuid,
+    /// Bound member hash.
+    pub operation_hash: Vec<u8>,
+    /// Provider idempotency key approved for this member.
+    pub idempotency_key: Uuid,
+    /// Final or reconciliation outcome.
+    pub outcome: ActionMemberOutcome,
+    /// Opaque provider result identifier.
+    pub external_result_id: Option<String>,
+    /// Provider result version.
+    pub external_result_version: Option<String>,
+    /// Durable reconciliation posture.
+    pub reconciliation_status: String,
+}
+
+impl std::fmt::Debug for ActionReceiptPublicationItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActionReceiptPublicationItem")
+            .field("identifiers_hashes", &"<redacted>")
+            .field("outcome", &self.outcome)
+            .field("external_result", &"<redacted>")
+            .field("reconciliation_status", &self.reconciliation_status)
+            .finish()
+    }
+}
+
+/// Crash-safe durable receipt payload projection claimed for event signing.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActionReceiptPublication {
+    /// One-time lease claim required to complete or retry publication.
+    pub publish_claim_id: Uuid,
+    /// Stable receipt UUIDv4.
+    pub receipt_id: Uuid,
+    /// Parent proposal UUIDv4.
+    pub proposal_id: Uuid,
+    /// Signed decision UUIDv4.
+    pub decision_id: Uuid,
+    /// Private channel carrying the receipt event.
+    pub channel_id: Uuid,
+    /// Owner recipient of the broker-signed receipt.
+    pub owner_pubkey: Vec<u8>,
+    /// Registered broker expected to sign the receipt.
+    pub broker_pubkey: Vec<u8>,
+    /// Exact canonical proposal hash.
+    pub operation_hash: Vec<u8>,
+    /// Ordered one-for-one member results.
+    pub results: Vec<ActionReceiptPublicationItem>,
+    /// Durable outcome timestamp.
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for ActionReceiptPublication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActionReceiptPublication")
+            .field("identifiers_hashes", &"<redacted>")
+            .field("result_count", &self.results.len())
+            .field("results", &self.results)
+            .field("occurred_at", &self.occurred_at)
+            .finish()
+    }
+}
+
 /// Durable external action proposal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExternalActionProposalRecord {
     /// Tenant owning the proposal.
     pub community_id: CommunityId,
@@ -985,8 +1229,21 @@ pub struct ExternalActionProposalRecord {
     pub decision_event_hash: Option<Vec<u8>>,
 }
 
+impl std::fmt::Debug for ExternalActionProposalRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalActionProposalRecord")
+            .field("identifiers_pubkeys_hashes", &"<redacted>")
+            .field("canonical_proposal", &"<redacted>")
+            .field("member_count", &self.member_count)
+            .field("items", &self.items)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
 /// A proposed member whose position is derived from its place in the bundle.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewExternalActionProposalItem {
     /// Stable UUIDv4 protocol member identifier.
     pub operation_id: Uuid,
@@ -1016,8 +1273,20 @@ pub struct NewExternalActionProposalItem {
     pub member_hash: Vec<u8>,
 }
 
+impl std::fmt::Debug for NewExternalActionProposalItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewExternalActionProposalItem")
+            .field("connector", &self.connector)
+            .field("operation", &self.operation)
+            .field("canonical_operation", &"<redacted>")
+            .field("identifiers_versions_hashes", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A complete proposed cross-provider action bundle inserted atomically.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewExternalActionProposal {
     /// Caller-selected proposal identifier.
     pub id: Uuid,
@@ -1043,8 +1312,19 @@ pub struct NewExternalActionProposal {
     pub items: Vec<NewExternalActionProposalItem>,
 }
 
+impl std::fmt::Debug for NewExternalActionProposal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewExternalActionProposal")
+            .field("identifiers_pubkeys_hashes", &"<redacted>")
+            .field("canonical_proposal", &"<redacted>")
+            .field("item_count", &self.items.len())
+            .finish()
+    }
+}
+
 /// Durable external action attempt metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExternalActionAttemptRecord {
     /// Tenant owning the attempt.
     pub community_id: CommunityId,
@@ -1062,8 +1342,20 @@ pub struct ExternalActionAttemptRecord {
     pub outcome: String,
 }
 
+impl std::fmt::Debug for ExternalActionAttemptRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalActionAttemptRecord")
+            .field("identifiers", &"<redacted>")
+            .field("item_index", &self.item_index)
+            .field("attempt_number", &self.attempt_number)
+            .field("outcome", &self.outcome)
+            .finish()
+    }
+}
+
 /// Durable action receipt and reconciliation metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExternalActionReceiptRecord {
     /// Tenant owning the receipt.
     pub community_id: CommunityId,
@@ -1087,6 +1379,19 @@ pub struct ExternalActionReceiptRecord {
     pub outcome: String,
     /// Reconciliation lifecycle state.
     pub reconciliation_state: String,
+}
+
+impl std::fmt::Debug for ExternalActionReceiptRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalActionReceiptRecord")
+            .field("identifiers_hashes", &"<redacted>")
+            .field("item_index", &self.item_index)
+            .field("remote_result", &"<redacted>")
+            .field("outcome", &self.outcome)
+            .field("reconciliation_state", &self.reconciliation_state)
+            .finish()
+    }
 }
 
 /// Pure result of checking a cursor lease.
