@@ -34,6 +34,13 @@ pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 /// meaningless and risks arithmetic overflow when deriving the in-flight
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
 pub(crate) const MAX_TURN_DURATION_CEILING_SECS: u64 = 604_800;
+pub const CORE_SEALED_MODE_ENV: &str = "BUZZ_ACP_CORE_SEALED_MODE";
+
+pub fn core_sealed_mode_enabled() -> bool {
+    std::env::var(CORE_SEALED_MODE_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -168,6 +175,19 @@ impl PermissionMode {
     /// therefore doesn't need to be explicitly set.
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Default)
+    }
+
+    /// Return the safest permission mode compatible with Core sealed mode.
+    ///
+    /// Modes that approve tool execution without a durable Buzz-side action
+    /// proposal are downgraded to `dontAsk`; explicit planning/default modes
+    /// remain unchanged and any per-tool permission request is rejected by the
+    /// ACP client in sealed mode.
+    pub fn core_sealed_effective(self) -> Self {
+        match self {
+            Self::AcceptEdits | Self::BypassPermissions => Self::DontAsk,
+            Self::Default | Self::DontAsk | Self::Plan => self,
+        }
     }
 }
 
@@ -2360,6 +2380,30 @@ channels = "ALL"
         assert!(!PermissionMode::AcceptEdits.is_default());
         assert!(!PermissionMode::DontAsk.is_default());
         assert!(!PermissionMode::Plan.is_default());
+    }
+
+    #[test]
+    fn test_core_sealed_effective_permission_mode_disables_approval_modes() {
+        assert_eq!(
+            PermissionMode::BypassPermissions.core_sealed_effective(),
+            PermissionMode::DontAsk
+        );
+        assert_eq!(
+            PermissionMode::AcceptEdits.core_sealed_effective(),
+            PermissionMode::DontAsk
+        );
+        assert_eq!(
+            PermissionMode::Default.core_sealed_effective(),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            PermissionMode::DontAsk.core_sealed_effective(),
+            PermissionMode::DontAsk
+        );
+        assert_eq!(
+            PermissionMode::Plan.core_sealed_effective(),
+            PermissionMode::Plan
+        );
     }
 
     #[test]

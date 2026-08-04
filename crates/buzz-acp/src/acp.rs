@@ -19,13 +19,6 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
-const CORE_SEALED_MODE_ENV: &str = "BUZZ_ACP_CORE_SEALED_MODE";
-
-fn core_sealed_mode_enabled() -> bool {
-    std::env::var(CORE_SEALED_MODE_ENV)
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-}
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -185,6 +178,9 @@ pub struct AcpClient {
     /// Guards against double-response if a timeout fires after the allow_once
     /// response was written but before `pending_permission_id` was cleared.
     permission_responded: bool,
+    /// Core sealed mode prevents ambient supervisor secrets and permission
+    /// auto-approval from reaching the model child.
+    core_sealed_mode: bool,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -490,7 +486,7 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
-        let core_sealed_mode = core_sealed_mode_enabled();
+        let core_sealed_mode = crate::config::core_sealed_mode_enabled();
 
         let mut cmd = tokio::process::Command::new(command);
         if core_sealed_mode {
@@ -581,6 +577,7 @@ impl AcpClient {
             next_id: 0,
             pending_permission_id: None,
             permission_responded: false,
+            core_sealed_mode,
             last_prompt_id: None,
             terminal_prompt_snapshot: None,
             current_hard_deadline: None,
@@ -1973,10 +1970,13 @@ impl AcpClient {
         }
     }
 
-    /// Auto-approve a `session/request_permission` request from the agent.
+    /// Respond to a `session/request_permission` request from the agent.
     ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
+    /// Normal mode finds the option with `kind == "allow_once"` and responds
+    /// with its `optionId`; if no `allow_once` option exists, it falls back to
+    /// `reject_once`. Core sealed mode never auto-approves and prefers
+    /// `reject_once`, falling back to a cancelled response when the agent did
+    /// not offer an explicit reject option.
     ///
     /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
     ///
@@ -2000,44 +2000,12 @@ impl AcpClient {
 
         tracing::debug!(
             target: "acp::permission",
+            core_sealed_mode = self.core_sealed_mode,
             "session/request_permission id={id}, {} options",
-            options.len()
+            options.len(),
         );
 
-        // Find allow_once by kind — NEVER hardcode optionId.
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
-
-        let response = if let Some(opt) = allow_once {
-            let option_id = opt["optionId"]
-                .as_str()
-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
-            tracing::info!(
-                target: "acp::permission",
-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
-            );
-            permission_response_selected(&id, option_id)
-        } else {
-            // No allow_once — fall back to reject_once.
-            tracing::warn!(
-                target: "acp::permission",
-                "no allow_once option found in permission request id={id}, falling back to reject_once"
-            );
-            let reject = options
-                .iter()
-                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
-
-            if let Some(opt) = reject {
-                let option_id = opt["optionId"].as_str().unwrap_or("reject");
-                permission_response_selected(&id, option_id)
-            } else {
-                return Err(AcpError::Protocol(
-                    "no suitable permission option found (neither allow_once nor reject_once)"
-                        .into(),
-                ));
-            }
-        };
+        let response = permission_response_for_request(&id, options, self.core_sealed_mode)?;
 
         // Write the response first, then mark as responded.
         //
@@ -2138,6 +2106,63 @@ fn permission_response_selected(id: &serde_json::Value, option_id: &str) -> serd
         "id": id,
         "result": { "outcome": { "outcome": "selected", "optionId": option_id } }
     })
+}
+
+fn permission_response_for_request(
+    id: &serde_json::Value,
+    options: &[serde_json::Value],
+    core_sealed_mode: bool,
+) -> Result<serde_json::Value, AcpError> {
+    if core_sealed_mode {
+        if let Some(option_id) = permission_option_id_by_kind(options, "reject_once")? {
+            tracing::info!(
+                target: "acp::permission",
+                "Core sealed mode rejected permission id={id} with reject_once optionId={option_id:?}"
+            );
+            return Ok(permission_response_selected(id, option_id));
+        }
+
+        tracing::warn!(
+            target: "acp::permission",
+            "Core sealed mode cancelled permission id={id}; agent did not offer reject_once"
+        );
+        return Ok(permission_response_cancelled(id));
+    }
+
+    if let Some(option_id) = permission_option_id_by_kind(options, "allow_once")? {
+        tracing::info!(
+            target: "acp::permission",
+            "auto-approving permission id={id} with allow_once optionId={option_id:?}"
+        );
+        return Ok(permission_response_selected(id, option_id));
+    }
+
+    tracing::warn!(
+        target: "acp::permission",
+        "no allow_once option found in permission request id={id}, falling back to reject_once"
+    );
+    if let Some(option_id) = permission_option_id_by_kind(options, "reject_once")? {
+        Ok(permission_response_selected(id, option_id))
+    } else {
+        Err(AcpError::Protocol(
+            "no suitable permission option found (neither allow_once nor reject_once)".into(),
+        ))
+    }
+}
+
+fn permission_option_id_by_kind<'a>(
+    options: &'a [serde_json::Value],
+    kind: &str,
+) -> Result<Option<&'a str>, AcpError> {
+    options
+        .iter()
+        .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some(kind))
+        .map(|opt| {
+            opt.get("optionId")
+                .and_then(|option_id| option_id.as_str())
+                .ok_or_else(|| AcpError::Protocol(format!("{kind} option missing optionId")))
+        })
+        .transpose()
 }
 
 /// Build a JSON-RPC permission response with `outcome: "cancelled"`.
@@ -2643,6 +2668,64 @@ mod tests {
             Some("cancelled")
         );
         // cancelled outcome has no optionId
+        assert!(response["result"]["outcome"].get("optionId").is_none());
+    }
+
+    #[test]
+    fn permission_response_selects_allow_once_outside_core_sealed_mode() {
+        let id = serde_json::json!(5);
+        let options = vec![
+            serde_json::json!({"optionId": "reject-1", "kind": "reject_once"}),
+            serde_json::json!({"optionId": "allow-1", "kind": "allow_once"}),
+        ];
+
+        let response = permission_response_for_request(&id, &options, false)
+            .expect("permission response should be built");
+
+        assert_eq!(
+            response["result"]["outcome"]["outcome"].as_str(),
+            Some("selected")
+        );
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("allow-1")
+        );
+    }
+
+    #[test]
+    fn permission_response_rejects_once_in_core_sealed_mode() {
+        let id = serde_json::json!(5);
+        let options = vec![
+            serde_json::json!({"optionId": "reject-1", "kind": "reject_once"}),
+            serde_json::json!({"optionId": "allow-1", "kind": "allow_once"}),
+        ];
+
+        let response = permission_response_for_request(&id, &options, true)
+            .expect("permission response should be built");
+
+        assert_eq!(
+            response["result"]["outcome"]["outcome"].as_str(),
+            Some("selected")
+        );
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("reject-1")
+        );
+    }
+
+    #[test]
+    fn permission_response_cancels_in_core_sealed_mode_without_reject_once() {
+        let id = serde_json::json!("req-1");
+        let options = vec![serde_json::json!({"optionId": "allow-1", "kind": "allow_once"})];
+
+        let response = permission_response_for_request(&id, &options, true)
+            .expect("permission response should be built");
+
+        assert_eq!(response["id"], id);
+        assert_eq!(
+            response["result"]["outcome"]["outcome"].as_str(),
+            Some("cancelled")
+        );
         assert!(response["result"]["outcome"].get("optionId").is_none());
     }
 

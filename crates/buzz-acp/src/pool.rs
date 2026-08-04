@@ -1449,14 +1449,28 @@ async fn create_session_and_apply_model(
         }),
     );
 
+    let permission_mode = effective_permission_mode_for_core_sealed_mode(
+        ctx.permission_mode,
+        crate::config::core_sealed_mode_enabled(),
+    );
+    if permission_mode != ctx.permission_mode {
+        tracing::warn!(
+            target: "pool::permission",
+            configured = %ctx.permission_mode,
+            effective = %permission_mode,
+            "Core sealed mode disabled ACP approval permission mode"
+        );
+    }
+
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
-    // are safely skipped — the harness auto-approves via handle_permission_request.
-    if !ctx.permission_mode.is_default()
-        && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
+    // are safely skipped — the harness permission-request handler remains the
+    // fallback policy.
+    if !permission_mode.is_default()
+        && agent_supports_mode(&resp.raw, permission_mode.as_wire_str())
     {
-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+        apply_permission_mode(&mut agent.acp, &resp.session_id, &permission_mode).await?;
     }
 
     Ok(resp.session_id)
@@ -1557,7 +1571,18 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
         .unwrap_or(false)
 }
 
-/// per-tool auto-approval in `handle_permission_request`.
+fn effective_permission_mode_for_core_sealed_mode(
+    configured: PermissionMode,
+    core_sealed_mode: bool,
+) -> PermissionMode {
+    if core_sealed_mode {
+        configured.core_sealed_effective()
+    } else {
+        configured
+    }
+}
+
+/// per-tool policy in `handle_permission_request`.
 ///
 /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
 /// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
@@ -4370,6 +4395,29 @@ mod tests {
     use crate::queue::BatchEvent;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
+
+    #[test]
+    fn effective_permission_mode_disables_approval_modes_only_in_core_sealed_mode() {
+        assert_eq!(
+            effective_permission_mode_for_core_sealed_mode(PermissionMode::BypassPermissions, true),
+            PermissionMode::DontAsk
+        );
+        assert_eq!(
+            effective_permission_mode_for_core_sealed_mode(PermissionMode::AcceptEdits, true),
+            PermissionMode::DontAsk
+        );
+        assert_eq!(
+            effective_permission_mode_for_core_sealed_mode(
+                PermissionMode::BypassPermissions,
+                false
+            ),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            effective_permission_mode_for_core_sealed_mode(PermissionMode::Plan, true),
+            PermissionMode::Plan
+        );
+    }
 
     #[test]
     fn trusted_publish_target_uses_batch_last_and_rejects_untrusted_tags() {
