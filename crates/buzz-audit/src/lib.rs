@@ -19,6 +19,8 @@
 
 /// Audit action types recorded in the log.
 pub mod action;
+/// Content-free, signed Core audit export records.
+pub mod core_export;
 /// Audit log entry types (stored and input).
 pub mod entry;
 /// Error types for audit operations.

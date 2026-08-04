@@ -888,6 +888,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "nostr",
  "serde",
  "serde_json",
  "sha2 0.11.0",
