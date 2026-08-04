@@ -859,49 +859,6 @@ pub enum ActionClaimDecision {
     AlreadyClaimed,
 }
 
-/// Exact signed owner decision fields accepted by the durable action CAS.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ActionDecisionRecord {
-    /// Stable UUIDv4 from the signed decision payload.
-    pub decision_id: Uuid,
-    /// Proposal receiving the decision.
-    pub proposal_id: Uuid,
-    /// Exact owner signer public key.
-    pub owner_pubkey: Vec<u8>,
-    /// Exact registered broker recipient public key.
-    pub broker_pubkey: Vec<u8>,
-    /// Private owner/broker channel.
-    pub channel_id: Uuid,
-    /// One-time proposal nonce.
-    pub nonce: Uuid,
-    /// Exact domain-separated canonical proposal hash.
-    pub operation_hash: Vec<u8>,
-    /// Hash of the cryptographically verified Nostr decision event.
-    pub decision_event_hash: Vec<u8>,
-    /// `true` approves; `false` permanently denies.
-    pub approved: bool,
-    /// Signed decision timestamp.
-    pub decided_at: DateTime<Utc>,
-}
-
-impl std::fmt::Debug for ActionDecisionRecord {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ActionDecisionRecord")
-            .field("decision_id", &"<redacted>")
-            .field("proposal_id", &"<redacted>")
-            .field("owner_pubkey", &"<redacted>")
-            .field("broker_pubkey", &"<redacted>")
-            .field("channel_id", &"<redacted>")
-            .field("nonce", &"<redacted>")
-            .field("operation_hash", &"<redacted>")
-            .field("decision_event_hash", &"<redacted>")
-            .field("approved", &self.approved)
-            .field("decided_at", &self.decided_at)
-            .finish()
-    }
-}
-
 /// Outcome of the atomic durable decision compare-and-swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionDecisionRecordOutcome {

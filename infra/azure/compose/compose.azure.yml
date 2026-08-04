@@ -208,6 +208,252 @@ services:
           cpus: "0.10"
           memory: 64M
 
+  agent-supervisor:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${BUZZ_CORE_WORKER_IMAGE:?set BUZZ_CORE_WORKER_IMAGE to an ACR digest reference}
+    user: "1000:1000"
+    command: ["serve", "--role", "agent-supervisor"]
+    env_file:
+      - path: /run/buzz/secrets/agent-supervisor.env
+        required: true
+    environment:
+      HTTPS_PROXY: http://model-egress-proxy:3128
+      HTTP_PROXY: http://model-egress-proxy:3128
+      NO_PROXY: relay,redis,localhost,127.0.0.1
+      BUZZ_WORKER_HEALTH_FILE: /tmp/buzz-core-worker.health
+    depends_on:
+      model-egress-proxy:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=1770
+      - /run/buzz:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0770
+    healthcheck: &worker-health
+      test: ["CMD", "/usr/local/bin/buzz-core-worker", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks: [broker, model-internal]
+    deploy: &small-worker-resources
+      resources:
+        limits: {cpus: "0.75", memory: 768M}
+        reservations: {cpus: "0.10", memory: 128M}
+
+  connector-worker:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${BUZZ_CORE_WORKER_IMAGE:?set BUZZ_CORE_WORKER_IMAGE to an ACR digest reference}
+    user: "1000:1000"
+    command: ["serve", "--role", "connector-worker"]
+    env_file:
+      - path: /run/buzz/secrets/connector-worker.env
+        required: true
+    environment:
+      HTTPS_PROXY: http://connector-egress-proxy:3128
+      HTTP_PROXY: http://connector-egress-proxy:3128
+      NO_PROXY: postgres,redis,relay,localhost,127.0.0.1
+      BUZZ_WORKER_HEALTH_FILE: /tmp/buzz-core-worker.health
+    depends_on:
+      postgres:
+        condition: service_healthy
+      connector-egress-proxy:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,uid=1000,gid=1000,mode=1770
+      - /run/buzz:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0770
+    healthcheck: *worker-health
+    networks: [relay-data, broker, connector-internal]
+    deploy: *small-worker-resources
+
+  sanitizer-indexer:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${BUZZ_CORE_WORKER_IMAGE:?set BUZZ_CORE_WORKER_IMAGE to an ACR digest reference}
+    user: "1000:1000"
+    command: ["serve", "--role", "sanitizer-indexer"]
+    env_file:
+      - path: /run/buzz/secrets/sanitizer-indexer.env
+        required: true
+    environment:
+      NO_PROXY: postgres,redis,localhost,127.0.0.1
+      BUZZ_WORKER_HEALTH_FILE: /tmp/buzz-core-worker.health
+    depends_on:
+      postgres:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1770
+      - /run/buzz:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0770
+    healthcheck: *worker-health
+    networks: [relay-data, broker]
+    deploy: *small-worker-resources
+
+  signal-runner:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${BUZZ_CORE_WORKER_IMAGE:?set BUZZ_CORE_WORKER_IMAGE to an ACR digest reference}
+    user: "1000:1000"
+    command: ["serve", "--role", "signal-runner"]
+    env_file:
+      - path: /run/buzz/secrets/signal-runner.env
+        required: true
+    environment:
+      NO_PROXY: postgres,redis,relay,localhost,127.0.0.1
+      BUZZ_WORKER_HEALTH_FILE: /tmp/buzz-core-worker.health
+    depends_on:
+      postgres:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=1770
+      - /run/buzz:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0770
+    healthcheck: *worker-health
+    networks: [relay-data, broker]
+    deploy: *small-worker-resources
+
+  action-executor:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${BUZZ_CORE_WORKER_IMAGE:?set BUZZ_CORE_WORKER_IMAGE to an ACR digest reference}
+    user: "1000:1000"
+    command: ["serve", "--role", "action-executor"]
+    env_file:
+      - path: /run/buzz/secrets/action-executor.env
+        required: true
+    environment:
+      HTTPS_PROXY: http://connector-egress-proxy:3128
+      HTTP_PROXY: http://connector-egress-proxy:3128
+      NO_PROXY: postgres,redis,relay,localhost,127.0.0.1
+      BUZZ_WORKER_HEALTH_FILE: /tmp/buzz-core-worker.health
+    depends_on:
+      postgres:
+        condition: service_healthy
+      connector-egress-proxy:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=1770
+      - /run/buzz:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0770
+    healthcheck: *worker-health
+    networks: [relay-data, broker, connector-internal]
+    deploy: *small-worker-resources
+
+  learning-worker:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${BUZZ_CORE_WORKER_IMAGE:?set BUZZ_CORE_WORKER_IMAGE to an ACR digest reference}
+    user: "1000:1000"
+    command: ["serve", "--role", "learning-worker"]
+    env_file:
+      - path: /run/buzz/secrets/learning-worker.env
+        required: true
+    environment:
+      NO_PROXY: postgres,redis,relay,localhost,127.0.0.1
+      BUZZ_WORKER_HEALTH_FILE: /tmp/buzz-core-worker.health
+    depends_on:
+      postgres:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=1770
+      - /run/buzz:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0770
+    healthcheck: *worker-health
+    networks: [relay-data, broker]
+    deploy: *small-worker-resources
+
+  audit-exporter:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${BUZZ_CORE_WORKER_IMAGE:?set BUZZ_CORE_WORKER_IMAGE to an ACR digest reference}
+    user: "1000:1000"
+    command: ["serve", "--role", "audit-exporter"]
+    env_file:
+      - path: /run/buzz/secrets/audit-exporter.env
+        required: true
+    environment:
+      HTTPS_PROXY: http://audit-egress-proxy:3128
+      HTTP_PROXY: http://audit-egress-proxy:3128
+      NO_PROXY: postgres,localhost,127.0.0.1
+      BUZZ_WORKER_HEALTH_FILE: /tmp/buzz-core-worker.health
+    depends_on:
+      postgres:
+        condition: service_healthy
+      audit-egress-proxy:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=1770
+      - /run/buzz:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0770
+    healthcheck: *worker-health
+    networks: [relay-data, audit-internal]
+    deploy: *small-worker-resources
+
+  connector-egress-proxy:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${EGRESS_PROXY_IMAGE:?set EGRESS_PROXY_IMAGE to a digest reference}
+    user: "13:13"
+    command: ["squid", "-NYC", "-f", "/etc/squid/squid.conf"]
+    volumes:
+      - ${BUZZ_AZURE_ASSET_ROOT:-/opt/buzz/infra/azure}/compose/squid-connectors.conf:/etc/squid/squid.conf:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=13,gid=13,mode=1770
+      - /run/squid:rw,noexec,nosuid,nodev,size=16m,uid=13,gid=13,mode=0770
+      - /var/spool/squid:rw,noexec,nosuid,nodev,size=32m,uid=13,gid=13,mode=0770
+    healthcheck:
+      test: ["CMD", "squid", "-k", "parse", "-f", "/etc/squid/squid.conf"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [connector-internal, egress]
+    deploy: *small-worker-resources
+
+  model-egress-proxy:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${EGRESS_PROXY_IMAGE:?set EGRESS_PROXY_IMAGE to a digest reference}
+    user: "13:13"
+    command: ["squid", "-NYC", "-f", "/etc/squid/squid.conf"]
+    volumes:
+      - ${BUZZ_AZURE_ASSET_ROOT:-/opt/buzz/infra/azure}/compose/squid-model.conf:/etc/squid/squid.conf:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=13,gid=13,mode=1770
+      - /run/squid:rw,noexec,nosuid,nodev,size=16m,uid=13,gid=13,mode=0770
+      - /var/spool/squid:rw,noexec,nosuid,nodev,size=32m,uid=13,gid=13,mode=0770
+    healthcheck:
+      test: ["CMD", "squid", "-k", "parse", "-f", "/etc/squid/squid.conf"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [model-internal, egress]
+    deploy: *small-worker-resources
+
+  audit-egress-proxy:
+    <<: *hardening
+    profiles: ["month1-workers"]
+    restart: "no"
+    image: ${EGRESS_PROXY_IMAGE:?set EGRESS_PROXY_IMAGE to a digest reference}
+    user: "13:13"
+    command: ["squid", "-NYC", "-f", "/etc/squid/squid.conf"]
+    volumes:
+      - /run/buzz/squid-audit.conf:/etc/squid/squid.conf:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=13,gid=13,mode=1770
+      - /run/squid:rw,noexec,nosuid,nodev,size=16m,uid=13,gid=13,mode=0770
+      - /var/spool/squid:rw,noexec,nosuid,nodev,size=32m,uid=13,gid=13,mode=0770
+    healthcheck:
+      test: ["CMD", "squid", "-k", "parse", "-f", "/etc/squid/squid.conf"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [audit-internal, egress]
+    deploy: *small-worker-resources
+
 volumes:
   buzz-caddy-data:
     labels:
@@ -241,9 +487,18 @@ networks:
     internal: true
     driver_opts:
       com.docker.network.bridge.name: buzz-connector
+  model-internal:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: buzz-model
+  audit-internal:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: buzz-audit
   egress:
     driver: bridge
     driver_opts:
       com.docker.network.bridge.name: buzz-egress
-    # Reserved for future constrained connector egress. No Month-1 service
-    # joins this network. Caddy uses its dedicated ingress bridge instead.
+    # Only the three allowlisting proxies join this external bridge.

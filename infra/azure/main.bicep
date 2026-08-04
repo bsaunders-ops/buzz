@@ -52,8 +52,18 @@ param minioMcImage string
 @description('Caddy image reference pinned by digest.')
 param caddyImage string
 
+@description('Core worker image pinned by digest. Worker services remain behind the Month-1 Compose profile until rollout approval.')
+param coreWorkerImage string
+
+@description('CONNECT allowlisting proxy image pinned by digest.')
+param egressProxyImage string
+
 @description('Explicit service activation gate. Foundation deployments leave the Compose project stopped.')
 param startCoreServices bool = false
+
+@description('Explicit rollout gate for the least-privilege Month-1 worker profile. False installs only the relay foundation.')
+@allowed([false])
+param enableMonth1Workers bool = false
 
 @description('Blake relay-owner x-only public key. May be empty while services remain disabled; activation fails closed without a valid 64-character hex key.')
 param relayOwnerPubkey string = ''
@@ -160,6 +170,10 @@ module hostBootstrap 'modules/host-bootstrap.bicep' = if (enableHostBootstrap) {
     minioImage: minioImage
     minioMcImage: minioMcImage
     caddyImage: caddyImage
+    coreWorkerImage: coreWorkerImage
+    egressProxyImage: egressProxyImage
+    auditStorageAccountName: auditStorage.outputs.storageAccountName
+    enableMonth1Workers: enableMonth1Workers
     startCoreServices: startCoreServices
   }
 }

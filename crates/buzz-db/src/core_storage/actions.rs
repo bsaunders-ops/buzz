@@ -1,4 +1,7 @@
-use buzz_core::CommunityId;
+use buzz_core::{
+    action_auth::{VerifiedActionDecision, VerifiedActionProposal, VerifiedActionReceipt},
+    CommunityId,
+};
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use std::{collections::HashSet, time::Duration as StdDuration};
@@ -8,7 +11,7 @@ use super::audit::append_audit_entry_tx;
 
 use super::{
     action_member_hash, action_member_operation_hash, action_operation_hash,
-    action_ordered_members_hash, bounded_lease, require_hash, require_pubkey, ActionDecisionRecord,
+    action_ordered_members_hash, bounded_lease, require_hash, require_pubkey,
     ActionDecisionRecordOutcome, ActionExecutionClaim, ActionExecutionItem, ActionMemberHashInput,
     ActionMemberOutcome, ActionProposalStatus, ActionReceiptPublication,
     ActionReceiptPublicationItem, ActionRemoteAttempt, AuditEntityType, AuditEnvelope,
@@ -78,6 +81,7 @@ pub async fn insert_action_proposal(
     pool: &PgPool,
     community_id: CommunityId,
     proposal: &NewExternalActionProposal,
+    verified: &VerifiedActionProposal,
 ) -> crate::Result<()> {
     const MAX_MEMBERS: usize = 10;
     if proposal.items.is_empty() || proposal.items.len() > MAX_MEMBERS {
@@ -89,6 +93,19 @@ pub async fn insert_action_proposal(
     require_pubkey("broker_pubkey", &proposal.broker_pubkey)?;
     require_hash("operation_hash", &proposal.operation_hash)?;
     require_hash("ordered_members_hash", &proposal.ordered_members_hash)?;
+    if verified.proposal_id() != proposal.id
+        || verified.nonce() != proposal.nonce
+        || verified.operation_hash().as_slice() != proposal.operation_hash
+        || verified.channel_id() != proposal.channel_id
+        || verified.owner_pubkey().as_slice() != proposal.owner_pubkey
+        || verified.broker_pubkey().as_slice() != proposal.broker_pubkey
+        || verified.proposed_at() != proposal.proposed_at.timestamp()
+        || verified.expires_at() != proposal.expires_at.timestamp()
+    {
+        return Err(crate::DbError::InvalidData(
+            "signed proposal capability does not match the durable proposal".into(),
+        ));
+    }
     if proposal.canonical_proposal.is_empty() || proposal.canonical_proposal.len() > 65_535 {
         return Err(crate::DbError::InvalidData(
             "canonical_proposal must contain between 1 and 65535 bytes".into(),
@@ -218,8 +235,9 @@ pub async fn insert_action_proposal(
     sqlx::query(
         "INSERT INTO external_action_proposals \
          (community_id, id, owner_pubkey, broker_pubkey, channel_id, channel_visibility, \
-          canonical_proposal, operation_hash, ordered_members_hash, member_count, nonce, proposed_at, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, 'private', $6, $7, $8, $9, $10, $11, $12)",
+          canonical_proposal, operation_hash, ordered_members_hash, member_count, nonce, proposed_at, expires_at, \
+          proposal_event_hash, proposal_event_created_at) \
+         VALUES ($1, $2, $3, $4, $5, 'private', $6, $7, $8, $9, $10, $11, $12, $13, $11)",
     )
     .bind(community_id.as_uuid())
     .bind(proposal.id)
@@ -233,6 +251,7 @@ pub async fn insert_action_proposal(
     .bind(proposal.nonce)
     .bind(proposal.proposed_at)
     .bind(proposal.expires_at)
+    .bind(verified.event_hash().as_slice())
     .execute(&mut *tx)
     .await?;
 
@@ -302,30 +321,32 @@ pub async fn insert_action_proposal(
 pub async fn record_action_decision(
     pool: &PgPool,
     community_id: CommunityId,
-    decision: &ActionDecisionRecord,
+    decision: &VerifiedActionDecision,
 ) -> crate::Result<ActionDecisionRecordOutcome> {
-    if decision.decision_id.get_version_num() != 4
-        || decision.proposal_id.get_version_num() != 4
-        || decision.nonce.get_version_num() != 4
+    if decision.decision_id().get_version_num() != 4
+        || decision.proposal_id().get_version_num() != 4
+        || decision.nonce().get_version_num() != 4
     {
         return Err(crate::DbError::InvalidData(
             "external action decision identifiers must be UUIDv4".into(),
         ));
     }
-    require_pubkey("owner_pubkey", &decision.owner_pubkey)?;
-    require_pubkey("broker_pubkey", &decision.broker_pubkey)?;
-    require_hash("operation_hash", &decision.operation_hash)?;
-    require_hash("decision_event_hash", &decision.decision_event_hash)?;
+    let verified_owner_pubkey = decision.owner_pubkey();
+    let verified_broker_pubkey = decision.broker_pubkey();
+    let verified_operation_hash = decision.operation_hash();
+    let decision_event_hash = decision.event_hash();
+    let decided_at = DateTime::<Utc>::from_timestamp(decision.decided_at(), 0)
+        .ok_or_else(|| crate::DbError::InvalidData("decision timestamp is out of range".into()))?;
 
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
-        "SELECT owner_pubkey, broker_pubkey, channel_id, nonce, operation_hash, \
+        "SELECT owner_pubkey, broker_pubkey, channel_id, nonce, operation_hash, proposal_event_hash, \
                 member_count, proposed_at, expires_at, status \
          FROM external_action_proposals \
          WHERE community_id=$1 AND id=$2 FOR UPDATE",
     )
     .bind(community_id.as_uuid())
-    .bind(decision.proposal_id)
+    .bind(decision.proposal_id())
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
@@ -338,16 +359,20 @@ pub async fn record_action_decision(
     let channel_id: Uuid = row.try_get("channel_id")?;
     let nonce: Uuid = row.try_get("nonce")?;
     let operation_hash: Vec<u8> = row.try_get("operation_hash")?;
+    let proposal_event_hash: Option<Vec<u8>> = row.try_get("proposal_event_hash")?;
     let proposed_at: DateTime<Utc> = row.try_get("proposed_at")?;
     let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
     let status: String = row.try_get("status")?;
 
     if status != ActionProposalStatus::Proposed.as_str()
-        || owner_pubkey != decision.owner_pubkey
-        || broker_pubkey != decision.broker_pubkey
-        || channel_id != decision.channel_id
-        || nonce != decision.nonce
-        || operation_hash != decision.operation_hash
+        || owner_pubkey.as_slice() != decision.owner_pubkey()
+        || broker_pubkey.as_slice() != decision.broker_pubkey()
+        || channel_id != decision.channel_id()
+        || nonce != decision.nonce()
+        || operation_hash.as_slice() != decision.operation_hash()
+        || proposal_event_hash
+            .as_ref()
+            .is_none_or(|hash| hash.len() != 32)
     {
         tx.commit().await?;
         return Ok(ActionDecisionRecordOutcome::Rejected);
@@ -356,17 +381,17 @@ pub async fn record_action_decision(
     let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
         .fetch_one(&mut *tx)
         .await?;
-    if decision.decided_at < proposed_at
-        || decision.decided_at >= expires_at
+    if decided_at < proposed_at
+        || decided_at >= expires_at
         || expires_at <= database_now
-        || decision.decided_at > database_now + chrono::Duration::minutes(5)
+        || decided_at > database_now + chrono::Duration::minutes(5)
     {
         sqlx::query(
             "UPDATE external_action_proposals SET status='expired', updated_at=$3 \
              WHERE community_id=$1 AND id=$2 AND status='proposed'",
         )
         .bind(community_id.as_uuid())
-        .bind(decision.proposal_id)
+        .bind(decision.proposal_id())
         .bind(database_now)
         .execute(&mut *tx)
         .await?;
@@ -377,9 +402,9 @@ pub async fn record_action_decision(
     let pair_is_current = lock_current_private_pair(
         &mut tx,
         community_id,
-        decision.channel_id,
-        &decision.owner_pubkey,
-        &decision.broker_pubkey,
+        decision.channel_id(),
+        verified_owner_pubkey.as_slice(),
+        verified_broker_pubkey.as_slice(),
     )
     .await?;
     let decision_is_fresh = !sqlx::query_scalar::<_, bool>(
@@ -390,8 +415,8 @@ pub async fn record_action_decision(
          )",
     )
     .bind(community_id.as_uuid())
-    .bind(decision.decision_id)
-    .bind(&decision.decision_event_hash)
+    .bind(decision.decision_id())
+    .bind(decision_event_hash.as_slice())
     .fetch_one(&mut *tx)
     .await?;
 
@@ -400,7 +425,7 @@ pub async fn record_action_decision(
         return Ok(ActionDecisionRecordOutcome::Rejected);
     }
 
-    let status = if decision.approved {
+    let status = if decision.approved() {
         ActionProposalStatus::Approved
     } else {
         ActionProposalStatus::Denied
@@ -414,16 +439,16 @@ pub async fn record_action_decision(
            AND nonce=$10 AND operation_hash=$11 AND expires_at > $8",
     )
     .bind(community_id.as_uuid())
-    .bind(decision.proposal_id)
+    .bind(decision.proposal_id())
     .bind(status.as_str())
-    .bind(decision.decision_id)
-    .bind(&decision.owner_pubkey)
-    .bind(&decision.broker_pubkey)
-    .bind(&decision.decision_event_hash)
-    .bind(decision.decided_at)
-    .bind(decision.channel_id)
-    .bind(decision.nonce)
-    .bind(&decision.operation_hash)
+    .bind(decision.decision_id())
+    .bind(verified_owner_pubkey.as_slice())
+    .bind(verified_broker_pubkey.as_slice())
+    .bind(decision_event_hash.as_slice())
+    .bind(decided_at)
+    .bind(decision.channel_id())
+    .bind(decision.nonce())
+    .bind(verified_operation_hash.as_slice())
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -436,7 +461,7 @@ pub async fn record_action_decision(
          WHERE community_id=$1 AND proposal_id=$2 AND status='proposed'",
     )
     .bind(community_id.as_uuid())
-    .bind(decision.proposal_id)
+    .bind(decision.proposal_id())
     .bind(status.as_str())
     .execute(&mut *tx)
     .await?
@@ -457,16 +482,16 @@ pub async fn record_action_decision(
         AuditEnvelope {
             event_type: AuditEventType::ActionProposalDecided,
             entity_type: AuditEntityType::ExternalActionProposal,
-            entity_id: decision.proposal_id,
-            object_hash: &decision.operation_hash,
+            entity_id: decision.proposal_id(),
+            object_hash: verified_operation_hash.as_slice(),
             version: None,
-            occurred_at: decision.decided_at,
+            occurred_at: decided_at,
             outcome: AuditOutcome::Accepted,
         },
     )
     .await?;
     tx.commit().await?;
-    Ok(if decision.approved {
+    Ok(if decision.approved() {
         ActionDecisionRecordOutcome::Approved
     } else {
         ActionDecisionRecordOutcome::Denied
@@ -505,6 +530,7 @@ pub async fn claim_action_execution(
          SET status='executing', execution_claim_id=$3, execution_claimed_by=$4, \
              execution_claimed_at=$5, updated_at=$5 \
          WHERE community_id=$1 AND id=$2 AND status=$6 AND expires_at > $5 \
+           AND proposal_event_hash IS NOT NULL \
            AND execution_claim_id IS NULL \
          RETURNING owner_pubkey, broker_pubkey, channel_id, canonical_proposal, operation_hash, \
                    ordered_members_hash, member_count, nonce, \
@@ -1191,25 +1217,40 @@ pub async fn claim_action_receipt_publication(
 pub async fn complete_action_receipt_publication(
     pool: &PgPool,
     community_id: CommunityId,
-    proposal_id: Uuid,
     publish_claim_id: Uuid,
-    event_hash: &[u8],
+    verified: &VerifiedActionReceipt,
     published_at: DateTime<Utc>,
 ) -> crate::Result<bool> {
-    require_hash("published_event_hash", event_hash)?;
+    let occurred_at = DateTime::<Utc>::from_timestamp(verified.occurred_at(), 0)
+        .ok_or_else(|| crate::DbError::InvalidData("receipt timestamp is out of range".into()))?;
     let updated = sqlx::query(
         "UPDATE external_action_receipt_outbox \
          SET publish_state='published', published_event_hash=$4, published_at=$5, \
              publish_claim_id=NULL, publish_claimed_by=NULL, publish_claimed_at=NULL, \
              publish_claim_until=NULL \
          WHERE community_id=$1 AND proposal_id=$2 AND publish_claim_id=$3 \
-           AND publish_state='claimed'",
+           AND publish_state='claimed' AND receipt_id=$6 AND occurred_at=$7 \
+           AND EXISTS ( \
+               SELECT 1 FROM external_action_proposals proposal \
+               WHERE proposal.community_id=external_action_receipt_outbox.community_id \
+                 AND proposal.id=external_action_receipt_outbox.proposal_id \
+                 AND proposal.decision_id=$8 AND proposal.operation_hash=$9 \
+                 AND proposal.channel_id=$10 AND proposal.owner_pubkey=$11 \
+                 AND proposal.broker_pubkey=$12 AND proposal.proposal_event_hash IS NOT NULL \
+           )",
     )
     .bind(community_id.as_uuid())
-    .bind(proposal_id)
+    .bind(verified.proposal_id())
     .bind(publish_claim_id)
-    .bind(event_hash)
+    .bind(verified.event_hash().as_slice())
     .bind(published_at)
+    .bind(verified.receipt_id())
+    .bind(occurred_at)
+    .bind(verified.decision_id())
+    .bind(verified.operation_hash().as_slice())
+    .bind(verified.channel_id())
+    .bind(verified.owner_pubkey().as_slice())
+    .bind(verified.broker_pubkey().as_slice())
     .execute(pool)
     .await?
     .rows_affected();

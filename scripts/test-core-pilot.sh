@@ -89,9 +89,10 @@ EOF
   cat > "$fixture/target/release/buzz-acp" <<EOF
 #!/usr/bin/env bash
 [[ ! -e "$fixture/acp-exit-immediately" ]] || exit 0
-printf 'agent_model=%s\nacp_model=%s\nlazy=%s\nagent_key_set=%s\nno_memory=%s\nno_base_prompt=%s\n' \
+printf 'agent_model=%s\nacp_model=%s\nlazy=%s\nagent_key_set=%s\nsealed=%s\nno_memory=%s\nno_base_prompt=%s\n' \
   "\${BUZZ_AGENT_MODEL:-}" "\${BUZZ_ACP_MODEL:-}" "\${BUZZ_ACP_LAZY_POOL-unset}" \
   "\$(if [[ -n "\${BUZZ_PRIVATE_KEY:-}" ]]; then printf yes; else printf no; fi)" \
+  "\${BUZZ_ACP_CORE_SEALED_MODE:-}" \
   "\${BUZZ_ACP_NO_MEMORY:-}" "\${BUZZ_ACP_NO_BASE_PROMPT:-}" > "$fixture/acp.env"
 printf 'agent_pool_ready agents=1\n'
 printf 'connected to relay at %s\n' "\${BUZZ_RELAY_URL:-}"
@@ -335,6 +336,7 @@ grep -q '^agent_model=gpt-5.6-terra$' "$fixture/acp.env" \
   && grep -q '^acp_model=gpt-5.6-terra$' "$fixture/acp.env" \
   && grep -q '^lazy=unset$' "$fixture/acp.env" \
   && grep -q '^agent_key_set=yes$' "$fixture/acp.env" \
+  && grep -q '^sealed=true$' "$fixture/acp.env" \
   && grep -q '^no_memory=true$' "$fixture/acp.env" \
   && grep -q '^no_base_prompt=true$' "$fixture/acp.env" \
   || fail "ACP must launch eager with the exact model, stable agent identity, and normalized bool policy"

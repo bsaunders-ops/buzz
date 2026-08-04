@@ -244,6 +244,37 @@ class ComposeContracts(unittest.TestCase):
                 "BUZZ_S3_SECRET_KEY": "file-secret",
             },
             "caddy.env": {"BUZZ_ORIGIN_SECRET": "file-origin-secret"},
+            "agent-supervisor.env": {
+                "BUZZ_RELAY_URL": "wss://buzz.contract.invalid",
+                "OPENAI_COMPAT_API_KEY": "file-openai",
+                "BUZZ_ACP_SIGNING_KEY": "3" * 64,
+            },
+            "connector-worker.env": {
+                "DATABASE_URL": "postgres://buzz_connector_worker:file@postgres:5432/buzz",
+                "CORE_CRM_CREDENTIAL_B64": "Y3Jt",
+                "MICROSOFT_CONNECTOR_CREDENTIAL_B64": "bXM=",
+                "GOOGLE_CONNECTOR_CREDENTIAL_B64": "Z29vZ2xl",
+            },
+            "sanitizer-indexer.env": {
+                "DATABASE_URL": "postgres://buzz_sanitizer_indexer:file@postgres:5432/buzz"
+            },
+            "signal-runner.env": {
+                "DATABASE_URL": "postgres://buzz_signal_runner:file@postgres:5432/buzz"
+            },
+            "action-executor.env": {
+                "DATABASE_URL": "postgres://buzz_action_executor:file@postgres:5432/buzz",
+                "CORE_CRM_CREDENTIAL_B64": "Y3Jt",
+                "MICROSOFT_CONNECTOR_CREDENTIAL_B64": "bXM=",
+                "GOOGLE_CONNECTOR_CREDENTIAL_B64": "Z29vZ2xl",
+                "BUZZ_ACP_SIGNING_KEY": "4" * 64,
+            },
+            "learning-worker.env": {
+                "DATABASE_URL": "postgres://buzz_learning_worker:file@postgres:5432/buzz"
+            },
+            "audit-exporter.env": {
+                "DATABASE_URL": "postgres://buzz_audit_exporter:file@postgres:5432/buzz",
+                "AUDIT_BLOB_CREDENTIAL_B64": "YXVkaXQ=",
+            },
         }
         for name, values in secret_values.items():
             (fixture_dir / name).write_text(
@@ -259,6 +290,13 @@ class ComposeContracts(unittest.TestCase):
             "minio": "minio.env",
             "minio-init": "minio-init.env",
             "caddy": "caddy.env",
+            "agent-supervisor": "agent-supervisor.env",
+            "connector-worker": "connector-worker.env",
+            "sanitizer-indexer": "sanitizer-indexer.env",
+            "signal-runner": "signal-runner.env",
+            "action-executor": "action-executor.env",
+            "learning-worker": "learning-worker.env",
+            "audit-exporter": "audit-exporter.env",
         }
         override_lines = ["services:"]
         for service, env_name in services.items():
@@ -278,6 +316,8 @@ class ComposeContracts(unittest.TestCase):
         env.update(
             {
                 "BUZZ_RELAY_IMAGE": f"corebuzz.azurecr.io/buzz-relay@{digest}",
+                "BUZZ_CORE_WORKER_IMAGE": f"corebuzz.azurecr.io/buzz-core-worker@{digest}",
+                "EGRESS_PROXY_IMAGE": f"docker.io/library/squid@{digest}",
                 "POSTGRES_IMAGE": f"docker.io/pgvector/pgvector@{digest}",
                 "REDIS_IMAGE": f"docker.io/library/redis@{digest}",
                 "MINIO_IMAGE": f"quay.io/minio/minio@{digest}",
@@ -302,6 +342,8 @@ class ComposeContracts(unittest.TestCase):
             str(AZURE / "compose" / "compose.azure.yml"),
             "-f",
             str(env_override),
+            "--profile",
+            "month1-workers",
             "config",
             "--format",
             "json",
@@ -393,7 +435,25 @@ class ComposeContracts(unittest.TestCase):
         overlay = read("infra/azure/compose/compose.azure.yml")
         self.assertRegex(overlay, r"(?m)^\s{2}connector-internal:\s*$")
         self.assertRegex(overlay, r"(?m)^\s{2}egress:\s*$")
-        self.assertNotRegex(overlay, r"(?m)^\s{2}(connector|sanitizer|indexer|executor):\s*$")
+        required_workers = {
+            "agent-supervisor",
+            "connector-worker",
+            "sanitizer-indexer",
+            "signal-runner",
+            "action-executor",
+            "learning-worker",
+            "audit-exporter",
+            "connector-egress-proxy",
+            "model-egress-proxy",
+            "audit-egress-proxy",
+        }
+        self.assertTrue(required_workers.issubset(self.config["services"]))
+        for service in required_workers:
+            self.assertEqual(
+                self.config["services"][service].get("profiles"),
+                ["month1-workers"],
+                f"{service} must stay disabled until its rollout gate is approved",
+            )
         self.assertEqual(
             set(self.config["services"]["caddy"]["networks"]),
             {"ingress", "edge"},
@@ -413,13 +473,25 @@ class ComposeContracts(unittest.TestCase):
             for service, config in self.config["services"].items()
             if "egress" in config.get("networks", [])
         }
-        self.assertEqual(egress_services, set(), "no Month-1 service may reach unrestricted egress")
+        self.assertEqual(
+            egress_services,
+            {"connector-egress-proxy", "model-egress-proxy", "audit-egress-proxy"},
+            "only allowlisting proxies may reach external egress",
+        )
+        for worker in required_workers - {
+            "connector-egress-proxy",
+            "model-egress-proxy",
+            "audit-egress-proxy",
+        }:
+            self.assertNotIn("egress", self.config["services"][worker].get("networks", []))
         expected_bridges = {
             "ingress": "buzz-ingress",
             "edge": "buzz-edge",
             "relay-data": "buzz-data",
             "broker": "buzz-broker",
             "connector-internal": "buzz-connector",
+            "model-internal": "buzz-model",
+            "audit-internal": "buzz-audit",
             "egress": "buzz-egress",
         }
         for network, bridge in expected_bridges.items():
@@ -428,6 +500,52 @@ class ComposeContracts(unittest.TestCase):
                 overlay,
                 rf"(?ms)^\s{{2}}{re.escape(network)}:\s*\n(?:\s{{4}}.+\n)*?\s{{6}}com\.docker\.network\.bridge\.name:\s*{bridge}\s*$",
             )
+
+    def test_model_credential_boundary_has_no_database_path(self) -> None:
+        supervisor = self.config["services"]["agent-supervisor"]
+        self.assertNotIn("DATABASE_URL", supervisor.get("environment", {}))
+        self.assertNotIn("relay-data", supervisor.get("networks", []))
+        for worker in (
+            "connector-worker",
+            "sanitizer-indexer",
+            "signal-runner",
+            "action-executor",
+            "learning-worker",
+            "audit-exporter",
+        ):
+            self.assertNotIn(
+                "OPENAI_COMPAT_API_KEY",
+                self.config["services"][worker].get("environment", {}),
+            )
+            self.assertNotIn("model-internal", self.config["services"][worker]["networks"])
+
+    def test_workers_use_distinct_least_privilege_database_logins(self) -> None:
+        expected = {
+            "connector-worker": "buzz_connector_worker",
+            "sanitizer-indexer": "buzz_sanitizer_indexer",
+            "signal-runner": "buzz_signal_runner",
+            "action-executor": "buzz_action_executor",
+            "learning-worker": "buzz_learning_worker",
+            "audit-exporter": "buzz_audit_exporter",
+        }
+        for service, role in expected.items():
+            url = self.config["services"][service]["environment"]["DATABASE_URL"]
+            self.assertTrue(url.startswith(f"postgres://{role}:"), service)
+
+    def test_connector_proxy_has_no_multitenant_storage_wildcards(self) -> None:
+        connector_proxy = read("infra/azure/compose/squid-connectors.conf")
+        self.assertNotRegex(connector_proxy, r"(?m)^\s+\.blob\.core\.windows\.net")
+        self.assertNotRegex(connector_proxy, r"(?m)^\s+\.googleapis\.com")
+        self.assertNotRegex(connector_proxy, r"(?m)^\s+\.google\.com")
+        self.assertIn("www.googleapis.com", connector_proxy)
+        for host in (
+            "docs.googleapis.com",
+            "sheets.googleapis.com",
+            "slides.googleapis.com",
+        ):
+            self.assertIn(host, connector_proxy)
+        refresh = read("infra/azure/bootstrap/refresh-secrets.sh")
+        self.assertIn("${AUDIT_STORAGE_ACCOUNT_NAME}.blob.core.windows.net", refresh)
 
     def test_only_caddy_publishes_origin_https(self) -> None:
         for service, config in self.config["services"].items():
@@ -498,6 +616,10 @@ class HostAndDeliveryContracts(unittest.TestCase):
         self.assertIn('docker pull "$bootstrap_bundle_image"', bootstrap)
         self.assertIn("infra/azure/bootstrap/Dockerfile", delivery)
         self.assertIn("variant: bootstrap", delivery)
+        self.assertIn("variant: core-worker", delivery)
+        worker_dockerfile = read("infra/azure/worker/Dockerfile")
+        self.assertRegex(worker_dockerfile, r"RUST_BUILD_IMAGE=.*@sha256:[0-9a-f]{64}")
+        self.assertRegex(worker_dockerfile, r"DEBIAN_RUNTIME_IMAGE=.*@sha256:[0-9a-f]{64}")
 
     def test_bootstrap_config_rejects_shell_injection_values(self) -> None:
         bootstrap = ROOT / "infra" / "azure" / "bootstrap" / "bootstrap.sh"
@@ -516,6 +638,10 @@ class HostAndDeliveryContracts(unittest.TestCase):
             "minioImage": "quay.io/minio/minio@sha256:" + "a" * 64,
             "minioMcImage": "quay.io/minio/mc@sha256:" + "a" * 64,
             "caddyImage": "docker.io/library/caddy@sha256:" + "a" * 64,
+            "coreWorkerImage": "corebuzzacr.azurecr.io/core-worker@sha256:" + "a" * 64,
+            "egressProxyImage": "docker.io/library/squid@sha256:" + "a" * 64,
+            "auditStorageAccountName": "corebuzzaudit",
+            "enableMonth1Workers": False,
             "startServices": False,
         }
 
@@ -557,6 +683,15 @@ class HostAndDeliveryContracts(unittest.TestCase):
             "service activation must fail closed without a valid relay owner",
         )
 
+        incomplete_workers = dict(valid)
+        incomplete_workers["enableMonth1Workers"] = True
+        rejected = validate(incomplete_workers)
+        self.assertNotEqual(
+            rejected.returncode,
+            0,
+            "health-only worker process hosts must not be production-activatable",
+        )
+
     def test_bootstrap_is_valid_idempotent_shell_and_unit_refreshes_secrets(self) -> None:
         bootstrap = ROOT / "infra" / "azure" / "bootstrap" / "bootstrap.sh"
         refresh = ROOT / "infra" / "azure" / "bootstrap" / "refresh-secrets.sh"
@@ -593,6 +728,9 @@ class HostAndDeliveryContracts(unittest.TestCase):
         compose_supervisor = (
             ROOT / "infra" / "azure" / "bootstrap" / "compose-supervisor.sh"
         )
+        provision_worker_roles = (
+            ROOT / "infra" / "azure" / "bootstrap" / "provision-worker-db-roles.sh"
+        )
         unit = read("infra/azure/bootstrap/buzz-core.service")
         for script in (
             bootstrap,
@@ -602,6 +740,7 @@ class HostAndDeliveryContracts(unittest.TestCase):
             docker_activation,
             docker_post_start,
             compose_supervisor,
+            provision_worker_roles,
             clean_volume_smoke,
             caddy_runtime,
             firewall_runtime,
@@ -954,6 +1093,31 @@ exit 0
             self.assertIn("run --rm --no-deps minio-init", prepare_calls[1])
             self.assertIn("up --detach --no-deps --wait relay", prepare_calls[2])
 
+            provision = root / "provision"
+            provision.write_text(
+                "#!/usr/bin/env bash\nprintf 'provisioned\\n' >>\"${DOCKER_CALLS:?}\"\n",
+                encoding="utf-8",
+            )
+            provision.chmod(0o755)
+            calls.unlink()
+            workers_prepared = subprocess.run(
+                ["bash", str(supervisor), "prepare"],
+                env=env
+                | {
+                    "ENABLE_MONTH1_WORKERS": "true",
+                    "PROVISION_WORKER_DB_ROLES_BIN": str(provision),
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(workers_prepared.returncode, 0, workers_prepared.stderr)
+            worker_calls = calls.read_text(encoding="utf-8")
+            self.assertIn("--profile month1-workers", worker_calls)
+            self.assertIn("provisioned", worker_calls)
+            self.assertIn("agent-supervisor", worker_calls)
+            self.assertIn("audit-egress-proxy", worker_calls)
+
             calls.unlink()
             clean_exit = subprocess.run(
                 ["bash", str(supervisor), "supervise"],
@@ -1002,6 +1166,8 @@ exit 0
             "buzz-data",
             "buzz-broker",
             "buzz-connector",
+            "buzz-model",
+            "buzz-audit",
             "buzz-egress",
         ):
             self.assertIn(bridge, text)
@@ -1070,6 +1236,10 @@ esac
                     "INPUT|-i buzz-broker -j REJECT",
                     "INPUT|-i buzz-connector -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
                     "INPUT|-i buzz-connector -j REJECT",
+                    "INPUT|-i buzz-model -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "INPUT|-i buzz-model -j REJECT",
+                    "INPUT|-i buzz-audit -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                    "INPUT|-i buzz-audit -j REJECT",
                     "INPUT|-i buzz-egress -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
                     "INPUT|-i buzz-egress -j REJECT",
                     "DOCKER-USER|-d 169.254.169.254/32 -j REJECT",

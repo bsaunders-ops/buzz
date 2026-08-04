@@ -31,6 +31,7 @@ members = [
     "crates/buzz-connector-core",
     "crates/buzz-learning",
     "crates/buzz-signal-runner",
+    "crates/buzz-core-worker",
     "crates/buzz-backend-kubernetes",
     "examples/countdown-bot",
 ]

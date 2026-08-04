@@ -692,7 +692,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 31);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1086,6 +1086,22 @@ mod tests {
         assert!(connector_hardening.contains("idx_embedding_versions_one_active"));
         assert!(connector_hardening.contains("trg_connector_account_purge_source_index"));
         assert!(connector_hardening.contains("trg_source_scope_purge_source_index"));
+
+        assert_eq!(migrations[29].version, 30);
+        assert_eq!(migrations[30].version, 31);
+        let worker_roles = migrations[30].sql.as_str().to_ascii_lowercase();
+        assert!(worker_roles.contains("create role core_connector_worker nologin"));
+        assert!(worker_roles.contains("create role core_action_executor nologin"));
+        assert!(worker_roles.contains("all lifecycle writes\n-- remain broker-owned"));
+        assert!(worker_roles.contains(
+            "grant select on core_audit_outbox, core_audit_checkpoints to core_audit_exporter"
+        ));
+        assert!(!worker_roles.contains("grant insert, update on\n    external_action_attempts"));
+        assert!(!worker_roles.contains("grant select, insert, update on\n    learning_revisions"));
+        let action_event_binding = migrations[29].sql.as_str();
+        assert!(action_event_binding.contains("ADD COLUMN proposal_event_hash BYTEA"));
+        assert!(action_event_binding.contains("proposal_event_created_at = proposed_at"));
+        assert!(action_event_binding.contains("external_action_proposals_event_hash_unique"));
     }
 
     #[test]

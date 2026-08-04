@@ -1,6 +1,10 @@
 use std::{collections::HashSet, fmt};
 
+use buzz_core::action_auth::{
+    validate_signed_action_proposal, ProposalExpectation, VerifiedActionProposal,
+};
 use buzz_core::core_protocol::{ActionTarget, EvidenceRef, PositiveWriteOperation};
+use nostr::Event;
 use uuid::Uuid;
 
 use crate::{
@@ -124,6 +128,36 @@ pub async fn prepare_proposal<A: FreshReadAdapter>(
         members.push(build_member(request, requested, fresh)?);
     }
     build_envelope(request, members)
+}
+
+/// Verify the exact signed kind `44310` event before durable proposal insertion.
+pub fn validate_signed_proposal(
+    event: &Event,
+    proposal: &CanonicalProposal,
+    now: i64,
+) -> Result<VerifiedActionProposal, BrokerError> {
+    let record = proposal.database_record();
+    let owner_pubkey = record
+        .owner_pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| BrokerError::Policy("invalid owner public key".into()))?;
+    let broker_pubkey = record
+        .broker_pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| BrokerError::Policy("invalid broker public key".into()))?;
+    validate_signed_action_proposal(
+        event,
+        &ProposalExpectation {
+            payload: proposal.protocol_payload().clone(),
+            channel_id: record.channel_id,
+            owner_pubkey,
+            broker_pubkey,
+        },
+        now,
+    )
+    .map_err(|error| BrokerError::Policy(error.to_string()))
 }
 
 pub(crate) fn validate_request_uniqueness(request: &ProposalRequest) -> Result<(), BrokerError> {

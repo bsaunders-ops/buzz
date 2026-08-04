@@ -82,6 +82,15 @@ fn exact_signed_owner_decision_is_verified_and_bound() {
         .expect("valid signed decision");
     assert!(verified.approved());
     assert_eq!(verified.event_hash(), event.id.to_bytes());
+    assert_eq!(verified.proposal_id(), fixture.expectation.proposal_id);
+    assert_eq!(verified.nonce(), fixture.expectation.nonce);
+    assert_eq!(
+        verified.operation_hash(),
+        fixture.expectation.operation_hash
+    );
+    assert_eq!(verified.channel_id(), fixture.expectation.channel_id);
+    assert_eq!(verified.owner_pubkey(), fixture.expectation.owner_pubkey);
+    assert_eq!(verified.broker_pubkey(), fixture.expectation.broker_pubkey);
 }
 
 #[test]

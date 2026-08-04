@@ -11,6 +11,7 @@ mod policy;
 mod proposal;
 mod receipt;
 
+pub use buzz_core::action_auth::{VerifiedActionProposal, VerifiedActionReceipt};
 pub use canonical::CanonicalProposal;
 pub use decision::{
     validate_signed_decision, ActionLifecycleState, ActionTransition, DecisionExpectation,
@@ -23,9 +24,10 @@ pub use executor::{
     PreDispatchFailure, ProviderFailureCode, RemotePrecondition, TypedWriteAdapter,
 };
 pub use proposal::{
-    prepare_proposal, FreshReadAdapter, FreshReadState, ProposalRequest, RequestedOperation,
+    prepare_proposal, validate_signed_proposal, FreshReadAdapter, FreshReadState, ProposalRequest,
+    RequestedOperation,
 };
-pub use receipt::{prepare_receipt_event, PreparedReceiptEvent};
+pub use receipt::{prepare_receipt_event, validate_signed_receipt, PreparedReceiptEvent};
 
 /// Proposal prepared from fresh normalized connector state.
 pub type PreparedProposal = CanonicalProposal;

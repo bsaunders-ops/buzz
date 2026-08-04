@@ -23,9 +23,11 @@ proxied to relay readiness. Ordinary traffic requires both the exact profile
 GUID in `X-Azure-FDID` and the route-added origin secret. Caddy then presents an operator-provided
 origin certificate. The service-tag IPs are shared by Front Door customers, so
 either ordinary-traffic header check by itself is insufficient. The
-Compose overlay runs only services that exist in the supported single-node
-bundle. The reserved `connector-internal` network is intentionally empty until
-real connector binaries are delivered; do not add stand-in images. Caddy alone
+Compose overlay runs the supported single-node bundle plus a disabled-by-default
+`month1-workers` profile. The source-built worker process host enforces distinct
+database identities, secret requirements, and health boundaries; activating the
+profile still requires the role-specific connector/scheduler acceptance gates.
+Caddy alone
 joins the non-internal `ingress` bridge for host-published TLS and the internal
 `edge` bridge for relay access; it never joins general `egress`. Stable bridge
 names let the persistent `DOCKER-USER`/`INPUT` firewall reject container access
@@ -65,6 +67,9 @@ Each gate needs a separate approval; one approval does not imply the next.
    public cutover independently. Bicep creates no DNS records.
 6. **Service activation:** approve `startCoreServices=true` or `systemctl enable
    --now buzz-core` only after restore, origin, secret, and digest checks pass.
+   `enableMonth1Workers` is currently compiler- and bootstrap-locked to `false`;
+   remove that lock only after all role business loops, credentials, and
+   role-specific end-to-end tests are approved.
 7. **Immutability lock:** approve only after a disposable account rehearsal and
    restore evidence. A locked policy is irreversible.
 8. **Windows signing:** provision the Artifact Signing account/profile and
@@ -91,9 +96,9 @@ Each gate needs a separate approval; one approval does not imply the next.
     --all --query '[-1].version' -o tsv
   ```
 
-- Seven immutable container references in `registry/repository@sha256:<64 hex>`
+- Nine immutable container references in `registry/repository@sha256:<64 hex>`
   form: the foundation-ACR bootstrap bundle, Buzz relay, Postgres/pgvector,
-  Redis, MinIO, MinIO client, and Caddy. The bundle is a `FROM scratch` OCI
+  Redis, MinIO, MinIO client, Caddy, Core worker, and Squid egress proxy. The bundle is a `FROM scratch` OCI
   artifact containing only reviewed Compose/Caddy/systemd assets. The VM pulls
   it with managed identity, verifies the requested repository digest, and never
   executes it as a container.
@@ -125,6 +130,8 @@ export REDIS_IMAGE='registry.invalid/redis@sha256:<64-hex>'
 export MINIO_IMAGE='registry.invalid/minio@sha256:<64-hex>'
 export MINIO_MC_IMAGE='registry.invalid/mc@sha256:<64-hex>'
 export CADDY_IMAGE='registry.invalid/caddy@sha256:<64-hex>'
+export BUZZ_CORE_WORKER_IMAGE='registry.invalid/core-worker@sha256:<64-hex>'
+export EGRESS_PROXY_IMAGE='registry.invalid/squid@sha256:<64-hex>'
 export POSTGRES_PASSWORD=validation-only REDIS_PASSWORD=validation-only
 export BUZZ_S3_ACCESS_KEY=validation-only BUZZ_S3_SECRET_KEY=validation-only
 export BUZZ_ORIGIN_FQDN=origin.invalid
@@ -166,7 +173,7 @@ image is not digest-pinned. It executes only:
 az deployment sub what-if \
   --location eastus2 \
   --template-file infra/azure/main.bicep \
-  --parameters enableHostBootstrap=false startCoreServices=false '<approved parameters>'
+  --parameters enableHostBootstrap=false startCoreServices=false enableMonth1Workers=false '<approved parameters>'
 ```
 
 Export the JSON what-if result for review and confirm: no inbound destination
@@ -212,6 +219,23 @@ Seed these exact Key Vault names through an approved secure operator session:
 - `relay-private-key`, `git-hook-hmac-secret`
 - `frontdoor-origin-secret`
 - `origin-tls-certificate`, `origin-tls-private-key`
+
+Only when the independent worker rollout is approved, also seed:
+
+- `openai-api-key`, `acp-signing-key`
+- `crm-connector-credential-b64`, `microsoft-connector-credential-b64`,
+  `google-connector-credential-b64`, `audit-blob-credential-b64`
+- `connector-worker-db-password`, `sanitizer-indexer-db-password`,
+  `signal-runner-db-password`, `action-executor-db-password`,
+  `learning-worker-db-password`, `audit-exporter-db-password`
+
+With `enableMonth1Workers=true`, every worker secret is mandatory and any Key
+Vault read/RBAC/network failure aborts activation. The bootstrap provisions six
+non-superuser login roles into fixed NOLOGIN privilege groups after migrations.
+The model-facing supervisor has neither a database credential nor a route to
+the data network. Signal and learning workers have no model credential or model
+egress. Connector, model, and audit traffic use separate proxies; the audit
+proxy permits only the exact deployed storage-account hostname.
 
 `frontdoor-origin-secret` must be the exact generated value supplied as the
 deployment's secure `originSecret` parameter; generating a second value causes

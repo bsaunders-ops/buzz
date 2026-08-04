@@ -4,7 +4,7 @@
 //! Config file (TOML) for complex subscription rules.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use clap::ValueEnum;
@@ -36,10 +36,50 @@ pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 pub(crate) const MAX_TURN_DURATION_CEILING_SECS: u64 = 604_800;
 pub const CORE_SEALED_MODE_ENV: &str = "BUZZ_ACP_CORE_SEALED_MODE";
 
+const CORE_SEALED_MODEL_ENV_ALLOWLIST: &[&str] = &[
+    "BUZZ_AGENT_PROVIDER",
+    "BUZZ_AGENT_MODEL",
+    "OPENAI_COMPAT_API_KEY",
+    "OPENAI_COMPAT_API",
+    "OPENAI_COMPAT_BASE_URL",
+    "OPENAI_COMPAT_MODEL",
+    "BUZZ_AGENT_THINKING_EFFORT",
+    "BUZZ_AGENT_WEB_SEARCH",
+    "BUZZ_AGENT_NO_HINTS",
+    "BUZZ_AGENT_REQUIRE_REPLY",
+];
+
 pub fn core_sealed_mode_enabled() -> bool {
     std::env::var(CORE_SEALED_MODE_ENV)
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
+fn core_sealed_child_env_from(
+    mut read_env: impl FnMut(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, ConfigError> {
+    let mut child_env = CORE_SEALED_MODEL_ENV_ALLOWLIST
+        .iter()
+        .filter_map(|key| read_env(key).map(|value| ((*key).to_string(), value)))
+        .collect::<Vec<_>>();
+
+    for required in ["BUZZ_AGENT_PROVIDER", "OPENAI_COMPAT_API_KEY"] {
+        if !child_env
+            .iter()
+            .any(|(key, value)| key == required && !value.trim().is_empty())
+        {
+            return Err(ConfigError::ConfigFile(format!(
+                "Core sealed mode requires dedicated model setting {required}"
+            )));
+        }
+    }
+
+    child_env.shrink_to_fit();
+    Ok(child_env)
+}
+
+fn core_sealed_child_env() -> Result<Vec<(String, String)>, ConfigError> {
+    core_sealed_child_env_from(|key| std::env::var(key).ok())
 }
 
 #[derive(Debug, Error)]
@@ -780,6 +820,56 @@ fn validate_core_sealed_mode(args: &CliArgs, core_sealed_mode: bool) -> Result<(
     Ok(())
 }
 
+fn resolve_core_sealed_agent_command(command: &str) -> Result<String, ConfigError> {
+    if normalize_agent_command_identity(command) != "buzz-agent" {
+        return Err(ConfigError::ConfigFile(
+            "Core sealed mode requires --agent-command=buzz-agent".into(),
+        ));
+    }
+
+    let requested = Path::new(command.trim());
+    let mut candidates = Vec::new();
+    if requested.is_absolute() || requested.components().count() > 1 {
+        candidates.push(requested.to_path_buf());
+    } else {
+        let path = std::env::var_os("PATH").ok_or_else(|| {
+            ConfigError::ConfigFile(
+                "Core sealed mode cannot resolve buzz-agent because PATH is unset".into(),
+            )
+        })?;
+        for directory in std::env::split_paths(&path) {
+            candidates.push(directory.join(requested));
+            if cfg!(windows) && requested.extension().is_none() {
+                candidates.push(directory.join(format!("{}.exe", requested.display())));
+            }
+        }
+    }
+
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(&candidate)?;
+        if normalize_agent_command_identity(&canonical.to_string_lossy()) != "buzz-agent" {
+            continue;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if canonical.metadata()?.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+
+        return Ok(canonical.to_string_lossy().into_owned());
+    }
+
+    Err(ConfigError::ConfigFile(
+        "Core sealed mode could not resolve buzz-agent to a trusted executable path".into(),
+    ))
+}
+
 pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
     let normalized = command.trim().replace('\\', "/");
     let trimmed = normalized.trim_end_matches('/');
@@ -945,6 +1035,7 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+        let core_sealed_mode = core_sealed_mode_enabled();
         let keys = Keys::parse(&args.private_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
@@ -954,7 +1045,7 @@ impl Config {
         args.private_key.clear();
 
         validate_trigger_reply_publishing(&args, &args.agent_command)?;
-        validate_core_sealed_mode(&args, core_sealed_mode_enabled())?;
+        validate_core_sealed_mode(&args, core_sealed_mode)?;
 
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
@@ -1018,7 +1109,11 @@ impl Config {
             ));
         }
 
-        let agent_command = args.agent_command;
+        let agent_command = if core_sealed_mode {
+            resolve_core_sealed_agent_command(&args.agent_command)?
+        } else {
+            args.agent_command
+        };
 
         let agent_args = normalize_agent_args(&agent_command, args.agent_args);
 
@@ -1154,6 +1249,10 @@ impl Config {
         // instructions arrive independently so they can be layered at runtime.
         let mut persona_env_vars = Vec::new();
         let model = args.model;
+
+        if core_sealed_mode {
+            persona_env_vars.extend(core_sealed_child_env()?);
+        }
 
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
@@ -2912,6 +3011,94 @@ channels = "ALL"
         assert!(
             validate_core_sealed_mode(&args, true).is_ok(),
             "sealed mode should allow the default empty MCP command"
+        );
+    }
+
+    #[test]
+    fn core_sealed_agent_command_resolves_to_an_absolute_executable() {
+        let fixture_root =
+            std::env::temp_dir().join(format!("buzz-acp-sealed-agent-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&fixture_root).expect("create sealed-agent fixture");
+        let executable_name = if cfg!(windows) {
+            "buzz-agent.exe"
+        } else {
+            "buzz-agent"
+        };
+        let fixture = fixture_root.join(executable_name);
+        std::fs::copy(
+            std::env::current_exe().expect("current test executable"),
+            &fixture,
+        )
+        .expect("copy executable fixture");
+
+        let resolved = resolve_core_sealed_agent_command(&fixture.to_string_lossy())
+            .expect("absolute buzz-agent executable should resolve");
+
+        assert!(Path::new(&resolved).is_absolute());
+        assert_eq!(normalize_agent_command_identity(&resolved), "buzz-agent");
+        std::fs::remove_dir_all(fixture_root).expect("remove sealed-agent fixture");
+    }
+
+    #[test]
+    fn core_sealed_agent_command_rejects_an_untrusted_runtime() {
+        let error = resolve_core_sealed_agent_command("codex")
+            .expect_err("sealed mode must reject non-buzz-agent runtimes");
+
+        assert!(error.to_string().contains("buzz-agent"));
+    }
+
+    #[test]
+    fn core_sealed_child_env_forwards_only_model_runtime_configuration() {
+        let source = HashMap::from([
+            ("BUZZ_AGENT_PROVIDER", "openai"),
+            ("BUZZ_AGENT_MODEL", "gpt-5.6-terra"),
+            ("OPENAI_COMPAT_API_KEY", "model-credential"),
+            ("OPENAI_COMPAT_API", "responses"),
+            ("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1"),
+            ("OPENAI_COMPAT_MODEL", "gpt-5.6-terra"),
+            ("BUZZ_AGENT_THINKING_EFFORT", "medium"),
+            ("BUZZ_AGENT_WEB_SEARCH", "1"),
+            ("BUZZ_AGENT_NO_HINTS", "1"),
+            ("BUZZ_AGENT_REQUIRE_REPLY", "0"),
+            ("BUZZ_PRIVATE_KEY", "must-not-cross-boundary"),
+            ("CORE_CRM_TOKEN", "must-not-cross-boundary"),
+        ]);
+
+        let child_env =
+            core_sealed_child_env_from(|key| source.get(key).map(|value| (*value).to_string()))
+                .expect("complete model configuration should be accepted");
+
+        assert_eq!(
+            child_env,
+            vec![
+                ("BUZZ_AGENT_PROVIDER".into(), "openai".into()),
+                ("BUZZ_AGENT_MODEL".into(), "gpt-5.6-terra".into()),
+                ("OPENAI_COMPAT_API_KEY".into(), "model-credential".into()),
+                ("OPENAI_COMPAT_API".into(), "responses".into()),
+                (
+                    "OPENAI_COMPAT_BASE_URL".into(),
+                    "https://api.openai.com/v1".into(),
+                ),
+                ("OPENAI_COMPAT_MODEL".into(), "gpt-5.6-terra".into()),
+                ("BUZZ_AGENT_THINKING_EFFORT".into(), "medium".into()),
+                ("BUZZ_AGENT_WEB_SEARCH".into(), "1".into()),
+                ("BUZZ_AGENT_NO_HINTS".into(), "1".into()),
+                ("BUZZ_AGENT_REQUIRE_REPLY".into(), "0".into()),
+            ],
+            "signing and connector credentials must never cross the sealed child boundary"
+        );
+    }
+
+    #[test]
+    fn core_sealed_child_env_fails_closed_without_model_credential() {
+        let error = core_sealed_child_env_from(|key| {
+            (key == "BUZZ_AGENT_PROVIDER").then(|| "openai".to_string())
+        })
+        .expect_err("sealed child startup must require its dedicated model credential");
+
+        assert!(
+            error.to_string().contains("OPENAI_COMPAT_API_KEY"),
+            "error should identify the missing dedicated model credential: {error}"
         );
     }
 

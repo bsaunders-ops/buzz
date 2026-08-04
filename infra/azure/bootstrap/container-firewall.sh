@@ -8,7 +8,7 @@ set -euo pipefail
 iptables_bin=${IPTABLES_BIN:-/usr/sbin/iptables}
 imds_cidr=169.254.169.254/32
 ingress_bridge=buzz-ingress
-host_bridges=(buzz-ingress buzz-edge buzz-data buzz-broker buzz-connector buzz-egress)
+host_bridges=(buzz-ingress buzz-edge buzz-data buzz-broker buzz-connector buzz-model buzz-audit buzz-egress)
 baseline_only=false
 if [[ ${1:-} == --baseline ]]; then
   baseline_only=true

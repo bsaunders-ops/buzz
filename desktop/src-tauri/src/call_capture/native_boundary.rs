@@ -46,7 +46,7 @@ impl NativeAudioChunk {
             || channels == 0
             || channels > MAX_NATIVE_CHANNELS
             || interleaved.is_empty()
-            || interleaved.len() % channel_count != 0
+            || !interleaved.len().is_multiple_of(channel_count)
             || interleaved.len() / channel_count > sample_rate_hz as usize * MAX_CALLBACK_SECONDS
         {
             return Err("invalid or oversized native audio callback".into());

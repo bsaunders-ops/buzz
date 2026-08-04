@@ -4,10 +4,10 @@ use std::{
 };
 
 use buzz_action_broker::{
-    execute_once, prepare_proposal, prepare_receipt_event, AdapterDispatchOutcome,
-    AdapterReadFailure, DurableExecutionStore, ExecuteActionRequest, ExecuteActionResult,
-    ExecutionError, FreshReadAdapter, FreshReadState, PreDispatchFailure, ProposalRequest,
-    RemotePrecondition, RequestedOperation, TypedWriteAdapter,
+    execute_once, prepare_proposal, prepare_receipt_event, validate_signed_proposal,
+    validate_signed_receipt, AdapterDispatchOutcome, AdapterReadFailure, DurableExecutionStore,
+    ExecuteActionRequest, ExecuteActionResult, ExecutionError, FreshReadAdapter, FreshReadState,
+    PreDispatchFailure, ProposalRequest, RemotePrecondition, RequestedOperation, TypedWriteAdapter,
 };
 use buzz_core::{core_protocol::PositiveWriteOperation, CommunityId};
 use buzz_db::core_storage::{
@@ -15,6 +15,7 @@ use buzz_db::core_storage::{
     ActionReceiptPublicationItem, ActionRemoteAttempt, ExternalConnector, ExternalOperation,
 };
 use chrono::{TimeZone, Utc};
+use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -125,6 +126,50 @@ async fn claim() -> ActionExecutionClaim {
         signer_pubkey: OWNER.to_vec(),
         decision_event_hash: vec![0x77; 32],
     }
+}
+
+#[tokio::test]
+async fn signed_proposal_capability_binds_exact_prepared_payload_and_routing() {
+    let owner = Keys::generate();
+    let broker = Keys::generate();
+    let mut request = proposal_request();
+    request.owner_pubkey = owner.public_key().to_bytes();
+    request.broker_pubkey = broker.public_key().to_bytes();
+    let prepared = prepare_proposal(&request, &ProposalReader)
+        .await
+        .expect("prepare proposal");
+    let channel = request.channel_id.to_string();
+    let recipient = owner.public_key().to_hex();
+    let event = EventBuilder::new(
+        Kind::Custom(44_310),
+        serde_json::to_string(prepared.protocol_payload()).expect("proposal payload"),
+    )
+    .tags(vec![
+        Tag::parse(["h", channel.as_str()]).expect("proposal h tag"),
+        Tag::parse(["p", recipient.as_str()]).expect("proposal p tag"),
+    ])
+    .custom_created_at(Timestamp::from(PROPOSED_AT as u64))
+    .sign_with_keys(&broker)
+    .expect("sign proposal event");
+
+    let verified = validate_signed_proposal(&event, &prepared, PROPOSED_AT)
+        .expect("verify exact proposal event");
+    assert_eq!(verified.proposal_id(), request.proposal_id);
+    assert_eq!(verified.event_hash(), event.id.to_bytes());
+    assert_eq!(verified.broker_pubkey(), broker.public_key().to_bytes());
+
+    let wrong_kind = EventBuilder::new(
+        Kind::Custom(44_312),
+        serde_json::to_string(prepared.protocol_payload()).expect("proposal payload"),
+    )
+    .tags(vec![
+        Tag::parse(["h", channel.as_str()]).expect("proposal h tag"),
+        Tag::parse(["p", recipient.as_str()]).expect("proposal p tag"),
+    ])
+    .custom_created_at(Timestamp::from(PROPOSED_AT as u64))
+    .sign_with_keys(&broker)
+    .expect("sign wrong-kind proposal event");
+    assert!(validate_signed_proposal(&wrong_kind, &prepared, PROPOSED_AT).is_err());
 }
 
 fn request() -> ExecuteActionRequest {
@@ -462,14 +507,16 @@ fn positive_operation_enum_has_no_generic_or_destructive_capability() {
 #[tokio::test]
 async fn receipt_content_and_private_routing_are_derived_only_from_durable_outcome() {
     let claim = claim().await;
+    let owner = Keys::generate();
+    let broker = Keys::generate();
     let publication = ActionReceiptPublication {
         publish_claim_id: Uuid::new_v4(),
         receipt_id: Uuid::new_v4(),
         proposal_id: claim.proposal_id,
         decision_id: claim.decision_id,
         channel_id: claim.channel_id,
-        owner_pubkey: claim.owner_pubkey.clone(),
-        broker_pubkey: claim.broker_pubkey.clone(),
+        owner_pubkey: owner.public_key().to_bytes().to_vec(),
+        broker_pubkey: broker.public_key().to_bytes().to_vec(),
         operation_hash: claim.operation_hash.clone(),
         results: vec![ActionReceiptPublicationItem {
             operation_id: claim.items[0].operation_id,
@@ -487,8 +534,40 @@ async fn receipt_content_and_private_routing_are_derived_only_from_durable_outco
         serde_json::from_str(prepared.content()).expect("valid receipt payload");
     payload.validate().expect("valid receipt invariants");
     assert_eq!(prepared.channel_id(), claim.channel_id);
-    assert_eq!(prepared.recipient_pubkey(), OWNER);
-    assert_eq!(prepared.signer_pubkey(), BROKER);
+    assert_eq!(prepared.recipient_pubkey(), owner.public_key().to_bytes());
+    assert_eq!(prepared.signer_pubkey(), broker.public_key().to_bytes());
+    let receipt_channel = publication.channel_id.to_string();
+    let receipt_recipient = owner.public_key().to_hex();
+    let receipt_event = EventBuilder::new(Kind::Custom(44_312), prepared.content())
+        .tags(vec![
+            Tag::parse(["h", receipt_channel.as_str()]).expect("receipt h tag"),
+            Tag::parse(["p", receipt_recipient.as_str()]).expect("receipt p tag"),
+        ])
+        .custom_created_at(Timestamp::from(publication.occurred_at.timestamp() as u64))
+        .sign_with_keys(&broker)
+        .expect("sign receipt event");
+    let verified_receipt = validate_signed_receipt(
+        &receipt_event,
+        &prepared,
+        publication.occurred_at.timestamp(),
+    )
+    .expect("verify exact receipt event");
+    assert_eq!(verified_receipt.receipt_id(), publication.receipt_id);
+    assert_eq!(verified_receipt.event_hash(), receipt_event.id.to_bytes());
+    let wrong_signer = EventBuilder::new(Kind::Custom(44_312), prepared.content())
+        .tags(vec![
+            Tag::parse(["h", receipt_channel.as_str()]).expect("receipt h tag"),
+            Tag::parse(["p", receipt_recipient.as_str()]).expect("receipt p tag"),
+        ])
+        .custom_created_at(Timestamp::from(publication.occurred_at.timestamp() as u64))
+        .sign_with_keys(&owner)
+        .expect("sign wrong-signer receipt event");
+    assert!(validate_signed_receipt(
+        &wrong_signer,
+        &prepared,
+        publication.occurred_at.timestamp(),
+    )
+    .is_err());
     let debug = format!("{prepared:?}");
     for secret in [
         "opaque-result-sensitive",

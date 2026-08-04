@@ -1,6 +1,14 @@
 use std::time::Duration as StdDuration;
 
-use buzz_core::CommunityId;
+use buzz_core::{
+    action_auth::{
+        validate_signed_action_decision, validate_signed_action_proposal,
+        validate_signed_action_receipt, DecisionExpectation, ProposalExpectation,
+        ReceiptExpectation, VerifiedActionDecision, VerifiedActionProposal, VerifiedActionReceipt,
+    },
+    core_protocol::{ActionProposalPayload, ActionReceiptPayload},
+    CommunityId,
+};
 use buzz_db::core_storage::{
     action_member_hash, action_member_operation_hash, action_operation_hash,
     action_ordered_members_hash, append_audit_entry, apply_source_change_page,
@@ -11,21 +19,202 @@ use buzz_db::core_storage::{
     recheck_source_chunk, record_action_decision, record_action_member_outcome,
     retry_action_receipt_publication, retry_audit_export_batch, search_source_chunks,
     search_source_chunks_by_embedding, source_chunk_hash, ActionClaimDecision,
-    ActionDecisionRecord, ActionDecisionRecordOutcome, ActionMemberHashInput, ActionMemberOutcome,
-    ActionProposalStatus, ApprovedSourceScopeRecord, AuditEntityType, AuditEnvelope,
-    AuditEventType, AuditObjectVersion, AuditOutcome, ConnectorAccountRecord, DeltaLeaseClaim,
-    DeltaLeaseDecision, ExternalConnector, ExternalOperation, IndexedSourceKind,
-    InsightClaimDecision, InsightClaimOutcome, InsightPriority, KeyVaultSecretName,
-    NewActionMemberOutcome, NewAssistantInsight, NewExternalActionProposal,
-    NewExternalActionProposalItem, NewIndexedSourceChunk, NewIndexedSourceItem,
-    NewSourceAclPrincipal, NewSourceChangePage, NewSourceTombstone, SourceCandidateRecheckRequest,
-    SourceItemAclRecord, SourcePageApplyOutcome, SourceSearchRequest, SourceVectorSearchRequest,
+    ActionDecisionRecordOutcome, ActionMemberHashInput, ActionMemberOutcome, ActionProposalStatus,
+    ApprovedSourceScopeRecord, AuditEntityType, AuditEnvelope, AuditEventType, AuditObjectVersion,
+    AuditOutcome, ConnectorAccountRecord, DeltaLeaseClaim, DeltaLeaseDecision, ExternalConnector,
+    ExternalOperation, IndexedSourceKind, InsightClaimDecision, InsightClaimOutcome,
+    InsightPriority, KeyVaultSecretName, NewActionMemberOutcome, NewAssistantInsight,
+    NewExternalActionProposal, NewExternalActionProposalItem, NewIndexedSourceChunk,
+    NewIndexedSourceItem, NewSourceAclPrincipal, NewSourceChangePage, NewSourceTombstone,
+    SourceCandidateRecheckRequest, SourceItemAclRecord, SourcePageApplyOutcome,
+    SourceSearchRequest, SourceVectorSearchRequest,
 };
 use chrono::{Duration, NaiveDate, Utc};
+use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+
+fn verified_proposal(
+    proposal: &NewExternalActionProposal,
+    broker: &Keys,
+) -> VerifiedActionProposal {
+    let first = proposal.items.first().expect("proposal item");
+    let payload: ActionProposalPayload = serde_json::from_value(json!({
+        "schema_version": 1,
+        "proposal_id": proposal.id.to_string(),
+        "nonce": proposal.nonce.to_string(),
+        "operation_hash": hex::encode(&proposal.operation_hash),
+        "proposed_at": proposal.proposed_at.timestamp(),
+        "expires_at": proposal.expires_at.timestamp(),
+        "bundle_semantics": "independent_operations",
+        "operations": [{
+            "operation_id": first.operation_id.to_string(),
+            "operation_hash": "11".repeat(32),
+            "idempotency_key": first.idempotency_key.to_string(),
+            "target": {
+                "provider": "outlook",
+                "account_id": first.account_id.to_string(),
+                "scope_id": first.scope_id.to_string(),
+                "object_id": null
+            },
+            "before": null,
+            "after": {"canonical_value": "{}", "value_hash": "22".repeat(32)},
+            "expected_remote_version": null,
+            "side_effects": ["creates_draft"],
+            "operation": {
+                "provider": "outlook",
+                "operation": {
+                    "action": "create_draft",
+                    "recipients": {"to": ["test@example.invalid"], "cc": [], "bcc": []},
+                    "subject": "Contract test",
+                    "body": "Contract test",
+                    "attachments": []
+                }
+            }
+        }],
+        "evidence": [{
+            "source": "crm",
+            "source_id": "contract-test",
+            "source_hash": "33".repeat(32),
+            "citation": null
+        }]
+    }))
+    .expect("valid signed proposal payload");
+    let channel = proposal.channel_id.to_string();
+    let owner = hex::encode(&proposal.owner_pubkey);
+    let event = EventBuilder::new(
+        Kind::Custom(44_310),
+        serde_json::to_string(&payload).expect("serialize proposal payload"),
+    )
+    .tags(vec![
+        Tag::parse(["h", channel.as_str()]).expect("proposal h tag"),
+        Tag::parse(["p", owner.as_str()]).expect("proposal p tag"),
+    ])
+    .custom_created_at(Timestamp::from(proposal.proposed_at.timestamp() as u64))
+    .sign_with_keys(broker)
+    .expect("sign proposal event");
+    validate_signed_action_proposal(
+        &event,
+        &ProposalExpectation {
+            payload,
+            channel_id: proposal.channel_id,
+            owner_pubkey: proposal
+                .owner_pubkey
+                .as_slice()
+                .try_into()
+                .expect("proposal owner key"),
+            broker_pubkey: proposal
+                .broker_pubkey
+                .as_slice()
+                .try_into()
+                .expect("proposal broker key"),
+        },
+        proposal.proposed_at.timestamp(),
+    )
+    .expect("verify signed proposal event")
+}
+
+fn verified_receipt(
+    publication: &buzz_db::core_storage::ActionReceiptPublication,
+    broker: &Keys,
+) -> VerifiedActionReceipt {
+    let results = publication
+        .results
+        .iter()
+        .map(|result| {
+            json!({
+                "operation_id": result.operation_id.to_string(),
+                "operation_hash": hex::encode(&result.operation_hash),
+                "idempotency_key": result.idempotency_key.to_string(),
+                "outcome": match result.outcome {
+                    ActionMemberOutcome::Succeeded => "succeeded",
+                    ActionMemberOutcome::Failed => "failed",
+                    ActionMemberOutcome::ReconciliationRequired => "reconciliation_required",
+                },
+                "external_result_id": result.external_result_id,
+                "external_result_version": result.external_result_version,
+                "reconciliation_status": result.reconciliation_status,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload: ActionReceiptPayload = serde_json::from_value(json!({
+        "schema_version": 1,
+        "receipt_id": publication.receipt_id.to_string(),
+        "proposal_id": publication.proposal_id.to_string(),
+        "decision_id": publication.decision_id.to_string(),
+        "operation_hash": hex::encode(&publication.operation_hash),
+        "results": results,
+        "occurred_at": publication.occurred_at.timestamp(),
+    }))
+    .expect("valid signed receipt payload");
+    let channel = publication.channel_id.to_string();
+    let owner = hex::encode(&publication.owner_pubkey);
+    let event = EventBuilder::new(
+        Kind::Custom(44_312),
+        serde_json::to_string(&payload).expect("serialize receipt payload"),
+    )
+    .tags(vec![
+        Tag::parse(["h", channel.as_str()]).expect("receipt h tag"),
+        Tag::parse(["p", owner.as_str()]).expect("receipt p tag"),
+    ])
+    .custom_created_at(Timestamp::from(publication.occurred_at.timestamp() as u64))
+    .sign_with_keys(broker)
+    .expect("sign receipt event");
+    validate_signed_action_receipt(
+        &event,
+        &ReceiptExpectation {
+            payload,
+            channel_id: publication.channel_id,
+            owner_pubkey: publication
+                .owner_pubkey
+                .as_slice()
+                .try_into()
+                .expect("receipt owner key"),
+            broker_pubkey: publication
+                .broker_pubkey
+                .as_slice()
+                .try_into()
+                .expect("receipt broker key"),
+        },
+        publication.occurred_at.timestamp(),
+    )
+    .expect("verify signed receipt event")
+}
+
+fn verified_approval(
+    owner: &Keys,
+    recipient: &Keys,
+    expectation: &DecisionExpectation,
+    decided_at: i64,
+) -> VerifiedActionDecision {
+    let payload = json!({
+        "schema_version": 1,
+        "decision_id": Uuid::new_v4().to_string(),
+        "proposal_id": expectation.proposal_id.to_string(),
+        "nonce": expectation.nonce.to_string(),
+        "operation_hash": hex::encode(expectation.operation_hash),
+        "decision": "approve",
+        "signer": owner.public_key().to_hex(),
+        "decided_at": decided_at,
+    });
+    let event = EventBuilder::new(
+        Kind::Custom(44_311),
+        serde_json::to_string(&payload).expect("serialize decision payload"),
+    )
+    .tags(vec![
+        Tag::parse(["h", expectation.channel_id.to_string().as_str()]).expect("decision h tag"),
+        Tag::parse(["p", recipient.public_key().to_hex().as_str()]).expect("decision p tag"),
+    ])
+    .custom_created_at(Timestamp::from(decided_at as u64))
+    .sign_with_keys(owner)
+    .expect("sign decision event");
+
+    validate_signed_action_decision(&event, expectation, decided_at)
+        .expect("decision fixture must be cryptographically valid")
+}
 
 #[test]
 fn action_operation_hash_uses_the_frozen_domain_and_exact_canonical_bytes() {
@@ -1481,9 +1670,19 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     let google_account_id = Uuid::new_v4();
     let google_scope_id = Uuid::new_v4();
     let proposal_id = Uuid::new_v4();
-    let signer = vec![8_u8; 32];
-    let broker = vec![4_u8; 32];
+    let owner_keys = Keys::generate();
+    let broker_keys = Keys::generate();
+    let signer = owner_keys.public_key().to_bytes().to_vec();
+    let broker = broker_keys.public_key().to_bytes().to_vec();
     let third_member = vec![9_u8; 32];
+    for pubkey in [&signer, &broker] {
+        sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+            .bind(community.as_uuid())
+            .bind(pubkey)
+            .execute(&pool)
+            .await
+            .expect("insert signed action identity");
+    }
     sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
         .bind(community.as_uuid())
         .bind(&third_member)
@@ -1575,7 +1774,7 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     .expect("authorize action broker in private channel");
     let member_idempotency_keys = [Uuid::new_v4(), Uuid::new_v4()];
     let operation_ids = [Uuid::new_v4(), Uuid::new_v4()];
-    let proposed_at = Utc::now();
+    let proposed_at = Utc::now() - Duration::seconds(1);
     let mut new_proposal = NewExternalActionProposal {
         id: proposal_id,
         owner_pubkey: signer.clone(),
@@ -1657,9 +1856,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     three_member_proposal.id = Uuid::new_v4();
     three_member_proposal.nonce = Uuid::new_v4();
     assert!(
-        insert_action_proposal(&pool, community, &three_member_proposal)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &three_member_proposal,
+            &verified_proposal(&three_member_proposal, &broker_keys),
+        )
+        .await
+        .is_err(),
         "a private action channel with a third current member must reject proposal insertion"
     );
     sqlx::query(
@@ -1677,9 +1881,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     mutated_operation_id.nonce = Uuid::new_v4();
     mutated_operation_id.items[0].operation_id = Uuid::new_v4();
     assert!(
-        insert_action_proposal(&pool, community, &mutated_operation_id)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &mutated_operation_id,
+            &verified_proposal(&mutated_operation_id, &broker_keys),
+        )
+        .await
+        .is_err(),
         "operation_id mutation without new member hashes must reject insertion"
     );
     let mut duplicate_operation_id = new_proposal.clone();
@@ -1687,9 +1896,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     duplicate_operation_id.nonce = Uuid::new_v4();
     duplicate_operation_id.items[1].operation_id = duplicate_operation_id.items[0].operation_id;
     assert!(
-        insert_action_proposal(&pool, community, &duplicate_operation_id)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &duplicate_operation_id,
+            &verified_proposal(&duplicate_operation_id, &broker_keys),
+        )
+        .await
+        .is_err(),
         "duplicate operation_id must reject the whole proposal"
     );
     let mut wrong_proposal_hash = new_proposal.clone();
@@ -1697,9 +1911,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     wrong_proposal_hash.nonce = Uuid::new_v4();
     wrong_proposal_hash.canonical_proposal.push(b' ');
     assert!(
-        insert_action_proposal(&pool, community, &wrong_proposal_hash)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &wrong_proposal_hash,
+            &verified_proposal(&wrong_proposal_hash, &broker_keys),
+        )
+        .await
+        .is_err(),
         "canonical proposal mutation without a new frozen hash must reject insertion"
     );
     let mut oversized_proposal = new_proposal.clone();
@@ -1709,9 +1928,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     oversized_proposal.operation_hash =
         action_operation_hash(&oversized_proposal.canonical_proposal).to_vec();
     assert!(
-        insert_action_proposal(&pool, community, &oversized_proposal)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &oversized_proposal,
+            &verified_proposal(&oversized_proposal, &broker_keys),
+        )
+        .await
+        .is_err(),
         "oversized canonical proposal must reject insertion"
     );
     let mut oversized_member = new_proposal.clone();
@@ -1721,9 +1945,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     oversized_member.items[0].canonical_operation_hash =
         action_member_operation_hash(&oversized_member.items[0].canonical_operation).to_vec();
     assert!(
-        insert_action_proposal(&pool, community, &oversized_member)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &oversized_member,
+            &verified_proposal(&oversized_member, &broker_keys),
+        )
+        .await
+        .is_err(),
         "oversized member canonical operation must reject insertion"
     );
     sqlx::query(
@@ -1740,9 +1969,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     removed_broker.id = Uuid::new_v4();
     removed_broker.nonce = Uuid::new_v4();
     assert!(
-        insert_action_proposal(&pool, community, &removed_broker)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &removed_broker,
+            &verified_proposal(&removed_broker, &broker_keys),
+        )
+        .await
+        .is_err(),
         "removed broker membership must not authorize proposal insertion"
     );
     sqlx::query(
@@ -1761,9 +1995,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     invalid_create.items.truncate(1);
     invalid_create.items[0].before_hash = Some(vec![99_u8; 32]);
     assert!(
-        insert_action_proposal(&pool, community, &invalid_create)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &invalid_create,
+            &verified_proposal(&invalid_create, &broker_keys),
+        )
+        .await
+        .is_err(),
         "create members must reject before-state preconditions"
     );
     let mut invalid_update = new_proposal.clone();
@@ -1773,9 +2012,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     invalid_update.items[0].before_hash = None;
     invalid_update.items[0].expected_remote_version = None;
     assert!(
-        insert_action_proposal(&pool, community, &invalid_update)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &invalid_update,
+            &verified_proposal(&invalid_update, &broker_keys),
+        )
+        .await
+        .is_err(),
         "non-create members must require before state and a remote version"
     );
     let mut replayed_proposal = new_proposal.clone();
@@ -1784,9 +2028,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     replayed_proposal.proposed_at = Utc::now() - Duration::minutes(20);
     replayed_proposal.expires_at = replayed_proposal.proposed_at + Duration::minutes(5);
     assert!(
-        insert_action_proposal(&pool, community, &replayed_proposal)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &replayed_proposal,
+            &verified_proposal(&replayed_proposal, &broker_keys),
+        )
+        .await
+        .is_err(),
         "a replayed canonical proposal must not receive a fresh DB insertion window"
     );
     let mut extreme_timestamp = new_proposal.clone();
@@ -1795,9 +2044,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     extreme_timestamp.proposed_at = chrono::DateTime::<Utc>::MAX_UTC - Duration::minutes(1);
     extreme_timestamp.expires_at = chrono::DateTime::<Utc>::MAX_UTC;
     assert!(
-        insert_action_proposal(&pool, community, &extreme_timestamp)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &extreme_timestamp,
+            &verified_proposal(&extreme_timestamp, &broker_keys),
+        )
+        .await
+        .is_err(),
         "extreme timestamps must return an error rather than panic"
     );
     let mut wrong_operation_hash = new_proposal.clone();
@@ -1805,9 +2059,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     wrong_operation_hash.nonce = Uuid::new_v4();
     wrong_operation_hash.items[0].canonical_operation_hash[0] ^= 0xff;
     assert!(
-        insert_action_proposal(&pool, community, &wrong_operation_hash)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &wrong_operation_hash,
+            &verified_proposal(&wrong_operation_hash, &broker_keys),
+        )
+        .await
+        .is_err(),
         "operation hash mismatch must reject the whole bundle"
     );
     let mut spliced_member = new_proposal.clone();
@@ -1815,9 +2074,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     spliced_member.nonce = Uuid::new_v4();
     spliced_member.items[1].target_hash[0] ^= 0xff;
     assert!(
-        insert_action_proposal(&pool, community, &spliced_member)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &spliced_member,
+            &verified_proposal(&spliced_member, &broker_keys),
+        )
+        .await
+        .is_err(),
         "a field spliced into a member must reject the whole bundle"
     );
     let mut wrong_bundle_hash = new_proposal.clone();
@@ -1825,9 +2089,14 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     wrong_bundle_hash.nonce = Uuid::new_v4();
     wrong_bundle_hash.ordered_members_hash[0] ^= 0xff;
     assert!(
-        insert_action_proposal(&pool, community, &wrong_bundle_hash)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &wrong_bundle_hash,
+            &verified_proposal(&wrong_bundle_hash, &broker_keys),
+        )
+        .await
+        .is_err(),
         "bundle hash mismatch must reject insertion"
     );
     let mut reordered_bundle = new_proposal.clone();
@@ -1835,14 +2104,24 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     reordered_bundle.nonce = Uuid::new_v4();
     reordered_bundle.items.swap(0, 1);
     assert!(
-        insert_action_proposal(&pool, community, &reordered_bundle)
-            .await
-            .is_err(),
+        insert_action_proposal(
+            &pool,
+            community,
+            &reordered_bundle,
+            &verified_proposal(&reordered_bundle, &broker_keys),
+        )
+        .await
+        .is_err(),
         "reordering members without a new bundle hash must reject insertion"
     );
-    insert_action_proposal(&pool, community, &new_proposal)
-        .await
-        .expect("insert atomic cross-provider action bundle");
+    insert_action_proposal(
+        &pool,
+        community,
+        &new_proposal,
+        &verified_proposal(&new_proposal, &broker_keys),
+    )
+    .await
+    .expect("insert atomic cross-provider action bundle");
     let stored_count: i16 = sqlx::query_scalar(
         "SELECT member_count FROM external_action_proposals WHERE community_id=$1 AND id=$2",
     )
@@ -1852,27 +2131,39 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     .await
     .expect("load derived member count");
     assert_eq!(stored_count, 2);
-    let decision_id = Uuid::new_v4();
-    let wrong_broker_decision = ActionDecisionRecord {
-        decision_id,
+    let decided_at = Utc::now().timestamp();
+    let wrong_broker_keys = Keys::generate();
+    let wrong_broker_expectation = DecisionExpectation {
         proposal_id,
-        owner_pubkey: signer.clone(),
-        broker_pubkey: vec![3_u8; 32],
         channel_id,
         nonce: new_proposal.nonce,
-        operation_hash: new_proposal.operation_hash.clone(),
-        decision_event_hash: vec![17_u8; 32],
-        approved: true,
-        decided_at: Utc::now(),
+        operation_hash: new_proposal
+            .operation_hash
+            .as_slice()
+            .try_into()
+            .expect("proposal hash"),
+        owner_pubkey: owner_keys.public_key().to_bytes(),
+        broker_pubkey: wrong_broker_keys.public_key().to_bytes(),
+        proposed_at: new_proposal.proposed_at.timestamp(),
+        expires_at: new_proposal.expires_at.timestamp(),
     };
+    let wrong_broker_decision = verified_approval(
+        &owner_keys,
+        &wrong_broker_keys,
+        &wrong_broker_expectation,
+        decided_at,
+    );
     assert_eq!(
         record_action_decision(&pool, community, &wrong_broker_decision)
             .await
             .expect("reject mismatched broker decision"),
         ActionDecisionRecordOutcome::Rejected
     );
-    let mut decision = wrong_broker_decision;
-    decision.broker_pubkey = broker.clone();
+    let decision_expectation = DecisionExpectation {
+        broker_pubkey: broker_keys.public_key().to_bytes(),
+        ..wrong_broker_expectation
+    };
+    let decision = verified_approval(&owner_keys, &broker_keys, &decision_expectation, decided_at);
     sqlx::query(
         "UPDATE channel_members SET removed_at=NULL \
          WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
@@ -2432,7 +2723,7 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     let mut receipt_proposal = new_proposal.clone();
     receipt_proposal.id = receipt_proposal_id;
     receipt_proposal.nonce = Uuid::new_v4();
-    receipt_proposal.proposed_at = Utc::now();
+    receipt_proposal.proposed_at = Utc::now() - Duration::seconds(1);
     receipt_proposal.expires_at = receipt_proposal.proposed_at + Duration::minutes(5);
     receipt_proposal.canonical_proposal = br#"{"action":"receipt-outbox"}"#.to_vec();
     receipt_proposal.operation_hash =
@@ -2460,21 +2751,35 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     receipt_proposal.items[0].member_hash = receipt_member_hash.to_vec();
     receipt_proposal.ordered_members_hash =
         action_ordered_members_hash(&[receipt_member_hash]).to_vec();
-    insert_action_proposal(&pool, community, &receipt_proposal)
-        .await
-        .expect("insert receipt-outbox proposal");
-    let receipt_decision = ActionDecisionRecord {
-        decision_id: Uuid::new_v4(),
+    insert_action_proposal(
+        &pool,
+        community,
+        &receipt_proposal,
+        &verified_proposal(&receipt_proposal, &broker_keys),
+    )
+    .await
+    .expect("insert receipt-outbox proposal");
+    let receipt_decided_at = Utc::now().timestamp();
+    let receipt_expectation = DecisionExpectation {
         proposal_id: receipt_proposal_id,
-        owner_pubkey: signer.clone(),
-        broker_pubkey: broker.clone(),
         channel_id,
         nonce: receipt_proposal.nonce,
-        operation_hash: receipt_proposal.operation_hash.clone(),
-        decision_event_hash: vec![0x66; 32],
-        approved: true,
-        decided_at: Utc::now(),
+        operation_hash: receipt_proposal
+            .operation_hash
+            .as_slice()
+            .try_into()
+            .expect("receipt proposal hash"),
+        owner_pubkey: owner_keys.public_key().to_bytes(),
+        broker_pubkey: broker_keys.public_key().to_bytes(),
+        proposed_at: receipt_proposal.proposed_at.timestamp(),
+        expires_at: receipt_proposal.expires_at.timestamp(),
     };
+    let receipt_decision = verified_approval(
+        &owner_keys,
+        &broker_keys,
+        &receipt_expectation,
+        receipt_decided_at,
+    );
     assert_eq!(
         record_action_decision(&pool, community, &receipt_decision)
             .await
@@ -2547,7 +2852,7 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
         .next()
         .expect("receipt publication");
     assert_eq!(publication.proposal_id, receipt_proposal_id);
-    assert_eq!(publication.decision_id, receipt_decision.decision_id);
+    assert_eq!(publication.decision_id, receipt_decision.decision_id());
     assert_eq!(publication.results.len(), 1);
     assert_eq!(publication.results[0].outcome, ActionMemberOutcome::Failed);
     let receipt_remote_attempts: i64 = sqlx::query_scalar(
@@ -2582,12 +2887,12 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
     .await
     .expect("reclaim receipt publication")
     .expect("retried receipt publication");
+    let verified_receipt = verified_receipt(&publication, &broker_keys);
     assert!(complete_action_receipt_publication(
         &pool,
         community,
-        receipt_proposal_id,
         publication.publish_claim_id,
-        &[0x99; 32],
+        &verified_receipt,
         Utc::now(),
     )
     .await

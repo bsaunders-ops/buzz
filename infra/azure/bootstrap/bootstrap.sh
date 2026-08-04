@@ -62,11 +62,23 @@ redis_image=$(read_config_string redisImage)
 minio_image=$(read_config_string minioImage)
 minio_mc_image=$(read_config_string minioMcImage)
 caddy_image=$(read_config_string caddyImage)
+core_worker_image=$(read_config_string coreWorkerImage)
+egress_proxy_image=$(read_config_string egressProxyImage)
+audit_storage_account_name=$(read_config_string auditStorageAccountName)
 if ! jq -e '.startServices | type == "boolean"' <<<"$config_json" >/dev/null; then
   echo "bootstrap configuration key startServices must be a boolean" >&2
   exit 2
 fi
 start_services=$(jq -r '.startServices' <<<"$config_json")
+if ! jq -e '.enableMonth1Workers | type == "boolean"' <<<"$config_json" >/dev/null; then
+  echo "bootstrap configuration key enableMonth1Workers must be a boolean" >&2
+  exit 2
+fi
+enable_month1_workers=$(jq -r '.enableMonth1Workers' <<<"$config_json")
+if [[ $enable_month1_workers == true ]]; then
+  echo "Month-1 workers remain deployment-gated until role business loops and end-to-end tests are complete" >&2
+  exit 2
+fi
 
 if [[ ! $acr_name =~ ^[a-z0-9]{5,50}$ ]]; then
   echo "acrName is invalid" >&2
@@ -74,6 +86,10 @@ if [[ ! $acr_name =~ ^[a-z0-9]{5,50}$ ]]; then
 fi
 if [[ ! $key_vault_name =~ ^[A-Za-z0-9-]{3,24}$ ]]; then
   echo "keyVaultName is invalid" >&2
+  exit 2
+fi
+if [[ ! $audit_storage_account_name =~ ^[a-z0-9]{3,24}$ ]]; then
+  echo "auditStorageAccountName is invalid" >&2
   exit 2
 fi
 if [[ ! $origin_fqdn =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ || $origin_fqdn != *.* || $origin_fqdn == *..* ]]; then
@@ -103,7 +119,7 @@ if [[ $start_services == true && -z $relay_owner_pubkey ]]; then
 fi
 
 image_pattern='^[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$'
-for image in "$bootstrap_bundle_image" "$relay_image" "$postgres_image" "$redis_image" "$minio_image" "$minio_mc_image" "$caddy_image"; do
+for image in "$bootstrap_bundle_image" "$relay_image" "$postgres_image" "$redis_image" "$minio_image" "$minio_mc_image" "$caddy_image" "$core_worker_image" "$egress_proxy_image"; do
   if [[ ! $image =~ $image_pattern ]]; then
     echo "every image must be pinned by sha256 digest" >&2
     exit 2
@@ -391,7 +407,7 @@ install_azure_cli
 mount_data_disk
 extract_verified_bundle
 
-for asset in compose-supervisor.sh container-firewall.sh docker-activation.sh docker-post-start.sh service-activation.sh refresh-secrets.sh buzz-core.service compose.yml compose.azure.yml Caddyfile.azure; do
+for asset in compose-supervisor.sh container-firewall.sh docker-activation.sh docker-post-start.sh service-activation.sh refresh-secrets.sh provision-worker-db-roles.sh buzz-core.service compose.yml compose.azure.yml Caddyfile.azure squid-connectors.conf squid-model.conf; do
   if [[ ! -f $asset_dir/$asset ]]; then
     echo "verified bootstrap bundle is missing $asset" >&2
     exit 1
@@ -403,6 +419,7 @@ install -d -m 0750 -o 1000 -g 1000 /srv/buzz/git /srv/buzz/minio
 install -d -m 0750 -o 999 -g 999 /srv/buzz/postgres /srv/buzz/redis
 
 install -m 0755 "$asset_dir/refresh-secrets.sh" /usr/local/sbin/buzz-core-refresh-secrets
+install -m 0755 "$asset_dir/provision-worker-db-roles.sh" /usr/local/sbin/buzz-core-provision-worker-db-roles
 install -m 0755 "$asset_dir/container-firewall.sh" /usr/local/sbin/buzz-core-container-firewall
 install -m 0755 "$asset_dir/service-activation.sh" /usr/local/sbin/buzz-core-service-activation
 install -m 0755 "$asset_dir/compose-supervisor.sh" /usr/local/sbin/buzz-core-compose-supervisor
@@ -412,6 +429,8 @@ install -m 0644 "$asset_dir/buzz-core.service" /etc/systemd/system/buzz-core.ser
 install -m 0644 "$asset_dir/compose.yml" /opt/buzz/deploy/compose/compose.yml
 install -m 0644 "$asset_dir/compose.azure.yml" /opt/buzz/infra/azure/compose/compose.azure.yml
 install -m 0644 "$asset_dir/Caddyfile.azure" /opt/buzz/infra/azure/compose/Caddyfile.azure
+install -m 0644 "$asset_dir/squid-connectors.conf" /opt/buzz/infra/azure/compose/squid-connectors.conf
+install -m 0644 "$asset_dir/squid-model.conf" /opt/buzz/infra/azure/compose/squid-model.conf
 
 install -d -m 0755 /etc/systemd/system/docker.service.d
 tmp_docker_dropin=$(mktemp /etc/systemd/system/docker.service.d/20-buzz-imds-firewall.conf.XXXXXX)
@@ -441,12 +460,29 @@ MINIO_ACCESS_KEY_SECRET_NAME=minio-access-key
 MINIO_SECRET_KEY_SECRET_NAME=minio-secret-key
 RELAY_PRIVATE_KEY_SECRET_NAME=relay-private-key
 GIT_HOOK_SECRET_NAME=git-hook-hmac-secret
+OPENAI_API_KEY_SECRET_NAME=openai-api-key
+ACP_SIGNING_KEY_SECRET_NAME=acp-signing-key
+CRM_CONNECTOR_CREDENTIAL_B64_SECRET_NAME=crm-connector-credential-b64
+MICROSOFT_CONNECTOR_CREDENTIAL_B64_SECRET_NAME=microsoft-connector-credential-b64
+GOOGLE_CONNECTOR_CREDENTIAL_B64_SECRET_NAME=google-connector-credential-b64
+AUDIT_BLOB_CREDENTIAL_B64_SECRET_NAME=audit-blob-credential-b64
+CONNECTOR_WORKER_DB_PASSWORD_SECRET_NAME=connector-worker-db-password
+SANITIZER_INDEXER_DB_PASSWORD_SECRET_NAME=sanitizer-indexer-db-password
+SIGNAL_RUNNER_DB_PASSWORD_SECRET_NAME=signal-runner-db-password
+ACTION_EXECUTOR_DB_PASSWORD_SECRET_NAME=action-executor-db-password
+LEARNING_WORKER_DB_PASSWORD_SECRET_NAME=learning-worker-db-password
+AUDIT_EXPORTER_DB_PASSWORD_SECRET_NAME=audit-exporter-db-password
+AUDIT_STORAGE_ACCOUNT_NAME=$audit_storage_account_name
+ENABLE_MONTH1_WORKERS=$enable_month1_workers
+COMPOSE_PROFILES=$( [[ $enable_month1_workers == true ]] && printf month1-workers )
 BUZZ_RELAY_IMAGE=$relay_image
 POSTGRES_IMAGE=$postgres_image
 REDIS_IMAGE=$redis_image
 MINIO_IMAGE=$minio_image
 MINIO_MC_IMAGE=$minio_mc_image
 CADDY_IMAGE=$caddy_image
+BUZZ_CORE_WORKER_IMAGE=$core_worker_image
+EGRESS_PROXY_IMAGE=$egress_proxy_image
 BUZZ_AZURE_ASSET_ROOT=/opt/buzz/infra/azure
 DOCKER_CONFIG=/run/buzz/docker
 EOF

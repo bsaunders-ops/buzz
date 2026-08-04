@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+use buzz_core::CommunityId;
 use chrono::NaiveDate;
 use sha2::{Digest, Sha256};
+use sqlx::{PgConnection, PgPool, Row};
+use uuid::Uuid;
 
 /// Learning layer whose contents may affect retrieval and behavior, not policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,15 +22,6 @@ pub enum SignalStrength {
     Strong,
     /// Weak or ambiguous signal.
     Weak,
-}
-
-/// Month-one firm promotion mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FirmStewardMode {
-    /// Blake is the founding steward during the first month.
-    FoundingSteward,
-    /// Normal multi-user promotion after at least two employees have activity.
-    MultiUser,
 }
 
 /// One hashed/de-identified signal considered by the evaluator.
@@ -51,11 +45,226 @@ pub struct LearningSignal {
     pub policy_boundary: bool,
 }
 
-/// Sanitized firm bundle text before encryption/storage.
+/// Closed aggregate rule vocabulary allowed in the sanitized firm layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AggregateFirmRule {
+    /// Present evidence before a recommendation.
+    EvidenceBeforeRecommendation,
+    /// Keep relationship context concise.
+    ConciseRelationshipContext,
+    /// Rank commitments and deadlines before lower-priority movement.
+    CommitmentsBeforeMovement,
+    /// Prefer practical buyer fit over generic list length.
+    PracticalBuyerFit,
+    /// Re-resolve source freshness before using a learned preference.
+    RecheckSourceFreshness,
+}
+
+impl AggregateFirmRule {
+    const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::EvidenceBeforeRecommendation => "evidence_before_recommendation",
+            Self::ConciseRelationshipContext => "concise_relationship_context",
+            Self::CommitmentsBeforeMovement => "commitments_before_movement",
+            Self::PracticalBuyerFit => "practical_buyer_fit",
+            Self::RecheckSourceFreshness => "recheck_source_freshness",
+        }
+    }
+}
+
+/// Failure to create a closed, sanitizer-produced firm bundle or authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmDerivationError {
+    /// Candidate, rule set, or durable state failed a closed validation rule.
+    Rejected,
+    /// The server-owned durable snapshot could not be read.
+    Storage,
+}
+
+impl std::fmt::Display for FirmDerivationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected => formatter.write_str("firm learning derivation rejected"),
+            Self::Storage => formatter.write_str("firm learning durable state unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for FirmDerivationError {}
+
+impl From<sqlx::Error> for FirmDerivationError {
+    fn from(_: sqlx::Error) -> Self {
+        Self::Storage
+    }
+}
+
+/// Sanitizer-produced firm bundle before encryption/storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmBundleCandidate {
     /// Aggregate typed rules only. Entity-specific content must be absent.
-    pub body: String,
+    body: String,
+    revision_id: Uuid,
+    source_candidate_hash: [u8; 32],
+    sanitizer_version: u16,
+    provenance_hash: [u8; 32],
+}
+
+impl FirmBundleCandidate {
+    /// Durable learning revision this sanitized bundle was derived from.
+    #[must_use]
+    pub const fn revision_id(&self) -> Uuid {
+        self.revision_id
+    }
+
+    /// Canonical closed-rule representation for encryption and storage.
+    #[must_use]
+    pub fn canonical_rules(&self) -> &str {
+        &self.body
+    }
+
+    /// Sanitizer revision that generated the closed rule bundle.
+    #[must_use]
+    pub const fn sanitizer_version(&self) -> u16 {
+        self.sanitizer_version
+    }
+
+    /// Hash binding the source candidate, sanitizer revision, and canonical rules.
+    #[must_use]
+    pub const fn provenance_hash(&self) -> [u8; 32] {
+        self.provenance_hash
+    }
+}
+
+fn sanitize_firm_bundle_for_revision(
+    revision_id: Uuid,
+    source_candidate_hash: [u8; 32],
+    rules: &[AggregateFirmRule],
+) -> Result<FirmBundleCandidate, FirmDerivationError> {
+    const SANITIZER_VERSION: u16 = 1;
+    if rules.is_empty() || rules.len() > 16 || source_candidate_hash == [0; 32] {
+        return Err(FirmDerivationError::Rejected);
+    }
+    let mut unique = HashSet::with_capacity(rules.len());
+    if rules.iter().any(|rule| !unique.insert(*rule)) {
+        return Err(FirmDerivationError::Rejected);
+    }
+    let body = rules
+        .iter()
+        .map(|rule| rule.canonical_name())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let provenance_hash = firm_bundle_provenance_hash(
+        revision_id,
+        source_candidate_hash,
+        SANITIZER_VERSION,
+        body.as_bytes(),
+    );
+    Ok(FirmBundleCandidate {
+        body,
+        revision_id,
+        source_candidate_hash,
+        sanitizer_version: SANITIZER_VERSION,
+        provenance_hash,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FirmActivitySnapshot {
+    active_user_count: usize,
+}
+
+/// Server-owned learning repository. Firm authority and source provenance are
+/// read inside repeatable-read transactions and never accepted from callers.
+#[derive(Debug, Clone)]
+pub struct LearningStore {
+    pool: PgPool,
+}
+
+impl LearningStore {
+    /// Create a learning repository over the service's least-privilege pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Derive a closed firm bundle from the durable candidate hash.
+    pub async fn sanitize_firm_revision(
+        &self,
+        community_id: CommunityId,
+        revision_id: Uuid,
+        rules: &[AggregateFirmRule],
+    ) -> Result<FirmBundleCandidate, FirmDerivationError> {
+        let source_hash = load_firm_revision_hash(&self.pool, community_id, revision_id).await?;
+        sanitize_firm_bundle_for_revision(revision_id, source_hash, rules)
+    }
+
+    /// Evaluate firm promotion against the current durable revision and active
+    /// identity snapshot. The snapshot is re-read on every evaluation, so a
+    /// formerly valid one-user state cannot be replayed after another employee
+    /// becomes active.
+    pub async fn evaluate_firm_promotion(
+        &self,
+        community_id: CommunityId,
+        revision_id: Uuid,
+        candidate: &PromotionCandidate,
+        evaluation_day: NaiveDate,
+    ) -> Result<PromotionDecision, FirmDerivationError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let source_hash =
+            load_firm_revision_hash_executor(&mut transaction, community_id, revision_id).await?;
+        let active_user_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM core_identity_bindings \
+             WHERE community_id=$1 AND lifecycle_state='active'",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+
+        let snapshot = FirmActivitySnapshot {
+            active_user_count: usize::try_from(active_user_count)
+                .map_err(|_| FirmDerivationError::Rejected)?,
+        };
+        Ok(evaluate_firm_promotion_with_snapshot(
+            candidate,
+            revision_id,
+            source_hash,
+            snapshot,
+            evaluation_day,
+        ))
+    }
+}
+
+async fn load_firm_revision_hash(
+    pool: &PgPool,
+    community_id: CommunityId,
+    revision_id: Uuid,
+) -> Result<[u8; 32], FirmDerivationError> {
+    let mut connection = pool.acquire().await?;
+    load_firm_revision_hash_executor(&mut connection, community_id, revision_id).await
+}
+
+async fn load_firm_revision_hash_executor(
+    connection: &mut PgConnection,
+    community_id: CommunityId,
+    revision_id: Uuid,
+) -> Result<[u8; 32], FirmDerivationError> {
+    let row = sqlx::query(
+        "SELECT bundle_integrity_hash FROM learning_revisions \
+         WHERE community_id=$1 AND id=$2 AND layer='sanitized_firm' AND state='candidate'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(revision_id)
+    .fetch_optional(connection)
+    .await?
+    .ok_or(FirmDerivationError::Rejected)?;
+    let hash: Vec<u8> = row.try_get("bundle_integrity_hash")?;
+    hash.as_slice()
+        .try_into()
+        .map_err(|_| FirmDerivationError::Rejected)
 }
 
 /// Promotion candidate evaluated before creating/activating a learning revision.
@@ -65,8 +274,6 @@ pub struct PromotionCandidate {
     pub layer: LearningLayer,
     /// Candidate creation day.
     pub created_day: NaiveDate,
-    /// Firm-steward gate mode.
-    pub steward_mode: FirmStewardMode,
     /// Required sanitized firm bundle for firm learning.
     pub sanitized_firm_bundle: Option<FirmBundleCandidate>,
     /// De-identified evidence signals.
@@ -142,7 +349,10 @@ pub fn evaluate_promotion(
 
     match candidate.layer {
         LearningLayer::Personal => evaluate_personal_promotion(candidate),
-        LearningLayer::SanitizedFirm => evaluate_firm_promotion(candidate, evaluation_day),
+        LearningLayer::SanitizedFirm => {
+            let _ = evaluation_day;
+            PromotionDecision::Quarantine(LearningQuarantineReason::FirmSanitization)
+        }
     }
 }
 
@@ -199,13 +409,22 @@ fn evaluate_personal_promotion(candidate: &PromotionCandidate) -> PromotionDecis
     }
 }
 
-fn evaluate_firm_promotion(
+fn evaluate_firm_promotion_with_snapshot(
     candidate: &PromotionCandidate,
+    revision_id: Uuid,
+    source_candidate_hash: [u8; 32],
+    snapshot: FirmActivitySnapshot,
     evaluation_day: NaiveDate,
 ) -> PromotionDecision {
     match candidate.sanitized_firm_bundle.as_ref() {
-        Some(bundle) if sanitized_firm_bundle_is_valid(bundle) => {}
+        Some(bundle)
+            if bundle.revision_id == revision_id
+                && bundle.source_candidate_hash == source_candidate_hash
+                && sanitized_firm_bundle_is_valid(bundle) => {}
         _ => return PromotionDecision::Quarantine(LearningQuarantineReason::FirmSanitization),
+    }
+    if snapshot.active_user_count == 0 || snapshot.active_user_count > 6 {
+        return PromotionDecision::Quarantine(LearningQuarantineReason::FirmSanitization);
     }
 
     let strong = unique_strong_signals(&candidate.signals);
@@ -229,7 +448,7 @@ fn evaluate_firm_promotion(
         return PromotionDecision::NeedsEvidence;
     }
 
-    if candidate.steward_mode == FirmStewardMode::MultiUser {
+    if snapshot.active_user_count >= 2 {
         let users: HashSet<&str> = strong
             .iter()
             .map(|signal| signal.user_key.as_str())
@@ -276,7 +495,32 @@ fn sanitized_firm_bundle_is_valid(bundle: &FirmBundleCandidate) -> bool {
     {
         return false;
     }
-    !contains_uuid_like_token(body) && !contains_long_hex_token(body)
+    !contains_uuid_like_token(body)
+        && !contains_long_hex_token(body)
+        && bundle.sanitizer_version == 1
+        && bundle.source_candidate_hash != [0; 32]
+        && bundle.provenance_hash
+            == firm_bundle_provenance_hash(
+                bundle.revision_id,
+                bundle.source_candidate_hash,
+                bundle.sanitizer_version,
+                bundle.body.as_bytes(),
+            )
+}
+
+fn firm_bundle_provenance_hash(
+    revision_id: Uuid,
+    source_candidate_hash: [u8; 32],
+    sanitizer_version: u16,
+    body: &[u8],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"CORE-BUZZ-FIRM-SANITIZER-V1\0");
+    hasher.update(revision_id.as_bytes());
+    hasher.update(source_candidate_hash);
+    hasher.update(sanitizer_version.to_be_bytes());
+    hasher.update(body);
+    hasher.finalize().into()
 }
 
 fn contains_uuid_like_token(value: &str) -> bool {
@@ -328,12 +572,34 @@ mod tests {
         }
     }
 
+    fn firm_bundle(rules: &[AggregateFirmRule]) -> FirmBundleCandidate {
+        sanitize_firm_bundle_for_revision(Uuid::from_u128(1), [0x31; 32], rules)
+            .expect("sanitize test firm bundle")
+    }
+
+    fn test_only_bundle(body: &str) -> FirmBundleCandidate {
+        let revision_id = Uuid::from_u128(1);
+        let source_candidate_hash = [0x32; 32];
+        let sanitizer_version = 1;
+        FirmBundleCandidate {
+            body: body.to_string(),
+            revision_id,
+            source_candidate_hash,
+            sanitizer_version,
+            provenance_hash: firm_bundle_provenance_hash(
+                revision_id,
+                source_candidate_hash,
+                sanitizer_version,
+                body.as_bytes(),
+            ),
+        }
+    }
+
     #[test]
     fn personal_promotion_requires_six_strong_signals_across_subjects_and_days() {
         let candidate = PromotionCandidate {
             layer: LearningLayer::Personal,
             created_day: day(1),
-            steward_mode: FirmStewardMode::FoundingSteward,
             sanitized_firm_bundle: None,
             signals: vec![
                 strong("s1", "emails", "deal-a", "blake", day(1)),
@@ -388,29 +654,49 @@ mod tests {
         let founding = PromotionCandidate {
             layer: LearningLayer::SanitizedFirm,
             created_day: day(1),
-            steward_mode: FirmStewardMode::FoundingSteward,
-            sanitized_firm_bundle: Some(FirmBundleCandidate {
-                body: "Prefer concise relationship context before recommendations.".to_string(),
-            }),
+            sanitized_firm_bundle: Some(firm_bundle(&[
+                AggregateFirmRule::ConciseRelationshipContext,
+            ])),
             signals: signals.clone(),
         };
 
         assert_eq!(
-            evaluate_promotion(&founding, day(14)),
+            evaluate_firm_promotion_with_snapshot(
+                &founding,
+                Uuid::from_u128(1),
+                [0x31; 32],
+                FirmActivitySnapshot {
+                    active_user_count: 1
+                },
+                day(14),
+            ),
             PromotionDecision::NeedsEvidence,
             "firm learning needs a full 14-day observation period"
         );
         assert_eq!(
-            evaluate_promotion(&founding, day(15)),
+            evaluate_firm_promotion_with_snapshot(
+                &founding,
+                Uuid::from_u128(1),
+                [0x31; 32],
+                FirmActivitySnapshot {
+                    active_user_count: 1
+                },
+                day(15),
+            ),
             PromotionDecision::Promote
         );
 
-        let multi_user = PromotionCandidate {
-            steward_mode: FirmStewardMode::MultiUser,
-            ..founding
-        };
+        let multi_user = PromotionCandidate { ..founding };
         assert_eq!(
-            evaluate_promotion(&multi_user, day(15)),
+            evaluate_firm_promotion_with_snapshot(
+                &multi_user,
+                Uuid::from_u128(1),
+                [0x31; 32],
+                FirmActivitySnapshot {
+                    active_user_count: 2
+                },
+                day(15),
+            ),
             PromotionDecision::NeedsEvidence,
             "post-month-one firm promotion needs evidence from at least two users"
         );
@@ -448,18 +734,47 @@ mod tests {
         let candidate = PromotionCandidate {
             layer: LearningLayer::SanitizedFirm,
             created_day: day(1),
-            steward_mode: FirmStewardMode::MultiUser,
-            sanitized_firm_bundle: Some(FirmBundleCandidate {
-                body: "Use this rule for Project Falcon, contact blake@example.com, $42M."
-                    .to_string(),
-            }),
+            sanitized_firm_bundle: Some(test_only_bundle(
+                "Use this rule for Project Falcon, contact blake@example.com, $42M.",
+            )),
             signals: concentrated,
         };
 
         assert_eq!(
-            evaluate_promotion(&candidate, day(15)),
+            evaluate_firm_promotion_with_snapshot(
+                &candidate,
+                Uuid::from_u128(1),
+                [0x32; 32],
+                FirmActivitySnapshot {
+                    active_user_count: 2
+                },
+                day(15),
+            ),
             PromotionDecision::Quarantine(LearningQuarantineReason::FirmSanitization)
         );
+    }
+
+    #[test]
+    fn firm_bundle_and_authority_are_derived_by_closed_server_paths() {
+        let source_hash = [0x51; 32];
+        let revision_id = Uuid::from_u128(9);
+        let bundle = sanitize_firm_bundle_for_revision(
+            revision_id,
+            source_hash,
+            &[
+                AggregateFirmRule::EvidenceBeforeRecommendation,
+                AggregateFirmRule::ConciseRelationshipContext,
+            ],
+        )
+        .expect("closed aggregate rules sanitize");
+        assert_eq!(bundle.revision_id(), revision_id);
+        assert_eq!(
+            bundle.canonical_rules(),
+            "evidence_before_recommendation\nconcise_relationship_context"
+        );
+        assert_eq!(bundle.sanitizer_version(), 1);
+        assert_ne!(bundle.provenance_hash(), source_hash);
+        assert!(sanitize_firm_bundle_for_revision(revision_id, source_hash, &[]).is_err());
     }
 
     #[test]

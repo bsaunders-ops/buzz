@@ -1,7 +1,11 @@
 use std::fmt;
 
-use buzz_core::core_protocol::ActionReceiptPayload;
+use buzz_core::{
+    action_auth::{validate_signed_action_receipt, ReceiptExpectation, VerifiedActionReceipt},
+    core_protocol::ActionReceiptPayload,
+};
 use buzz_db::core_storage::{ActionMemberOutcome, ActionReceiptPublication};
+use nostr::Event;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -125,4 +129,25 @@ pub fn prepare_receipt_event(
         signer_pubkey,
         content,
     })
+}
+
+/// Verify the exact signed kind `44312` event before marking its outbox row published.
+pub fn validate_signed_receipt(
+    event: &Event,
+    prepared: &PreparedReceiptEvent,
+    now: i64,
+) -> Result<VerifiedActionReceipt, ExecutionError> {
+    let payload: ActionReceiptPayload =
+        serde_json::from_str(prepared.content()).map_err(|_| ExecutionError::BindingRejected)?;
+    validate_signed_action_receipt(
+        event,
+        &ReceiptExpectation {
+            payload,
+            channel_id: prepared.channel_id(),
+            owner_pubkey: prepared.recipient_pubkey(),
+            broker_pubkey: prepared.signer_pubkey(),
+        },
+        now,
+    )
+    .map_err(|_| ExecutionError::BindingRejected)
 }

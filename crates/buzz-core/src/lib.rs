@@ -5,6 +5,8 @@
 //! Provides [`StoredEvent`], filter matching, kind constants, and event
 //! verification. All other Buzz crates depend on this one.
 
+/// Opaque signed-event capabilities for durable Core actions.
+pub mod action_auth;
 /// NIP-AM: Agent Turn Metric — payload type and encrypt/decrypt helpers.
 pub mod agent_turn_metric;
 /// Channel and membership enums shared across crates.

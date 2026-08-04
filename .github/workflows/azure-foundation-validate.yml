@@ -55,6 +55,8 @@ jobs:
           MINIO_IMAGE: quay.io/minio/minio@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           MINIO_MC_IMAGE: quay.io/minio/mc@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           CADDY_IMAGE: docker.io/library/caddy@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          BUZZ_CORE_WORKER_IMAGE: corebuzz.invalid/buzz-core-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          EGRESS_PROXY_IMAGE: docker.io/library/ubuntu/squid@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           POSTGRES_PASSWORD: validation-only
           REDIS_PASSWORD: validation-only
           BUZZ_S3_ACCESS_KEY: validation-only
@@ -134,6 +136,8 @@ jobs:
           MINIO_IMAGE: ${{ vars.MINIO_IMAGE }}
           MINIO_MC_IMAGE: ${{ vars.MINIO_MC_IMAGE }}
           CADDY_IMAGE: ${{ vars.CADDY_IMAGE }}
+          CORE_WORKER_IMAGE: ${{ vars.BUZZ_CORE_WORKER_IMAGE }}
+          EGRESS_PROXY_IMAGE: ${{ vars.EGRESS_PROXY_IMAGE }}
           BOOTSTRAP_BUNDLE_IMAGE: ${{ vars.BOOTSTRAP_BUNDLE_IMAGE }}
         run: |
           set -euo pipefail
@@ -141,7 +145,7 @@ jobs:
             [[ -n "${!value}" ]] || { echo "::error::$value is unset"; exit 1; }
           done
           [[ "$RELAY_OWNER_PUBKEY" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "::error::RELAY_OWNER_PUBKEY is invalid"; exit 1; }
-          for value in BOOTSTRAP_BUNDLE_IMAGE RELAY_IMAGE POSTGRES_IMAGE REDIS_IMAGE MINIO_IMAGE MINIO_MC_IMAGE CADDY_IMAGE; do
+          for value in BOOTSTRAP_BUNDLE_IMAGE RELAY_IMAGE POSTGRES_IMAGE REDIS_IMAGE MINIO_IMAGE MINIO_MC_IMAGE CADDY_IMAGE CORE_WORKER_IMAGE EGRESS_PROXY_IMAGE; do
             [[ "${!value}" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "::error::$value is not digest-pinned"; exit 1; }
           done
 
@@ -171,6 +175,8 @@ jobs:
           MINIO_IMAGE: ${{ vars.MINIO_IMAGE }}
           MINIO_MC_IMAGE: ${{ vars.MINIO_MC_IMAGE }}
           CADDY_IMAGE: ${{ vars.CADDY_IMAGE }}
+          CORE_WORKER_IMAGE: ${{ vars.BUZZ_CORE_WORKER_IMAGE }}
+          EGRESS_PROXY_IMAGE: ${{ vars.EGRESS_PROXY_IMAGE }}
           BOOTSTRAP_BUNDLE_IMAGE: ${{ vars.BOOTSTRAP_BUNDLE_IMAGE }}
         run: |
           set -euo pipefail
@@ -194,6 +200,8 @@ jobs:
               minioImage="$MINIO_IMAGE" \
               minioMcImage="$MINIO_MC_IMAGE" \
               caddyImage="$CADDY_IMAGE" \
+              coreWorkerImage="$CORE_WORKER_IMAGE" \
+              egressProxyImage="$EGRESS_PROXY_IMAGE" \
               enableHostBootstrap=false \
               startCoreServices=false \
             --no-pretty-print

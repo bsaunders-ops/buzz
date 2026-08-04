@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::Receiver,
         Arc, Mutex,
     },
     thread,
@@ -59,7 +59,7 @@ struct ActiveCall {
     control_sequence: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PrivateRelayEventReady {
     schema_version: u8,
@@ -594,7 +594,7 @@ fn start_platform_runtime(
     route: CallCaptureRoute,
     accumulator: Arc<Mutex<LiveSessionAccumulator>>,
 ) -> Result<Box<dyn CallCaptureRuntime>, String> {
-    let (sender, receiver) = mpsc::sync_channel(TRANSPORT_QUEUE_CAPACITY);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(TRANSPORT_QUEUE_CAPACITY);
     let native = super::native::start(call_id, microphone, output, app.clone(), sender)?;
     let failed = Arc::new(AtomicBool::new(false));
     let thread_failed = Arc::clone(&failed);

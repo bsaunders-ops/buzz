@@ -7,8 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+type TranscriptionCalls = Arc<Mutex<Vec<(AudioEndpointKind, Vec<f32>)>>>;
+type FinalizedSegments = Arc<Mutex<Vec<FinalizedSegment>>>;
+type RecordingPipeline = LocalAudioPipeline<RecordingTranscriber, RecordingFinalizedSink>;
+
 struct RecordingTranscriber {
-    calls: Arc<Mutex<Vec<(AudioEndpointKind, Vec<f32>)>>>,
+    calls: TranscriptionCalls,
 }
 
 impl LocalTranscriber for RecordingTranscriber {
@@ -34,7 +38,7 @@ impl LocalTranscriber for RecordingTranscriber {
 }
 
 struct RecordingFinalizedSink {
-    segments: Arc<Mutex<Vec<FinalizedSegment>>>,
+    segments: FinalizedSegments,
 }
 
 impl FinalizedSegmentSink for RecordingFinalizedSink {
@@ -48,13 +52,7 @@ fn frame(source: AudioEndpointKind, value: f32, start: u64, end: u64) -> RawAudi
     RawAudioFrame::new(source, vec![value; 160], 16_000, start, end).unwrap()
 }
 
-fn recording_pipeline(
-    call_id: Uuid,
-) -> (
-    LocalAudioPipeline<RecordingTranscriber, RecordingFinalizedSink>,
-    Arc<Mutex<Vec<(AudioEndpointKind, Vec<f32>)>>>,
-    Arc<Mutex<Vec<FinalizedSegment>>>,
-) {
+fn recording_pipeline(call_id: Uuid) -> (RecordingPipeline, TranscriptionCalls, FinalizedSegments) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let segments = Arc::new(Mutex::new(Vec::new()));
     let pipeline = LocalAudioPipeline::new(

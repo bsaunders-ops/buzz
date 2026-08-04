@@ -14,6 +14,10 @@ param redisImage string
 param minioImage string
 param minioMcImage string
 param caddyImage string
+param coreWorkerImage string
+param egressProxyImage string
+param auditStorageAccountName string
+param enableMonth1Workers bool = false
 param startCoreServices bool = false
 
 var configPayload = base64(string({
@@ -31,6 +35,10 @@ var configPayload = base64(string({
   minioImage: minioImage
   minioMcImage: minioMcImage
   caddyImage: caddyImage
+  coreWorkerImage: coreWorkerImage
+  egressProxyImage: egressProxyImage
+  auditStorageAccountName: auditStorageAccountName
+  enableMonth1Workers: enableMonth1Workers
   startServices: startCoreServices
 }))
 var loader = loadTextContent('../bootstrap/bootstrap.sh')

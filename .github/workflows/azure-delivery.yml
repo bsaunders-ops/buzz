@@ -48,6 +48,11 @@ jobs:
             image_name: bootstrap-bundle
             file: ./infra/azure/bootstrap/Dockerfile
             target: bundle
+          - variant: core-worker
+            artifact: buzz-core-worker
+            image_name: buzz-core-worker
+            file: ./infra/azure/worker/Dockerfile
+            target: runtime
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
@@ -69,6 +74,10 @@ jobs:
           outputs: type=oci,dest=/tmp/${{ matrix.artifact }}.tar
           sbom: true
           provenance: mode=max
+          build-args: |
+            RUST_BUILD_IMAGE=rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+            NODE_BUILD_IMAGE=node:24-bookworm-slim@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7
+            DEBIAN_RUNTIME_IMAGE=debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
       - name: Emit SHA-256 manifest
         run: |
