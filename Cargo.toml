@@ -29,6 +29,7 @@ members = [
     "crates/buzz-voice",
     "crates/buzz-action-broker",
     "crates/buzz-connector-core",
+    "crates/buzz-learning",
     "crates/buzz-signal-runner",
     "crates/buzz-backend-kubernetes",
     "examples/countdown-bot",
@@ -144,6 +145,7 @@ buzz-search = { path = "crates/buzz-search" }
 buzz-audit = { path = "crates/buzz-audit" }
 buzz-workflow = { path = "crates/buzz-workflow" }
 buzz-media = { path = "crates/buzz-media" }
+buzz-learning = { path = "crates/buzz-learning" }
 buzz-signal-runner = { path = "crates/buzz-signal-runner" }
 buzz-sdk = { path = "crates/buzz-sdk" }
 buzz-ws-client = { path = "crates/buzz-ws-client" }
