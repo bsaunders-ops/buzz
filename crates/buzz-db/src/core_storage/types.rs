@@ -6,8 +6,17 @@ use uuid::Uuid;
 pub const EMBEDDING_DIMENSIONS: usize = 384;
 
 /// Validated non-secret Azure Key Vault secret name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KeyVaultSecretName(String);
+
+impl std::fmt::Debug for KeyVaultSecretName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyVaultSecretName")
+            .field("name_redacted", &true)
+            .finish()
+    }
+}
 
 impl KeyVaultSecretName {
     /// Accept Azure's 1-127 ASCII alphanumeric/hyphen secret-name grammar.
@@ -34,7 +43,7 @@ impl KeyVaultSecretName {
 }
 
 /// Durable Entra-to-Buzz identity binding metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdentityBindingRecord {
     /// Tenant owning the binding.
     pub community_id: CommunityId,
@@ -54,8 +63,19 @@ pub struct IdentityBindingRecord {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+impl std::fmt::Debug for IdentityBindingRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IdentityBindingRecord")
+            .field("lifecycle_state", &self.lifecycle_state)
+            .field("revoked", &self.revoked_at.is_some())
+            .field("identity_and_challenge_redacted", &true)
+            .finish()
+    }
+}
+
 /// Durable connector account metadata without credential values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectorAccountRecord {
     /// Tenant owning the account.
     pub community_id: CommunityId,
@@ -73,8 +93,19 @@ pub struct ConnectorAccountRecord {
     pub status: String,
 }
 
+impl std::fmt::Debug for ConnectorAccountRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorAccountRecord")
+            .field("provider", &self.provider)
+            .field("status", &self.status)
+            .field("account_authority_redacted", &true)
+            .finish()
+    }
+}
+
 /// Approved external source scope and its granted capabilities.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ApprovedSourceScopeRecord {
     /// Tenant owning the scope.
     pub community_id: CommunityId,
@@ -84,6 +115,8 @@ pub struct ApprovedSourceScopeRecord {
     pub account_id: Uuid,
     /// Immutable provider-side scope identifier.
     pub external_scope_id: String,
+    /// Exact configured clickable-link hosts for account-specific authorities.
+    pub resolver_hosts: Vec<String>,
     /// Provider-specific scope type.
     pub scope_type: String,
     /// Whether reads are permitted.
@@ -96,8 +129,23 @@ pub struct ApprovedSourceScopeRecord {
     pub status: String,
 }
 
+impl std::fmt::Debug for ApprovedSourceScopeRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApprovedSourceScopeRecord")
+            .field("scope_type", &self.scope_type)
+            .field("resolver_host_count", &self.resolver_hosts.len())
+            .field("can_read", &self.can_read)
+            .field("can_write", &self.can_write)
+            .field("active_deal_pinned", &self.active_deal_pinned)
+            .field("status", &self.status)
+            .field("scope_authority_redacted", &true)
+            .finish()
+    }
+}
+
 /// Current encrypted delta cursor and lease state for a source stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectorDeltaCursorRecord {
     /// Tenant owning the cursor.
     pub community_id: CommunityId,
@@ -119,8 +167,20 @@ pub struct ConnectorDeltaCursorRecord {
     pub last_success_at: Option<DateTime<Utc>>,
 }
 
+impl std::fmt::Debug for ConnectorDeltaCursorRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorDeltaCursorRecord")
+            .field("cursor_redacted", &true)
+            .field("cursor_bytes", &self.encrypted_cursor.len())
+            .field("cursor_key_version", &self.cursor_key_version)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
 /// Migratable local embedding version metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EmbeddingVersionRecord {
     /// Tenant owning the embedding corpus.
     pub community_id: CommunityId,
@@ -136,8 +196,21 @@ pub struct EmbeddingVersionRecord {
     pub status: String,
 }
 
+impl std::fmt::Debug for EmbeddingVersionRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddingVersionRecord")
+            .field("model_name", &self.model_name)
+            .field("dimensions", &self.dimensions)
+            .field("version", &self.version)
+            .field("status", &self.status)
+            .field("tenant_and_identifier_redacted", &true)
+            .finish()
+    }
+}
+
 /// Stable provider item identity and citation metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SourceItemRecord {
     /// Tenant owning the item.
     pub community_id: CommunityId,
@@ -165,8 +238,19 @@ pub struct SourceItemRecord {
     pub tombstoned_at: Option<DateTime<Utc>>,
 }
 
+impl std::fmt::Debug for SourceItemRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceItemRecord")
+            .field("source_metadata_redacted", &true)
+            .field("source_type", &self.source_type)
+            .field("tombstoned", &self.tombstoned_at.is_some())
+            .finish()
+    }
+}
+
 /// Source chunk content, hash, and local embedding metadata.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct SourceChunkRecord {
     /// Tenant owning the chunk.
     pub community_id: CommunityId,
@@ -186,8 +270,20 @@ pub struct SourceChunkRecord {
     pub embedding: Option<Vec<f32>>,
 }
 
+impl std::fmt::Debug for SourceChunkRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceChunkRecord")
+            .field("chunk_index", &self.chunk_index)
+            .field("content_redacted", &true)
+            .field("content_characters", &self.content.chars().count())
+            .field("embedding_present", &self.embedding.is_some())
+            .finish()
+    }
+}
+
 /// Positive source-item ACL principal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SourceItemAclRecord {
     /// Tenant owning the ACL.
     pub community_id: CommunityId,
@@ -201,6 +297,210 @@ pub struct SourceItemAclRecord {
     pub principal_pubkey: Option<Vec<u8>>,
     /// Channel identifier for a channel ACL.
     pub channel_id: Option<Uuid>,
+}
+
+impl std::fmt::Debug for SourceItemAclRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceItemAclRecord")
+            .field("principal_type", &self.principal_type)
+            .field("authority_identifiers_redacted", &true)
+            .finish()
+    }
+}
+
+/// Closed indexed source kind accepted by the connector storage boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexedSourceKind {
+    /// Email body.
+    Email,
+    /// Calendar event.
+    CalendarEvent,
+    /// Document or plain text.
+    Document,
+    /// Spreadsheet cell text.
+    Spreadsheet,
+    /// Simple slide text.
+    Presentation,
+    /// CRM entity or activity.
+    CrmRecord,
+    /// Granola transcript exposed by CRM.
+    CrmTranscript,
+}
+
+impl IndexedSourceKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Email => "email",
+            Self::CalendarEvent => "calendar_event",
+            Self::Document => "document",
+            Self::Spreadsheet => "spreadsheet",
+            Self::Presentation => "presentation",
+            Self::CrmRecord => "crm_record",
+            Self::CrmTranscript => "crm_transcript",
+        }
+    }
+}
+
+/// Positive source ACL replacement accepted by a change page.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NewSourceAclPrincipal {
+    /// One exact Buzz user signing key.
+    User([u8; 32]),
+    /// One private channel; reads still require current membership.
+    Channel(Uuid),
+}
+
+impl std::fmt::Debug for NewSourceAclPrincipal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let principal_type = match self {
+            Self::User(_) => "user",
+            Self::Channel(_) => "channel",
+        };
+        formatter
+            .debug_struct("NewSourceAclPrincipal")
+            .field("principal_type", &principal_type)
+            .field("authority_identifier_redacted", &true)
+            .finish()
+    }
+}
+
+/// One deterministic normalized source chunk in an item upsert.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewIndexedSourceChunk {
+    /// Stable zero-based order within the item.
+    pub chunk_index: i32,
+    /// Inclusive Unicode-scalar offset in the normalized source text.
+    pub start_char: i64,
+    /// Exclusive Unicode-scalar offset in the normalized source text.
+    pub end_char: i64,
+    /// Bounded normalized untrusted source text.
+    pub content: String,
+    /// Domain-separated chunk hash.
+    pub content_hash: [u8; 32],
+}
+
+impl std::fmt::Debug for NewIndexedSourceChunk {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewIndexedSourceChunk")
+            .field("chunk_index", &self.chunk_index)
+            .field("start_char", &self.start_char)
+            .field("end_char", &self.end_char)
+            .field("content_redacted", &true)
+            .field("content_characters", &self.content.chars().count())
+            .finish()
+    }
+}
+
+/// One complete source item, chunk, and positive ACL replacement.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewIndexedSourceItem {
+    /// Immutable provider-side item identifier.
+    pub external_item_id: String,
+    /// Exact current provider version.
+    pub remote_version: String,
+    /// Optional current provider ETag.
+    pub remote_etag: Option<String>,
+    /// Citation title.
+    pub title: String,
+    /// Closed source kind.
+    pub source_kind: IndexedSourceKind,
+    /// Provider modification time.
+    pub modified_at: DateTime<Utc>,
+    /// Stable provider link.
+    pub resolvable_link: String,
+    /// Complete current positive ACL set.
+    pub acls: Vec<NewSourceAclPrincipal>,
+    /// Deterministic chunks. Empty ACLs require empty chunks.
+    pub chunks: Vec<NewIndexedSourceChunk>,
+}
+
+impl std::fmt::Debug for NewIndexedSourceItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewIndexedSourceItem")
+            .field("source_kind", &self.source_kind)
+            .field("acl_count", &self.acls.len())
+            .field("chunk_count", &self.chunks.len())
+            .field("metadata_and_content_redacted", &true)
+            .finish()
+    }
+}
+
+/// Provider item whose active ACL and index material must be removed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewSourceTombstone {
+    /// Immutable provider-side item identifier.
+    pub external_item_id: String,
+}
+
+impl std::fmt::Debug for NewSourceTombstone {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewSourceTombstone")
+            .field("external_item_id_redacted", &true)
+            .finish()
+    }
+}
+
+/// One fenced source change page committed with its encrypted cursor.
+#[derive(Clone, Copy)]
+pub struct NewSourceChangePage<'a> {
+    /// Server-resolved tenant embedded as the leading page authority.
+    pub community_id: CommunityId,
+    /// Connector account boundary.
+    pub account_id: Uuid,
+    /// Approved source scope boundary.
+    pub scope_id: Uuid,
+    /// Closed connector provider expected on the account.
+    pub provider: ExternalConnector,
+    /// Preconfigured stream name.
+    pub stream: &'a str,
+    /// Worker holding the current fenced cursor lease.
+    pub worker_id: Uuid,
+    /// Current fenced lease generation.
+    pub lease_generation: i64,
+    /// Current cursor integrity hash expected by this page.
+    pub expected_cursor_integrity_hash: &'a [u8],
+    /// Next application-encrypted cursor bytes.
+    pub next_encrypted_cursor: &'a [u8],
+    /// Integrity hash for the next cursor bytes.
+    pub next_cursor_integrity_hash: &'a [u8],
+    /// Encryption key version for the next cursor.
+    pub next_cursor_key_version: i32,
+    /// Deterministic digest of the complete page and remote checkpoint.
+    pub page_digest: &'a [u8],
+    /// Complete item replacements.
+    pub upserts: &'a [NewIndexedSourceItem],
+    /// Item tombstones.
+    pub tombstones: &'a [NewSourceTombstone],
+    /// Explicit database-comparable application time.
+    pub now: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for NewSourceChangePage<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewSourceChangePage")
+            .field("provider", &self.provider)
+            .field("upsert_count", &self.upserts.len())
+            .field("tombstone_count", &self.tombstones.len())
+            .field("authority_cursor_and_content_redacted", &true)
+            .finish()
+    }
+}
+
+/// Durable source-page application outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePageApplyOutcome {
+    /// Item changes and cursor committed together.
+    Applied {
+        /// Number of item identities in the page.
+        changed_items: usize,
+    },
+    /// The exact next cursor was already committed, so no changes were replayed.
+    AlreadyApplied,
 }
 
 /// Closed feed priority mapping persisted as 0=low through 3=urgent.
@@ -816,7 +1116,7 @@ impl DeltaLeaseDecision {
 }
 
 /// Claimed encrypted cursor and fencing generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeltaLeaseClaim {
     /// Application-encrypted cursor bytes.
     pub encrypted_cursor: Vec<u8>,
@@ -830,13 +1130,34 @@ pub struct DeltaLeaseClaim {
     pub lease_until: DateTime<Utc>,
 }
 
+impl std::fmt::Debug for DeltaLeaseClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeltaLeaseClaim")
+            .field("encrypted_cursor_and_integrity_redacted", &true)
+            .field("cursor_bytes", &self.encrypted_cursor.len())
+            .field("cursor_key_version", &self.cursor_key_version)
+            .field("generation", &self.generation)
+            .field("lease_until", &self.lease_until)
+            .finish()
+    }
+}
+
 /// Positive-ACL-filtered citation result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SourceCitationRecord {
     /// Local source item identifier.
     pub item_id: Uuid,
     /// Local source chunk identifier.
     pub chunk_id: Uuid,
+    /// Connector account identifier used in the stable authority key.
+    pub account_id: Uuid,
+    /// Approved source scope used in the stable authority key.
+    pub scope_id: Uuid,
+    /// Immutable provider-side item identifier.
+    pub external_item_id: String,
+    /// Closed connector provider.
+    pub provider: String,
     /// Source title.
     pub title: String,
     /// Typed source kind.
@@ -847,15 +1168,122 @@ pub struct SourceCitationRecord {
     pub resolvable_link: String,
     /// Provider version used for authorization rechecks.
     pub remote_version: String,
+    /// Optional provider ETag used for authorization rechecks.
+    pub remote_etag: Option<String>,
     /// Chunk hash used for post-ranking citation checks.
     pub chunk_hash: Vec<u8>,
+    /// Exact active local embedding version used for the retrieval.
+    pub embedding_version_id: Uuid,
+    /// Inclusive Unicode-scalar offset in normalized source text.
+    pub start_char: i64,
+    /// Exclusive Unicode-scalar offset in normalized source text.
+    pub end_char: i64,
+}
+
+impl std::fmt::Debug for SourceCitationRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceCitationRecord")
+            .field("provider", &self.provider)
+            .field("source_type", &self.source_type)
+            .field("metadata_and_identifiers_redacted", &true)
+            .finish()
+    }
+}
+
+/// One ranked source candidate to re-read after ranking and before disclosure.
+#[derive(Clone, Copy)]
+pub struct SourceCandidateRecheckRequest<'a> {
+    /// Candidate item returned by the pre-authorized rank query.
+    pub item_id: Uuid,
+    /// Candidate chunk returned by the pre-authorized rank query.
+    pub chunk_id: Uuid,
+    /// Exact remote version returned by the rank query.
+    pub remote_version: &'a str,
+    /// Exact optional ETag returned by the rank query.
+    pub remote_etag: Option<&'a str>,
+    /// Exact chunk hash returned by the rank query.
+    pub chunk_hash: &'a [u8],
+    /// Exact active local embedding version returned by the rank query.
+    pub embedding_version_id: Uuid,
+    /// Authenticated requesting user's Buzz public key.
+    pub requester_pubkey: &'a [u8],
+    /// Request-local channels resolved by the server; membership is rejoined.
+    pub authorized_channel_ids: &'a [Uuid],
+}
+
+impl std::fmt::Debug for SourceCandidateRecheckRequest<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceCandidateRecheckRequest")
+            .field("candidate_and_audience_redacted", &true)
+            .field("channel_count", &self.authorized_channel_ids.len())
+            .finish()
+    }
+}
+
+/// Source content returned only after a fresh lifecycle/version/ACL recheck.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthorizedSourceExcerptRecord {
+    /// Local source item identifier.
+    pub item_id: Uuid,
+    /// Local source chunk identifier.
+    pub chunk_id: Uuid,
+    /// Connector account identifier.
+    pub account_id: Uuid,
+    /// Approved source scope identifier.
+    pub scope_id: Uuid,
+    /// Immutable provider item identifier.
+    pub external_item_id: String,
+    /// Closed connector provider.
+    pub provider: String,
+    /// Citation title.
+    pub title: String,
+    /// Typed source kind.
+    pub source_type: String,
+    /// Provider modification time.
+    pub modified_at: DateTime<Utc>,
+    /// Stable provider source link.
+    pub resolvable_link: String,
+    /// Exact provider version rechecked after ranking.
+    pub remote_version: String,
+    /// Optional provider ETag rechecked after ranking.
+    pub remote_etag: Option<String>,
+    /// Exact chunk hash rechecked after ranking.
+    pub chunk_hash: Vec<u8>,
+    /// Exact local embedding version rechecked before disclosure.
+    pub embedding_version_id: Uuid,
+    /// Inclusive Unicode-scalar offset in normalized source text.
+    pub start_char: i64,
+    /// Exclusive Unicode-scalar offset in normalized source text.
+    pub end_char: i64,
+    /// Authorized source chunk content.
+    pub content: String,
+    /// Hash of the complete current positive ACL set.
+    pub acl_revision: Vec<u8>,
+    /// Database timestamp of the authorization recheck.
+    pub authorization_checked_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for AuthorizedSourceExcerptRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedSourceExcerptRecord")
+            .field("provider", &self.provider)
+            .field("source_type", &self.source_type)
+            .field("content_and_metadata_redacted", &true)
+            .field("content_characters", &self.content.chars().count())
+            .finish()
+    }
 }
 
 /// Full-text source retrieval request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SourceSearchRequest<'a> {
     /// Full-text query.
     pub query: &'a str,
+    /// Required active local embedding version for this hybrid retrieval.
+    pub embedding_version_id: Uuid,
     /// Requesting user's Buzz public key.
     pub requester_pubkey: &'a [u8],
     /// Explicitly authorized request-local channels.
@@ -864,8 +1292,20 @@ pub struct SourceSearchRequest<'a> {
     pub limit: i64,
 }
 
+impl std::fmt::Debug for SourceSearchRequest<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceSearchRequest")
+            .field("query_and_audience_redacted", &true)
+            .field("query_characters", &self.query.chars().count())
+            .field("channel_count", &self.authorized_channel_ids.len())
+            .field("limit", &self.limit)
+            .finish()
+    }
+}
+
 /// Local-vector source retrieval request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SourceVectorSearchRequest<'a> {
     /// Exactly 384 local embedding values.
     pub embedding: &'a [f32],
@@ -877,6 +1317,18 @@ pub struct SourceVectorSearchRequest<'a> {
     pub authorized_channel_ids: &'a [Uuid],
     /// Maximum returned citations.
     pub limit: i64,
+}
+
+impl std::fmt::Debug for SourceVectorSearchRequest<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceVectorSearchRequest")
+            .field("embedding_and_audience_redacted", &true)
+            .field("embedding_dimensions", &self.embedding.len())
+            .field("channel_count", &self.authorized_channel_ids.len())
+            .field("limit", &self.limit)
+            .finish()
+    }
 }
 
 /// Closed protocol set of learnable domains; policy and permissions are absent.

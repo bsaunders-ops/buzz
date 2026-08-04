@@ -27,6 +27,7 @@ members = [
     "crates/buzz-relay-mesh",
     "crates/buzz-dev-mcp",
     "crates/buzz-voice",
+    "crates/buzz-connector-core",
     "crates/buzz-backend-kubernetes",
     "examples/countdown-bot",
 ]
@@ -132,6 +133,7 @@ schemars = { version = "1", default-features = false }
 
 # Internal crates
 buzz-core = { path = "crates/buzz-core" }
+buzz-connector-core = { path = "crates/buzz-connector-core" }
 buzz-conformance = { path = "crates/buzz-conformance" }
 buzz-db = { path = "crates/buzz-db" }
 buzz-auth = { path = "crates/buzz-auth" }

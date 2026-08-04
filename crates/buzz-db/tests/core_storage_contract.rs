@@ -3,15 +3,19 @@ use std::time::Duration as StdDuration;
 use buzz_core::CommunityId;
 use buzz_db::core_storage::{
     action_member_hash, action_member_operation_hash, action_operation_hash,
-    action_ordered_members_hash, append_audit_entry, claim_action_execution,
-    claim_audit_export_batch, claim_delta_scope, claim_insight_slot, complete_audit_export_batch,
-    complete_delta_scope, fail_delta_scope, insert_action_proposal,
-    mark_action_timeout_for_reconciliation, retry_audit_export_batch, search_source_chunks,
-    search_source_chunks_by_embedding, ActionClaimDecision, ActionMemberHashInput,
-    ActionProposalStatus, AuditEntityType, AuditEnvelope, AuditEventType, AuditObjectVersion,
-    AuditOutcome, DeltaLeaseDecision, ExternalConnector, ExternalOperation, InsightClaimDecision,
-    InsightClaimOutcome, InsightPriority, NewAssistantInsight, NewExternalActionProposal,
-    NewExternalActionProposalItem, SourceSearchRequest, SourceVectorSearchRequest,
+    action_ordered_members_hash, append_audit_entry, apply_source_change_page,
+    claim_action_execution, claim_audit_export_batch, claim_delta_scope, claim_insight_slot,
+    complete_audit_export_batch, complete_delta_scope, fail_delta_scope, insert_action_proposal,
+    mark_action_timeout_for_reconciliation, recheck_source_chunk, retry_audit_export_batch,
+    search_source_chunks, search_source_chunks_by_embedding, source_chunk_hash,
+    ActionClaimDecision, ActionMemberHashInput, ActionProposalStatus, ApprovedSourceScopeRecord,
+    AuditEntityType, AuditEnvelope, AuditEventType, AuditObjectVersion, AuditOutcome,
+    ConnectorAccountRecord, DeltaLeaseClaim, DeltaLeaseDecision, ExternalConnector,
+    ExternalOperation, IndexedSourceKind, InsightClaimDecision, InsightClaimOutcome,
+    InsightPriority, KeyVaultSecretName, NewAssistantInsight, NewExternalActionProposal,
+    NewExternalActionProposalItem, NewIndexedSourceChunk, NewIndexedSourceItem,
+    NewSourceAclPrincipal, NewSourceChangePage, NewSourceTombstone, SourceCandidateRecheckRequest,
+    SourceItemAclRecord, SourcePageApplyOutcome, SourceSearchRequest, SourceVectorSearchRequest,
 };
 use chrono::{Duration, NaiveDate, Utc};
 use sqlx::{PgPool, Row};
@@ -154,13 +158,13 @@ async fn seed_source(
     .expect("insert source item");
     sqlx::query(
         "INSERT INTO source_chunks \
-         (community_id, id, item_id, chunk_index, content, content_hash) \
-         VALUES ($1, $2, $3, 0, 'needle confidential evidence', $4)",
+         (community_id, id, item_id, chunk_index, start_char, end_char, content, content_hash) \
+         VALUES ($1, $2, $3, 0, 0, 28, 'needle confidential evidence', $4)",
     )
     .bind(community.as_uuid())
     .bind(chunk_id)
     .bind(item_id)
-    .bind(vec![9_u8; 32])
+    .bind(source_chunk_hash(0, 0, 28, "needle confidential evidence").to_vec())
     .execute(pool)
     .await
     .expect("insert source chunk");
@@ -177,6 +181,36 @@ async fn seed_source(
     .await
     .expect("insert source ACL");
     (account_id, scope_id, chunk_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn microsoft_resolver_page<'a>(
+    community_id: CommunityId,
+    account_id: Uuid,
+    scope_id: Uuid,
+    worker_id: Uuid,
+    lease_generation: i64,
+    upserts: &'a [NewIndexedSourceItem],
+    page_digest: &'a [u8],
+    now: chrono::DateTime<Utc>,
+) -> NewSourceChangePage<'a> {
+    NewSourceChangePage {
+        community_id,
+        account_id,
+        scope_id,
+        provider: ExternalConnector::MicrosoftGraph,
+        stream: "changes",
+        worker_id,
+        lease_generation,
+        expected_cursor_integrity_hash: &[4_u8; 32],
+        next_encrypted_cursor: &[5_u8; 48],
+        next_cursor_integrity_hash: &[5_u8; 32],
+        next_cursor_key_version: 1,
+        page_digest,
+        upserts,
+        tombstones: &[],
+        now,
+    }
 }
 
 #[tokio::test]
@@ -407,6 +441,66 @@ fn operation_and_audit_categories_reject_open_ended_values() {
     assert!(AuditObjectVersion::new("mailbox body with spaces").is_err());
 }
 
+#[test]
+fn connector_storage_debug_output_redacts_cursors_and_authority_ids() {
+    let sensitive_id =
+        Uuid::parse_str("feedface-dead-beef-cafe-0123456789ab").expect("valid sentinel UUID");
+    let claim = DeltaLeaseClaim {
+        encrypted_cursor: b"MNPI-CURSOR-SENTINEL".to_vec(),
+        cursor_integrity_hash: vec![77; 32],
+        cursor_key_version: 1,
+        generation: 2,
+        lease_until: Utc::now(),
+    };
+    let acl = SourceItemAclRecord {
+        community_id: CommunityId::from_uuid(sensitive_id),
+        id: sensitive_id,
+        item_id: sensitive_id,
+        principal_type: "user".into(),
+        principal_pubkey: Some(vec![77; 32]),
+        channel_id: None,
+    };
+    let new_acl = NewSourceAclPrincipal::Channel(sensitive_id);
+    let credential_reference =
+        KeyVaultSecretName::new("MNPI-CREDENTIAL-SENTINEL").expect("valid secret name");
+    let account = ConnectorAccountRecord {
+        community_id: CommunityId::from_uuid(sensitive_id),
+        id: sensitive_id,
+        provider: "google_drive".into(),
+        owner_pubkey: vec![77; 32],
+        external_account_id: "MNPI-ACCOUNT-SENTINEL".into(),
+        credential_reference: credential_reference.clone(),
+        status: "active".into(),
+    };
+    let scope = ApprovedSourceScopeRecord {
+        community_id: CommunityId::from_uuid(sensitive_id),
+        id: sensitive_id,
+        account_id: sensitive_id,
+        external_scope_id: "MNPI-SCOPE-SENTINEL".into(),
+        resolver_hosts: vec!["mnpi-host-sentinel.sharepoint.com".into()],
+        scope_type: "google_shared_drive".into(),
+        can_read: true,
+        can_write: false,
+        active_deal_pinned: false,
+        status: "active".into(),
+    };
+    for debug in [
+        format!("{claim:?}"),
+        format!("{acl:?}"),
+        format!("{new_acl:?}"),
+        format!("{credential_reference:?}"),
+        format!("{account:?}"),
+        format!("{scope:?}"),
+    ] {
+        assert!(!debug.contains("MNPI-CURSOR-SENTINEL"));
+        assert!(!debug.contains("MNPI-CREDENTIAL-SENTINEL"));
+        assert!(!debug.contains("MNPI-ACCOUNT-SENTINEL"));
+        assert!(!debug.contains("MNPI-SCOPE-SENTINEL"));
+        assert!(!debug.contains("feedface"));
+        assert!(!debug.contains("77, 77"));
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires Postgres with pgvector"]
 async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search() {
@@ -442,6 +536,16 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
     .execute(&pool)
     .await
     .expect("insert embedding version");
+    assert!(sqlx::query(
+        "INSERT INTO embedding_versions \
+         (community_id, id, model_name, dimensions, version, status, activated_at) \
+         VALUES ($1, $2, 'acl-contract', 384, 2, 'active', NOW())",
+    )
+    .bind(community_a.as_uuid())
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .is_err());
     let embedding = vec![1.0_f32; 384];
     let embedding_literal = format!(
         "[{}]",
@@ -468,6 +572,7 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
         community_a,
         SourceSearchRequest {
             query: "needle",
+            embedding_version_id: embedding_version,
             requester_pubkey: &allowed_user,
             authorized_channel_ids: &[channel_a],
             limit: 10,
@@ -478,12 +583,241 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
     assert_eq!(allowed.len(), 1);
     assert_eq!(allowed[0].item_id, shared_item_id);
     assert_eq!(allowed[0].title, format!("Needle {shared_item_id}"));
+    let ranked = allowed[0].clone();
+    let rechecked = recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("post-rank source recheck")
+    .expect("unchanged user ACL remains authorized");
+    assert_eq!(rechecked.content, "needle confidential evidence");
+    assert_eq!((rechecked.start_char, rechecked.end_char), (0, 28));
+    assert_eq!(rechecked.provider, "microsoft_graph");
+    assert_eq!(rechecked.acl_revision.len(), 32);
+    assert!(recheck_source_chunk(
+        &pool,
+        community_b,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("cross-tenant post-rank recheck")
+    .is_none());
+
+    sqlx::query(
+        "DELETE FROM source_item_acls \
+         WHERE community_id=$1 AND item_id=$2 AND principal_type='user' AND principal_pubkey=$3",
+    )
+    .bind(community_a.as_uuid())
+    .bind(shared_item_id)
+    .bind(&allowed_user)
+    .execute(&pool)
+    .await
+    .expect("revoke user ACL after ranking");
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("post-rank revocation recheck")
+    .is_none());
+    sqlx::query(
+        "INSERT INTO source_item_acls \
+         (community_id, id, item_id, principal_type, principal_pubkey) \
+         VALUES ($1, $2, $3, 'user', $4)",
+    )
+    .bind(community_a.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(shared_item_id)
+    .bind(&allowed_user)
+    .execute(&pool)
+    .await
+    .expect("restore user ACL for remaining contract checks");
+
+    sqlx::query("UPDATE source_items SET remote_version='v2' WHERE community_id=$1 AND id=$2")
+        .bind(community_a.as_uuid())
+        .bind(shared_item_id)
+        .execute(&pool)
+        .await
+        .expect("change provider version after ranking");
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("changed-version recheck")
+    .is_none());
+    sqlx::query("UPDATE source_items SET remote_version='v1' WHERE community_id=$1 AND id=$2")
+        .bind(community_a.as_uuid())
+        .bind(shared_item_id)
+        .execute(&pool)
+        .await
+        .expect("restore provider version");
+
+    sqlx::query("UPDATE source_items SET remote_etag='etag-v1' WHERE community_id=$1 AND id=$2")
+        .bind(community_a.as_uuid())
+        .bind(shared_item_id)
+        .execute(&pool)
+        .await
+        .expect("change provider etag after ranking");
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("changed-etag recheck")
+    .is_none());
+    sqlx::query("UPDATE source_items SET remote_etag=NULL WHERE community_id=$1 AND id=$2")
+        .bind(community_a.as_uuid())
+        .bind(shared_item_id)
+        .execute(&pool)
+        .await
+        .expect("restore provider etag");
+
+    sqlx::query("UPDATE source_chunks SET content_hash=$3 WHERE community_id=$1 AND id=$2")
+        .bind(community_a.as_uuid())
+        .bind(ranked.chunk_id)
+        .bind(vec![10_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("replace chunk hash after ranking");
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("changed-chunk recheck")
+    .is_none());
+    sqlx::query("UPDATE source_chunks SET content_hash=$3 WHERE community_id=$1 AND id=$2")
+        .bind(community_a.as_uuid())
+        .bind(ranked.chunk_id)
+        .bind(&ranked.chunk_hash)
+        .execute(&pool)
+        .await
+        .expect("restore chunk hash");
+
+    sqlx::query("UPDATE source_chunks SET content='needle corrupted evidence' WHERE community_id=$1 AND id=$2")
+        .bind(community_a.as_uuid())
+        .bind(ranked.chunk_id)
+        .execute(&pool)
+        .await
+        .expect("corrupt source content without its hash");
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .is_err());
+    sqlx::query(
+        "UPDATE source_chunks SET content='needle confidential evidence', start_char=1, end_char=29 \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community_a.as_uuid())
+    .bind(ranked.chunk_id)
+    .execute(&pool)
+    .await
+    .expect("corrupt Unicode-scalar source offsets");
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .is_err());
+    sqlx::query(
+        "UPDATE source_chunks SET start_char=0, end_char=28 \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community_a.as_uuid())
+    .bind(ranked.chunk_id)
+    .execute(&pool)
+    .await
+    .expect("restore source chunk offsets");
 
     let denied = search_source_chunks(
         &pool,
         community_a,
         SourceSearchRequest {
             query: "needle",
+            embedding_version_id: embedding_version,
             requester_pubkey: &denied_user,
             authorized_channel_ids: &[],
             limit: 10,
@@ -500,6 +834,7 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
         community_a,
         SourceSearchRequest {
             query: "needle",
+            embedding_version_id: embedding_version,
             requester_pubkey: &denied_user,
             authorized_channel_ids: &[channel_a],
             limit: 10,
@@ -547,6 +882,7 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
             community_a,
             SourceSearchRequest {
                 query: "needle",
+                embedding_version_id: embedding_version,
                 requester_pubkey: &denied_user,
                 authorized_channel_ids: &[channel_a],
                 limit: 10,
@@ -574,12 +910,100 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
         .len(),
         1
     );
+    sqlx::query(
+        "UPDATE embedding_versions SET status='retired', retired_at=NOW() \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community_a.as_uuid())
+    .bind(embedding_version)
+    .execute(&pool)
+    .await
+    .expect("retire embedding version");
+    assert!(search_source_chunks_by_embedding(
+        &pool,
+        community_a,
+        SourceVectorSearchRequest {
+            embedding: &embedding,
+            embedding_version_id: embedding_version,
+            requester_pubkey: &denied_user,
+            authorized_channel_ids: &[channel_a],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("vector search retired model version")
+    .is_empty());
+    assert!(search_source_chunks(
+        &pool,
+        community_a,
+        SourceSearchRequest {
+            query: "needle",
+            embedding_version_id: embedding_version,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("full-text search retired model version")
+    .is_empty());
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("post-rank retired model recheck")
+    .is_none());
+    sqlx::query(
+        "UPDATE embedding_versions \
+         SET status='building', activated_at=NULL, retired_at=NULL \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community_a.as_uuid())
+    .bind(embedding_version)
+    .execute(&pool)
+    .await
+    .expect("mark embedding version building");
+    assert!(search_source_chunks(
+        &pool,
+        community_a,
+        SourceSearchRequest {
+            query: "needle",
+            embedding_version_id: embedding_version,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+            limit: 10,
+        },
+    )
+    .await
+    .expect("full-text search building model version")
+    .is_empty());
+    sqlx::query(
+        "UPDATE embedding_versions SET status='active', activated_at=NOW(), retired_at=NULL \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community_a.as_uuid())
+    .bind(embedding_version)
+    .execute(&pool)
+    .await
+    .expect("restore active embedding version");
     assert!(
         search_source_chunks(
             &pool,
             community_a,
             SourceSearchRequest {
                 query: "needle",
+                embedding_version_id: embedding_version,
                 requester_pubkey: &denied_user,
                 authorized_channel_ids: &[],
                 limit: 10,
@@ -606,6 +1030,7 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
             community_a,
             SourceSearchRequest {
                 query: "needle",
+                embedding_version_id: embedding_version,
                 requester_pubkey: &denied_user,
                 authorized_channel_ids: &[channel_a],
                 limit: 10,
@@ -630,6 +1055,23 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
     .await
     .expect("vector search removed channel member")
     .is_empty());
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &denied_user,
+            authorized_channel_ids: &[channel_a],
+        },
+    )
+    .await
+    .expect("removed channel member post-rank recheck")
+    .is_none());
 
     sqlx::query("UPDATE source_items SET tombstoned_at=NOW() WHERE community_id=$1 AND id=$2")
         .bind(community_a.as_uuid())
@@ -642,6 +1084,7 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
         community_a,
         SourceSearchRequest {
             query: "needle",
+            embedding_version_id: embedding_version,
             requester_pubkey: &allowed_user,
             authorized_channel_ids: &[],
             limit: 10,
@@ -650,6 +1093,23 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
     .await
     .expect("search tombstoned source")
     .is_empty());
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("tombstoned post-rank recheck")
+    .is_none());
 
     sqlx::query("UPDATE source_items SET tombstoned_at=NULL WHERE community_id=$1 AND id=$2")
         .bind(community_a.as_uuid())
@@ -665,11 +1125,23 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
         .execute(&pool)
         .await
         .expect("revoke source scope");
+    let purged_projection: (i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM source_chunks WHERE community_id=$1 AND item_id=$2), \
+           (SELECT count(*) FROM source_item_acls WHERE community_id=$1 AND item_id=$2)",
+    )
+    .bind(community_a.as_uuid())
+    .bind(shared_item_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect physical scope-revocation purge");
+    assert_eq!(purged_projection, (0, 0));
     assert!(search_source_chunks(
         &pool,
         community_a,
         SourceSearchRequest {
             query: "needle",
+            embedding_version_id: embedding_version,
             requester_pubkey: &allowed_user,
             authorized_channel_ids: &[],
             limit: 10,
@@ -678,6 +1150,104 @@ async fn cross_community_collisions_are_safe_and_acl_filtering_precedes_search()
     .await
     .expect("search revoked scope")
     .is_empty());
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("revoked-scope post-rank recheck")
+    .is_none());
+    sqlx::query(
+        "UPDATE approved_source_scopes SET status='active', revoked_at=NULL \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community_a.as_uuid())
+    .bind(scope_a)
+    .execute(&pool)
+    .await
+    .expect("restore source scope");
+    sqlx::query(
+        "UPDATE source_items SET status='active', tombstoned_at=NULL \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community_a.as_uuid())
+    .bind(shared_item_id)
+    .execute(&pool)
+    .await
+    .expect("prepare account-revocation purge fixture");
+    let account_purge_chunk = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO source_chunks \
+         (community_id, id, item_id, chunk_index, start_char, end_char, content, content_hash) \
+         VALUES ($1, $2, $3, 0, 0, 28, 'needle confidential evidence', $4)",
+    )
+    .bind(community_a.as_uuid())
+    .bind(account_purge_chunk)
+    .bind(shared_item_id)
+    .bind(source_chunk_hash(0, 0, 28, "needle confidential evidence").to_vec())
+    .execute(&pool)
+    .await
+    .expect("reindex source before account revocation");
+    sqlx::query(
+        "INSERT INTO source_item_acls \
+         (community_id, id, item_id, principal_type, principal_pubkey) \
+         VALUES ($1, $2, $3, 'user', $4)",
+    )
+    .bind(community_a.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(shared_item_id)
+    .bind(&allowed_user)
+    .execute(&pool)
+    .await
+    .expect("restore ACL before account revocation");
+    let account_a = ranked.account_id;
+    sqlx::query(
+        "UPDATE connector_accounts SET status='revoked', revoked_at=NOW() \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community_a.as_uuid())
+    .bind(account_a)
+    .execute(&pool)
+    .await
+    .expect("revoke connector account after ranking");
+    assert!(recheck_source_chunk(
+        &pool,
+        community_a,
+        SourceCandidateRecheckRequest {
+            item_id: ranked.item_id,
+            chunk_id: ranked.chunk_id,
+            remote_version: &ranked.remote_version,
+            remote_etag: ranked.remote_etag.as_deref(),
+            chunk_hash: &ranked.chunk_hash,
+            embedding_version_id: ranked.embedding_version_id,
+            requester_pubkey: &allowed_user,
+            authorized_channel_ids: &[],
+        },
+    )
+    .await
+    .expect("revoked-account post-rank recheck")
+    .is_none());
+    let account_purged: (i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM source_chunks WHERE community_id=$1 AND item_id=$2), \
+           (SELECT count(*) FROM source_item_acls WHERE community_id=$1 AND item_id=$2)",
+    )
+    .bind(community_a.as_uuid())
+    .bind(shared_item_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect physical account-revocation purge");
+    assert_eq!(account_purged, (0, 0));
 
     drop_scratch_db(&admin, pool, &name).await;
 }
@@ -1633,6 +2203,383 @@ async fn action_claims_execute_once_and_timeout_enters_reconciliation() {
             .expect("claim after timeout")
             .is_none(),
         "a timeout must not reopen a blind retry"
+    );
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, _) = seed_community(&pool, "source-page").await;
+    let account_id = Uuid::new_v4();
+    let scope_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO connector_accounts \
+         (community_id, id, provider, owner_pubkey, external_account_id, credential_reference) \
+         VALUES ($1, $2, 'google_drive', $3, $4, $5)",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(vec![3_u8; 32])
+    .bind(format!("account-{account_id}"))
+    .bind(format!("kv-account-{account_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert page connector account");
+    sqlx::query(
+        "INSERT INTO approved_source_scopes \
+         (community_id, id, account_id, external_scope_id, scope_type, can_read, can_write) \
+         VALUES ($1, $2, $3, $4, 'google_shared_drive', true, false)",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .bind(account_id)
+    .bind(format!("scope-{scope_id}"))
+    .execute(&pool)
+    .await
+    .expect("insert page source scope");
+    sqlx::query(
+        "INSERT INTO connector_delta_cursors \
+         (community_id, account_id, scope_id, stream, encrypted_cursor, \
+          cursor_integrity_hash, cursor_key_version) \
+         VALUES ($1, $2, $3, 'changes', $4, $5, 1)",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(scope_id)
+    .bind(vec![1_u8; 48])
+    .bind(vec![1_u8; 32])
+    .execute(&pool)
+    .await
+    .expect("insert page cursor");
+
+    let worker = Uuid::new_v4();
+    let now = Utc::now();
+    let lease = claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "changes",
+        worker,
+        now,
+        StdDuration::from_secs(60),
+    )
+    .await
+    .expect("claim page cursor")
+    .expect("page cursor lease");
+    let upserts = vec![NewIndexedSourceItem {
+        external_item_id: "drive-item-1".into(),
+        remote_version: "v1".into(),
+        remote_etag: Some("etag-v1".into()),
+        title: "Project Atlas notes".into(),
+        source_kind: IndexedSourceKind::Document,
+        modified_at: now,
+        resolvable_link: "https://drive.google.com/open?id=drive-item-1".into(),
+        acls: vec![NewSourceAclPrincipal::User([3_u8; 32])],
+        chunks: vec![NewIndexedSourceChunk {
+            chunk_index: 0,
+            start_char: 0,
+            end_char: 29,
+            content: "bounded untrusted source text".into(),
+            content_hash: source_chunk_hash(0, 0, 29, "bounded untrusted source text"),
+        }],
+    }];
+    let page = NewSourceChangePage {
+        community_id: community,
+        account_id,
+        scope_id,
+        provider: ExternalConnector::GoogleDrive,
+        stream: "changes",
+        worker_id: worker,
+        lease_generation: lease.generation,
+        expected_cursor_integrity_hash: &[1_u8; 32],
+        next_encrypted_cursor: &[2_u8; 48],
+        next_cursor_integrity_hash: &[2_u8; 32],
+        next_cursor_key_version: 1,
+        page_digest: &[4_u8; 32],
+        upserts: &upserts,
+        tombstones: &[],
+        now: now + Duration::seconds(1),
+    };
+    let (other_community, _) = seed_community(&pool, "source-page-other").await;
+    assert!(apply_source_change_page(&pool, other_community, page)
+        .await
+        .is_err());
+    assert_eq!(
+        apply_source_change_page(&pool, community, page)
+            .await
+            .expect("apply source page"),
+        SourcePageApplyOutcome::Applied { changed_items: 1 }
+    );
+    assert_eq!(
+        apply_source_change_page(&pool, community, page)
+            .await
+            .expect("replay source page"),
+        SourcePageApplyOutcome::AlreadyApplied
+    );
+    let mismatched_replay = NewSourceChangePage {
+        page_digest: &[99_u8; 32],
+        ..page
+    };
+    assert!(
+        apply_source_change_page(&pool, community, mismatched_replay)
+            .await
+            .is_err()
+    );
+    let projection: (i64, i64, Vec<u8>, Option<Uuid>, i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM source_chunks WHERE community_id=$1), \
+           (SELECT count(*) FROM source_item_acls WHERE community_id=$1), \
+           cursor_integrity_hash, lease_owner, \
+           (SELECT start_char FROM source_chunks WHERE community_id=$1 LIMIT 1), \
+           (SELECT end_char FROM source_chunks WHERE community_id=$1 LIMIT 1) \
+         FROM connector_delta_cursors \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream='changes'",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(scope_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect committed source page");
+    assert_eq!((projection.0, projection.1), (1, 1));
+    assert_eq!(projection.2, vec![2_u8; 32]);
+    assert_eq!(projection.3, None);
+    assert_eq!((projection.4, projection.5), (0, 29));
+
+    let second_worker = Uuid::new_v4();
+    let second_lease = claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "changes",
+        second_worker,
+        now + Duration::seconds(2),
+        StdDuration::from_secs(60),
+    )
+    .await
+    .expect("claim ACL replacement cursor")
+    .expect("ACL replacement cursor lease");
+    let replacement_upserts = vec![NewIndexedSourceItem {
+        external_item_id: "drive-item-1".into(),
+        remote_version: "v2".into(),
+        remote_etag: Some("etag-v2".into()),
+        title: "Project Atlas revised notes".into(),
+        source_kind: IndexedSourceKind::Document,
+        modified_at: now + Duration::seconds(2),
+        resolvable_link: "https://drive.google.com/open?id=drive-item-1".into(),
+        acls: vec![NewSourceAclPrincipal::User([4_u8; 32])],
+        chunks: vec![NewIndexedSourceChunk {
+            chunk_index: 0,
+            start_char: 0,
+            end_char: 11,
+            content: "replacement".into(),
+            content_hash: source_chunk_hash(0, 0, 11, "replacement"),
+        }],
+    }];
+    let replacement_page = NewSourceChangePage {
+        community_id: community,
+        account_id,
+        scope_id,
+        provider: ExternalConnector::GoogleDrive,
+        stream: "changes",
+        worker_id: second_worker,
+        lease_generation: second_lease.generation,
+        expected_cursor_integrity_hash: &[2_u8; 32],
+        next_encrypted_cursor: &[3_u8; 48],
+        next_cursor_integrity_hash: &[3_u8; 32],
+        next_cursor_key_version: 1,
+        page_digest: &[5_u8; 32],
+        upserts: &replacement_upserts,
+        tombstones: &[],
+        now: now + Duration::seconds(3),
+    };
+    assert_eq!(
+        apply_source_change_page(&pool, community, replacement_page)
+            .await
+            .expect("replace item ACL and source version"),
+        SourcePageApplyOutcome::Applied { changed_items: 1 }
+    );
+    assert_eq!(
+        apply_source_change_page(&pool, community, replacement_page)
+            .await
+            .expect("replay ACL replacement"),
+        SourcePageApplyOutcome::AlreadyApplied
+    );
+    let replacement: (i64, i64, String, String) = sqlx::query_as(
+        "SELECT \
+           count(*) FILTER (WHERE acl.principal_pubkey=$2), \
+           count(*) FILTER (WHERE acl.principal_pubkey=$3), \
+           min(item.remote_version), min(chunk.content) \
+         FROM source_items item \
+         JOIN source_item_acls acl ON acl.community_id=item.community_id AND acl.item_id=item.id \
+         JOIN source_chunks chunk ON chunk.community_id=item.community_id AND chunk.item_id=item.id \
+         WHERE item.community_id=$1 AND item.external_item_id='drive-item-1'",
+    )
+    .bind(community.as_uuid())
+    .bind(vec![3_u8; 32])
+    .bind(vec![4_u8; 32])
+    .fetch_one(&pool)
+    .await
+    .expect("inspect complete ACL and source replacement");
+    assert_eq!(replacement, (0, 1, "v2".into(), "replacement".into()));
+
+    let third_worker = Uuid::new_v4();
+    let third_lease = claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "changes",
+        third_worker,
+        now + Duration::seconds(4),
+        StdDuration::from_secs(60),
+    )
+    .await
+    .expect("claim tombstone cursor")
+    .expect("tombstone cursor lease");
+    let tombstones = vec![NewSourceTombstone {
+        external_item_id: "drive-item-1".into(),
+    }];
+    let tombstone_page = NewSourceChangePage {
+        community_id: community,
+        account_id,
+        scope_id,
+        provider: ExternalConnector::GoogleDrive,
+        stream: "changes",
+        worker_id: third_worker,
+        lease_generation: third_lease.generation,
+        expected_cursor_integrity_hash: &[3_u8; 32],
+        next_encrypted_cursor: &[4_u8; 48],
+        next_cursor_integrity_hash: &[4_u8; 32],
+        next_cursor_key_version: 1,
+        page_digest: &[6_u8; 32],
+        upserts: &[],
+        tombstones: &tombstones,
+        now: now + Duration::seconds(5),
+    };
+    assert_eq!(
+        apply_source_change_page(&pool, community, tombstone_page)
+            .await
+            .expect("apply tombstone page"),
+        SourcePageApplyOutcome::Applied { changed_items: 1 }
+    );
+    assert_eq!(
+        apply_source_change_page(&pool, community, tombstone_page)
+            .await
+            .expect("replay tombstone page"),
+        SourcePageApplyOutcome::AlreadyApplied
+    );
+    let removed: (i64, i64, bool) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM source_chunks WHERE community_id=$1), \
+           (SELECT count(*) FROM source_item_acls WHERE community_id=$1), \
+           EXISTS (SELECT 1 FROM source_items \
+                   WHERE community_id=$1 AND external_item_id='drive-item-1' \
+                     AND tombstoned_at IS NOT NULL AND status='unavailable')",
+    )
+    .bind(community.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .expect("inspect tombstoned source page");
+    assert_eq!(removed, (0, 0, true));
+    assert!(apply_source_change_page(&pool, community, page)
+        .await
+        .is_err());
+
+    sqlx::query(
+        "UPDATE connector_accounts SET provider='microsoft_graph' \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("switch fixture to Microsoft provider");
+    sqlx::query(
+        "UPDATE approved_source_scopes SET resolver_hosts=ARRAY['coreadvs.sharepoint.com'] \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(scope_id)
+    .execute(&pool)
+    .await
+    .expect("configure exact SharePoint resolver host");
+    let fourth_worker = Uuid::new_v4();
+    let fourth_lease = claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "changes",
+        fourth_worker,
+        now + Duration::seconds(6),
+        StdDuration::from_secs(60),
+    )
+    .await
+    .expect("claim Microsoft authority cursor")
+    .expect("Microsoft authority cursor lease");
+    let sharepoint_item = |link: &str| NewIndexedSourceItem {
+        external_item_id: "onedrive-item-1".into(),
+        remote_version: "v1".into(),
+        remote_etag: Some("etag-v1".into()),
+        title: "Selected OneDrive source".into(),
+        source_kind: IndexedSourceKind::Document,
+        modified_at: now,
+        resolvable_link: link.into(),
+        acls: vec![NewSourceAclPrincipal::User([3_u8; 32])],
+        chunks: vec![NewIndexedSourceChunk {
+            chunk_index: 0,
+            start_char: 0,
+            end_char: 9,
+            content: "authority".into(),
+            content_hash: source_chunk_hash(0, 0, 9, "authority"),
+        }],
+    };
+    let attacker_items = [sharepoint_item(
+        "https://attacker.sharepoint.com/sites/deals/file",
+    )];
+    assert!(apply_source_change_page(
+        &pool,
+        community,
+        microsoft_resolver_page(
+            community,
+            account_id,
+            scope_id,
+            fourth_worker,
+            fourth_lease.generation,
+            &attacker_items,
+            &[7_u8; 32],
+            now + Duration::seconds(7),
+        ),
+    )
+    .await
+    .is_err());
+    let approved_items = [sharepoint_item(
+        "https://coreadvs.sharepoint.com/sites/deals/file",
+    )];
+    assert_eq!(
+        apply_source_change_page(
+            &pool,
+            community,
+            microsoft_resolver_page(
+                community,
+                account_id,
+                scope_id,
+                fourth_worker,
+                fourth_lease.generation,
+                &approved_items,
+                &[8_u8; 32],
+                now + Duration::seconds(7),
+            ),
+        )
+        .await
+        .expect("apply exact configured SharePoint resolver authority"),
+        SourcePageApplyOutcome::Applied { changed_items: 1 }
     );
 
     drop_scratch_db(&admin, pool, &name).await;

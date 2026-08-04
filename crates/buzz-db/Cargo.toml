@@ -17,6 +17,7 @@ uuid        = { workspace = true }
 chrono      = { workspace = true }
 hex         = { workspace = true }
 sha2        = { workspace = true }
+url         = { workspace = true }
 tracing     = { workspace = true }
 thiserror   = { workspace = true }
 nostr       = { workspace = true }

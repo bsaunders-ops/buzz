@@ -980,6 +980,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-connector-core"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "buzz-db",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-core"
 version = "0.1.0"
 dependencies = [
@@ -1018,6 +1036,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

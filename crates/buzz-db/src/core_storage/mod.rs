@@ -10,6 +10,8 @@ mod actions;
 mod audit;
 mod delta;
 mod insights;
+mod source_hash;
+mod source_pages;
 mod sources;
 mod types;
 
@@ -28,7 +30,9 @@ pub use audit::{
 };
 pub use delta::{claim_delta_scope, complete_delta_scope, fail_delta_scope};
 pub use insights::claim_insight_slot;
-pub use sources::{search_source_chunks, search_source_chunks_by_embedding};
+pub use source_hash::source_chunk_hash;
+pub use source_pages::apply_source_change_page;
+pub use sources::{recheck_source_chunk, search_source_chunks, search_source_chunks_by_embedding};
 pub use types::*;
 
 const HASH_BYTES: usize = 32;

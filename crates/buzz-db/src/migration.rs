@@ -692,7 +692,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 27);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1068,6 +1068,16 @@ mod tests {
         }
         assert!(core_storage.contains("existing_expression"));
         assert!(core_storage.contains("ELSE (%s) END"));
+
+        assert_eq!(migrations[27].version, 29);
+        let connector_hardening = migrations[27].sql.as_str();
+        assert!(connector_hardening.contains("last_page_digest"));
+        assert!(connector_hardening.contains("start_char"));
+        assert!(connector_hardening.contains("end_char"));
+        assert!(connector_hardening.contains("resolver_hosts"));
+        assert!(connector_hardening.contains("idx_embedding_versions_one_active"));
+        assert!(connector_hardening.contains("trg_connector_account_purge_source_index"));
+        assert!(connector_hardening.contains("trg_source_scope_purge_source_index"));
     }
 
     #[test]
