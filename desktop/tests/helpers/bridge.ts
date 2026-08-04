@@ -172,6 +172,8 @@ type MockBridgeOptions = {
   relaySelf?: string | null;
   /** Native-like huddle state seeded from authoritative role-bearing membership. */
   huddle?: MockHuddleSeed;
+  /** Enables the Windows-only Core call-capture command surface. */
+  callCaptureEnabled?: boolean;
   /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
   builderlabAuth?: { email?: string; name?: string; expiresAt: string } | null;
   /** Optional policy returned by the native join-policy discovery command. */

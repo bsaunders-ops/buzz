@@ -60,6 +60,13 @@ import type {
   RuntimeFileConfigSubset,
 } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import {
+  EMPTY_CALL_CAPTURE_SNAPSHOT,
+  type CallCaptureDevice,
+  type CallCaptureSnapshot,
+  type CopilotSuggestion,
+  type FinalizedTranscriptSegment,
+} from "@/features/call-capture/types";
 
 type TestIdentity = {
   privateKey: string;
@@ -269,6 +276,8 @@ type E2eConfig = {
     relayAgents?: MockRelayAgentSeed[];
     /** Native-like huddle state seeded from authoritative role-bearing membership. */
     huddle?: MockHuddleSeed;
+    /** Enables the Windows-only Core call-capture command surface. */
+    callCaptureEnabled?: boolean;
     agentListDelayMs?: number;
     agentMemory?: RawAgentMemoryListing | Record<string, RawAgentMemoryListing>;
     addChannelMembersDelayMs?: number;
@@ -1049,6 +1058,10 @@ declare global {
       command: string;
       payload: unknown;
     }>;
+    __BUZZ_E2E_NOTIFICATIONS__?: Array<{
+      body: string | null;
+      title: string;
+    }>;
     __BUZZ_E2E_WEBVIEW_ZOOM__?: number;
     __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
       channelName: string;
@@ -1207,6 +1220,16 @@ declare global {
       createdAt: number;
       slotId: string;
     }) => unknown;
+    __BUZZ_E2E_EMIT_CALL_CAPTURE_TRANSCRIPT__?: (input: {
+      text: string;
+      speaker?: "self" | "others";
+    }) => Promise<void>;
+    __BUZZ_E2E_EMIT_CALL_CAPTURE_SUGGESTION__?: (input: {
+      text: string;
+      category?: CopilotSuggestion["category"];
+      interrupt?: CopilotSuggestion["interrupt"];
+      evidenced?: boolean;
+    }) => Promise<void>;
     __BUZZ_E2E_SEED_MOCK_REMINDERS__?: (reminders: RelayEvent[]) => void;
     __BUZZ_E2E_QUERY_CLIENT__?: {
       invalidateQueries: (filters: { queryKey: readonly unknown[] }) => unknown;
@@ -9629,6 +9652,98 @@ export function maybeInstallE2eTauriMocks() {
   resetMockSaveSubscriptions(config);
   resetMockPendingCommunityDeepLinks(config);
   initializeMockHuddle(config.mock?.huddle);
+  const mockCallDevices: CallCaptureDevice[] = [
+    {
+      schema_version: 1,
+      id: "e2e-microphone",
+      label: "Core USB Microphone",
+      kind: "microphone",
+      is_default: true,
+      sample_rate_hz: 48_000,
+      channels: 1,
+    },
+    {
+      schema_version: 1,
+      id: "e2e-output",
+      label: "Core Office Speakers",
+      kind: "output",
+      is_default: true,
+      sample_rate_hz: 48_000,
+      channels: 2,
+    },
+  ];
+  let mockCallSnapshot: CallCaptureSnapshot = {
+    ...structuredClone(EMPTY_CALL_CAPTURE_SNAPSHOT),
+    phase: config.mock?.callCaptureEnabled ? "idle" : "disabled",
+  };
+  let mockCallConsent: {
+    microphoneId: string;
+    outputId: string;
+    token: string;
+  } | null = null;
+  let mockTranscriptSequence = 0;
+  let mockSuggestionSequence = 0;
+
+  const currentMockCallSnapshot = () => {
+    if (
+      mockCallSnapshot.phase === "active" &&
+      mockCallSnapshot.started_at_ms !== null
+    ) {
+      mockCallSnapshot = {
+        ...mockCallSnapshot,
+        elapsed_ms: Math.max(0, Date.now() - mockCallSnapshot.started_at_ms),
+      };
+    }
+    return structuredClone(mockCallSnapshot);
+  };
+
+  window.__BUZZ_E2E_EMIT_CALL_CAPTURE_TRANSCRIPT__ = async ({
+    text,
+    speaker = "others",
+  }) => {
+    if (mockCallSnapshot.phase !== "active" || !mockCallSnapshot.call_id) {
+      throw new Error("No active mock call capture.");
+    }
+    mockTranscriptSequence += 1;
+    const payload: FinalizedTranscriptSegment = {
+      schema_version: 1,
+      segment_id: crypto.randomUUID(),
+      call_id: mockCallSnapshot.call_id,
+      sequence: mockTranscriptSequence,
+      speaker,
+      text,
+      started_at_ms: (mockTranscriptSequence - 1) * 1_000,
+      ended_at_ms: mockTranscriptSequence * 1_000,
+      confidence: 96,
+      model_version: "parakeet-e2e",
+    };
+    await emit("call-capture-finalized-transcript", payload);
+  };
+  window.__BUZZ_E2E_EMIT_CALL_CAPTURE_SUGGESTION__ = async ({
+    text,
+    category = "decision",
+    interrupt = "quiet",
+    evidenced = interrupt === "critical",
+  }) => {
+    if (mockCallSnapshot.phase !== "active" || !mockCallSnapshot.call_id) {
+      throw new Error("No active mock call capture.");
+    }
+    mockSuggestionSequence += 1;
+    const payload: CopilotSuggestion = {
+      schema_version: 1,
+      suggestion_id: crypto.randomUUID(),
+      call_id: mockCallSnapshot.call_id,
+      sequence: mockSuggestionSequence,
+      category,
+      interrupt,
+      text,
+      created_at: Math.floor(Date.now() / 1_000),
+      model_version: "core-copilot-e2e",
+      confidence: 94,
+      evidence_hashes: evidenced ? ["a".repeat(64)] : [],
+    };
+    await emit("call-capture-suggestion", payload);
+  };
   mockWebsocketSendMutexWedged = false;
   mockWindows("main");
   window.__BUZZ_E2E_COMMANDS__ = [];
@@ -9954,6 +10069,110 @@ export function maybeInstallE2eTauriMocks() {
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
     switch (command) {
+      case "get_call_capture_state":
+        return currentMockCallSnapshot();
+      case "list_call_capture_devices":
+        if (!activeConfig?.mock?.callCaptureEnabled) {
+          throw new Error("Core call capture is disabled");
+        }
+        return structuredClone(mockCallDevices);
+      case "acknowledge_call_capture_consent": {
+        const request = (
+          payload as {
+            request?: {
+              microphone_id?: string;
+              output_id?: string;
+              consent_acknowledged?: boolean;
+            };
+          }
+        ).request;
+        const microphoneId = request?.microphone_id;
+        const outputId = request?.output_id;
+        if (
+          !activeConfig?.mock?.callCaptureEnabled ||
+          request?.consent_acknowledged !== true ||
+          !microphoneId ||
+          !outputId ||
+          !mockCallDevices.some(
+            (device) =>
+              device.kind === "microphone" && device.id === microphoneId,
+          ) ||
+          !mockCallDevices.some(
+            (device) => device.kind === "output" && device.id === outputId,
+          )
+        ) {
+          throw new Error("Fresh visible call consent is required");
+        }
+        mockCallConsent = {
+          microphoneId,
+          outputId,
+          token: crypto.randomUUID(),
+        };
+        return {
+          schema_version: 1,
+          token: mockCallConsent.token,
+          microphone_id: mockCallConsent.microphoneId,
+          output_id: mockCallConsent.outputId,
+          issued_at_ms: Date.now(),
+          expires_at_ms: Date.now() + 60_000,
+        };
+      }
+      case "start_call_capture": {
+        const request = (
+          payload as {
+            request?: {
+              microphone_id?: string;
+              output_id?: string;
+              consent_token?: string;
+            };
+          }
+        ).request;
+        const consent = mockCallConsent;
+        const microphoneId = request?.microphone_id;
+        const outputId = request?.output_id;
+        if (
+          !consent ||
+          !microphoneId ||
+          !outputId ||
+          request?.consent_token !== consent.token ||
+          microphoneId !== consent.microphoneId ||
+          outputId !== consent.outputId
+        ) {
+          throw new Error("Consent is unknown, stale, or already used");
+        }
+        const startedAt = Date.now();
+        mockCallSnapshot = {
+          schema_version: 1,
+          phase: "active",
+          call_id: crypto.randomUUID(),
+          selected_microphone_id: microphoneId,
+          selected_output_id: outputId,
+          microphone_source: { health: "healthy", level_percent: 38 },
+          output_source: { health: "healthy", level_percent: 62 },
+          degraded_reasons: [],
+          stop_reason: null,
+          started_at_ms: startedAt,
+          elapsed_ms: 0,
+          last_segment_sequence: 0,
+        };
+        mockCallConsent = null;
+        mockTranscriptSequence = 0;
+        mockSuggestionSequence = 0;
+        await emit("call-capture-state", currentMockCallSnapshot());
+        return currentMockCallSnapshot();
+      }
+      case "stop_call_capture":
+        if (mockCallSnapshot.phase === "active") {
+          mockCallSnapshot = {
+            ...currentMockCallSnapshot(),
+            phase: "ended",
+            stop_reason: "explicit",
+          };
+          await emit("call-capture-state", currentMockCallSnapshot());
+        }
+        return currentMockCallSnapshot();
+      case "accept_call_copilot_suggestion":
+        return { accepted: 1 };
       case "get_huddle_state": {
         const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;
         const delayMs = activeConfig?.mock?.huddleStateReadDelayMs ?? 0;

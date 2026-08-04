@@ -20,6 +20,7 @@ import { deriveShellRoute } from "@/app/AppShell.helpers";
 import { ThemeGrainientBackground } from "@/app/ThemeGrainientBackground";
 import { useReloadShortcut } from "@/app/useReloadShortcut";
 import { KnownAgentPubkeysProvider } from "@/features/agents/useKnownAgentPubkeys";
+import { CoreCallCapture } from "@/features/call-capture";
 import { useAppOnboardingState } from "@/features/onboarding/hooks";
 import { useMachineOnboardingState } from "@/features/onboarding/machineOnboarding";
 import {
@@ -281,6 +282,7 @@ function AppReady({
     >
       <KnownAgentPubkeysProvider>
         <RouterProvider router={router} />
+        <CoreCallCapture />
       </KnownAgentPubkeysProvider>
     </EncryptedBackupProvider>
   );

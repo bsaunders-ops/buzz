@@ -17,11 +17,14 @@ name = "buzz_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = ["system-keyring"]
+default = ["system-keyring", "call-capture-platform"]
 mesh-llm = ["dep:iroh", "dep:mesh-llm-sdk", "dep:mesh-llm-host-runtime", "dep:mesh-llm-client", "dep:mesh-llm-node", "dep:mesh-llm-system", "dep:mesh-llm-events"]
 # OS keyring backing for desktop secret storage (nsec private keys). When
 # disabled, secrets fall back to 0o600 files. On by default for real builds.
 system-keyring = ["dep:keyring"]
+# Native Core Month-1 call-capture command/runtime integration. Kept separate
+# so the pure protocol/lifecycle harness can compile without Tauri/platform I/O.
+call-capture-platform = []
 
 [build-dependencies]
 base64 = "0.22"

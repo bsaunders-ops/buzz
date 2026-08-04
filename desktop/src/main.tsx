@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "@/app/App";
+import { CallCaptureBarWindow } from "@/features/call-capture";
 import { NostrBindConsentDialog } from "@/features/profile/ui/NostrBindConsentDialog";
 import "@fontsource-variable/inter/wght.css";
 import "@/shared/styles/globals.css";
@@ -71,6 +72,23 @@ function configureDevE2eBridgeFromUrl() {
 }
 
 function renderApp() {
+  const isCallCaptureBarWindow =
+    new URL(window.location.href).searchParams.get("coreCallCaptureBar") ===
+    "1";
+
+  if (isCallCaptureBarWindow) {
+    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+      <React.StrictMode>
+        <ThemeProvider defaultTheme="buzz">
+          <TooltipProvider delayDuration={300}>
+            <CallCaptureBarWindow />
+          </TooltipProvider>
+        </ThemeProvider>
+      </React.StrictMode>,
+    );
+    return;
+  }
+
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
       <CommunitiesProvider>
