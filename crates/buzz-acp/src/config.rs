@@ -766,6 +766,20 @@ fn validate_trigger_reply_publishing(
     }
 }
 
+fn validate_core_sealed_mode(args: &CliArgs, core_sealed_mode: bool) -> Result<(), ConfigError> {
+    if !core_sealed_mode {
+        return Ok(());
+    }
+
+    if !args.mcp_command.trim().is_empty() {
+        return Err(ConfigError::ConfigFile(
+            "Core sealed mode requires an empty --mcp-command; expose connector reads and writes through brokered Core tools only".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
     let normalized = command.trim().replace('\\', "/");
     let trimmed = normalized.trim_end_matches('/');
@@ -940,6 +954,7 @@ impl Config {
         args.private_key.clear();
 
         validate_trigger_reply_publishing(&args, &args.agent_command)?;
+        validate_core_sealed_mode(&args, core_sealed_mode_enabled())?;
 
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
@@ -2867,6 +2882,53 @@ channels = "ALL"
         assert!(
             Config::from_args(args).is_err(),
             "trigger-reply publishing must fail startup when the configured owner is invalid"
+        );
+    }
+
+    #[test]
+    fn core_sealed_mode_rejects_arbitrary_mcp_command() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--mcp-command",
+            "buzz-dev-mcp",
+        ])
+        .expect("sealed-mode MCP CLI arguments should parse");
+
+        let err = validate_core_sealed_mode(&args, true).expect_err("must reject MCP command");
+
+        assert!(
+            err.to_string().contains("mcp-command"),
+            "error should mention mcp-command: {err}"
+        );
+    }
+
+    #[test]
+    fn core_sealed_mode_allows_empty_mcp_command() {
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("minimal CLI arguments should parse");
+
+        assert!(
+            validate_core_sealed_mode(&args, true).is_ok(),
+            "sealed mode should allow the default empty MCP command"
+        );
+    }
+
+    #[test]
+    fn unsealed_mode_preserves_configured_mcp_command() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--mcp-command",
+            "buzz-dev-mcp",
+        ])
+        .expect("unsealed MCP CLI arguments should parse");
+
+        assert!(
+            validate_core_sealed_mode(&args, false).is_ok(),
+            "non-Core ACP mode should preserve existing arbitrary MCP support"
         );
     }
 

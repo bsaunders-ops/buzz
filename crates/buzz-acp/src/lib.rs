@@ -4282,7 +4282,7 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 }
 
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
-    if config.mcp_command.is_empty() {
+    if !should_expose_mcp_servers(&config.mcp_command, config::core_sealed_mode_enabled()) {
         return vec![];
     }
     vec![McpServer {
@@ -4336,6 +4336,10 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
             env
         },
     }]
+}
+
+fn should_expose_mcp_servers(mcp_command: &str, core_sealed_mode: bool) -> bool {
+    !core_sealed_mode && !mcp_command.trim().is_empty()
 }
 
 #[cfg(test)]
@@ -5257,6 +5261,14 @@ mod build_mcp_servers_tests {
             servers.is_empty(),
             "empty mcp_command should produce no MCP servers"
         );
+    }
+
+    #[test]
+    fn mcp_servers_are_exposed_only_when_unsealed_and_configured() {
+        assert!(should_expose_mcp_servers("buzz-dev-mcp", false));
+        assert!(!should_expose_mcp_servers("buzz-dev-mcp", true));
+        assert!(!should_expose_mcp_servers("", false));
+        assert!(!should_expose_mcp_servers("", true));
     }
 
     #[test]
