@@ -35,7 +35,10 @@ pub use delta::{claim_delta_scope, complete_delta_scope, fail_delta_scope};
 pub use insights::claim_insight_slot;
 pub use source_hash::source_chunk_hash;
 pub use source_pages::apply_source_change_page;
-pub use sources::{recheck_source_chunk, search_source_chunks, search_source_chunks_by_embedding};
+pub use sources::{
+    recheck_source_chunk, recheck_source_chunk_fts, search_source_chunks,
+    search_source_chunks_by_embedding, search_source_chunks_fts,
+};
 pub use types::*;
 
 const HASH_BYTES: usize = 32;

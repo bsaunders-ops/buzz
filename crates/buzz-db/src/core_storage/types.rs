@@ -1442,6 +1442,91 @@ pub struct SourceCitationRecord {
     pub end_char: i64,
 }
 
+/// Server-authenticated source retrieval audience.
+///
+/// Channel identifiers are only a server-resolved request subset. Storage
+/// always rejoins them to current membership and never treats them as grants.
+#[derive(Clone, Copy)]
+pub struct ServerResolvedSourceAudience<'a> {
+    requester_pubkey: &'a [u8],
+    authorized_channel_ids: &'a [Uuid],
+}
+
+impl<'a> ServerResolvedSourceAudience<'a> {
+    /// Bind an authenticated caller to channels resolved by the server.
+    #[must_use]
+    pub const fn new(requester_pubkey: &'a [u8], authorized_channel_ids: &'a [Uuid]) -> Self {
+        Self {
+            requester_pubkey,
+            authorized_channel_ids,
+        }
+    }
+
+    pub(super) const fn requester_pubkey(self) -> &'a [u8] {
+        self.requester_pubkey
+    }
+
+    pub(super) const fn authorized_channel_ids(self) -> &'a [Uuid] {
+        self.authorized_channel_ids
+    }
+}
+
+impl std::fmt::Debug for ServerResolvedSourceAudience<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerResolvedSourceAudience")
+            .field("caller_redacted", &true)
+            .field("channel_count", &self.authorized_channel_ids.len())
+            .finish()
+    }
+}
+
+/// Content-free full-text candidate that does not require an embedding model.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SourceFtsCitationRecord {
+    /// Local source item identifier.
+    pub item_id: Uuid,
+    /// Local source chunk identifier.
+    pub chunk_id: Uuid,
+    /// Connector account identifier used in the stable authority key.
+    pub account_id: Uuid,
+    /// Approved source scope used in the stable authority key.
+    pub scope_id: Uuid,
+    /// Immutable provider-side item identifier.
+    pub external_item_id: String,
+    /// Closed connector provider wire value.
+    pub provider: String,
+    /// Source title.
+    pub title: String,
+    /// Typed source kind wire value.
+    pub source_type: String,
+    /// Provider modification time.
+    pub modified_at: DateTime<Utc>,
+    /// Stable resolvable source link.
+    pub resolvable_link: String,
+    /// Provider version used for authorization rechecks.
+    pub remote_version: String,
+    /// Optional provider ETag used for authorization rechecks.
+    pub remote_etag: Option<String>,
+    /// Chunk hash used for post-ranking checks.
+    pub chunk_hash: Vec<u8>,
+    /// Inclusive Unicode-scalar offset in normalized source text.
+    pub start_char: i64,
+    /// Exclusive Unicode-scalar offset in normalized source text.
+    pub end_char: i64,
+}
+
+impl std::fmt::Debug for SourceFtsCitationRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceFtsCitationRecord")
+            .field("provider", &self.provider)
+            .field("source_type", &self.source_type)
+            .field("metadata_and_identifiers_redacted", &true)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for SourceCitationRecord {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1525,6 +1610,87 @@ pub struct AuthorizedSourceExcerptRecord {
     pub acl_revision: Vec<u8>,
     /// Database timestamp of the authorization recheck.
     pub authorization_checked_at: DateTime<Utc>,
+}
+
+/// Source content returned by the embedding-independent FTS recheck only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthorizedSourceFtsExcerptRecord {
+    /// Local source item identifier.
+    pub item_id: Uuid,
+    /// Local source chunk identifier.
+    pub chunk_id: Uuid,
+    /// Connector account identifier.
+    pub account_id: Uuid,
+    /// Approved source scope identifier.
+    pub scope_id: Uuid,
+    /// Immutable provider item identifier.
+    pub external_item_id: String,
+    /// Closed connector provider wire value.
+    pub provider: String,
+    /// Citation title.
+    pub title: String,
+    /// Typed source kind wire value.
+    pub source_type: String,
+    /// Provider modification time.
+    pub modified_at: DateTime<Utc>,
+    /// Stable provider source link.
+    pub resolvable_link: String,
+    /// Exact provider version rechecked after ranking.
+    pub remote_version: String,
+    /// Optional provider ETag rechecked after ranking.
+    pub remote_etag: Option<String>,
+    /// Exact chunk hash rechecked after ranking.
+    pub chunk_hash: Vec<u8>,
+    /// Inclusive Unicode-scalar offset in normalized source text.
+    pub start_char: i64,
+    /// Exclusive Unicode-scalar offset in normalized source text.
+    pub end_char: i64,
+    /// Authorized bounded source chunk content.
+    pub content: String,
+    /// Hash of the complete current positive ACL set.
+    pub acl_revision: Vec<u8>,
+    /// Database timestamp of the authorization recheck.
+    pub authorization_checked_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for AuthorizedSourceFtsExcerptRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedSourceFtsExcerptRecord")
+            .field("provider", &self.provider)
+            .field("source_type", &self.source_type)
+            .field("content_and_metadata_redacted", &true)
+            .field("content_characters", &self.content.chars().count())
+            .finish()
+    }
+}
+
+/// Embedding-independent full-text source retrieval request.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceFtsSearchRequest<'a> {
+    /// Full-text query.
+    pub query: &'a str,
+    /// Server-authenticated request audience.
+    pub audience: ServerResolvedSourceAudience<'a>,
+    /// Maximum returned candidates.
+    pub limit: i64,
+}
+
+/// One embedding-independent FTS candidate to re-read before disclosure.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceFtsCandidateRecheckRequest<'a> {
+    /// Candidate item returned by the rank query.
+    pub item_id: Uuid,
+    /// Candidate chunk returned by the rank query.
+    pub chunk_id: Uuid,
+    /// Exact remote version returned by the rank query.
+    pub remote_version: &'a str,
+    /// Exact optional ETag returned by the rank query.
+    pub remote_etag: Option<&'a str>,
+    /// Exact chunk hash returned by the rank query.
+    pub chunk_hash: &'a [u8],
+    /// Server-authenticated request audience.
+    pub audience: ServerResolvedSourceAudience<'a>,
 }
 
 impl std::fmt::Debug for AuthorizedSourceExcerptRecord {
