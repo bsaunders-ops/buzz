@@ -475,7 +475,13 @@ impl AuthorizedExcerpt {
         self.source_item_id
     }
 
-    fn new_with_source_item_id(
+    /// Construct an excerpt already bound to its trusted tenant-local source item.
+    ///
+    /// Callers must obtain `source_item_id` from the same current authorized
+    /// database read that produced the citation and excerpt text. The value is
+    /// deliberately omitted from model serialization and is useful only as an
+    /// opaque coordinate for a later authorization recheck.
+    pub fn new_with_source_item_id(
         source_item_id: Uuid,
         citation: Citation,
         text: impl Into<String>,

@@ -31,7 +31,6 @@ use uuid::Uuid;
 const MAX_MODEL_OUTPUT_BYTES: usize = 16_384;
 const RETRIEVAL_LIMIT: usize = 8;
 const DEDUPE_DOMAIN: &[u8] = b"core-buzz:private-assistant-insight:v1\0";
-const EVIDENCE_RESOLVER_DOMAIN: &[u8] = b"core-buzz:evidence-resolver:v1\0";
 const REALTIME_WINDOW_SECONDS: i64 = 15 * 60;
 const SAME_DAY_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 
@@ -518,10 +517,10 @@ fn derive_evidence(excerpts: &[&AuthorizedExcerpt]) -> Result<Vec<EvidenceRef>, 
         let source = evidence_source(citation.provider, citation.source_kind)?;
         let source_id = format!("item:{}", hex::encode(citation.item_hash));
         let source_hash = hex::encode(citation.chunk_hash);
-        let mut resolver_hasher = Sha256::new();
-        resolver_hasher.update(EVIDENCE_RESOLVER_DOMAIN);
-        resolver_hasher.update(citation.item_hash);
-        let resolver_id = format!("evidence:{}", hex::encode(resolver_hasher.finalize()));
+        let source_item_id = excerpt
+            .source_item_id()
+            .ok_or(TurnError::InsightConstructionFailed)?;
+        let resolver_id = format!("evidence:{}", source_item_id.hyphenated());
         let source_tag = match source {
             EvidenceSource::Crm => 0,
             EvidenceSource::Outlook => 1,

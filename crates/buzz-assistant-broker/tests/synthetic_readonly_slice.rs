@@ -15,8 +15,14 @@ use buzz_connector_core::{
         ScopeId,
     },
 };
-use buzz_core::{core_protocol::InsightPayload, CommunityId};
-use buzz_db::core_storage::claim_delta_scope;
+use buzz_core::{
+    core_protocol::{EvidenceResolverId, InsightPayload},
+    CommunityId,
+};
+use buzz_db::core_storage::{
+    claim_delta_scope, resolve_source_evidence, EvidenceResolution, EvidenceResolveRequest,
+    ServerResolvedSourceAudience,
+};
 use chrono::Utc;
 use nostr::{EventBuilder, Keys, PublicKey};
 use serde_json::{json, Value};
@@ -28,7 +34,8 @@ const CRM_FIXTURE: &[u8] =
     include_bytes!("../../buzz-connector-core/tests/fixtures/core-crm/get-contact.response.json");
 const PRIVATE_CHANNEL: Uuid = Uuid::from_u128(0x400);
 const OTHER_PRIVATE_CHANNEL: Uuid = Uuid::from_u128(0x401);
-const CREATED_AT: i64 = 1_775_000_000;
+// One minute after the fixture's latest provider modification timestamp.
+const CREATED_AT: i64 = 1_785_596_705;
 const CREDENTIAL_REFERENCE: &str = "kv-synthetic-secret-sentinel";
 const STREAM: &str = "bounded-snapshot";
 
@@ -459,6 +466,53 @@ async fn synthetic_core_crm_read_reaches_only_the_authorized_private_assistant()
     );
     let payload: InsightPayload = serde_json::from_str(&event.content).expect("kind-44300 payload");
     assert_eq!(payload.evidence.len(), 1);
+
+    let cited = &payload.evidence[0];
+    let citation = cited
+        .citation
+        .as_ref()
+        .expect("private citation descriptor");
+    let resolver_id = EvidenceResolverId::try_from(citation.resolver_id.as_str())
+        .expect("opaque local resolver id");
+    let chunk_hash = hex::decode(cited.source_hash.as_str()).expect("cited chunk hash");
+    let current_channels = [PRIVATE_CHANNEL];
+    let owner_bytes = blake.public_key().to_bytes();
+    let resolution_request = EvidenceResolveRequest {
+        item_id: resolver_id.source_item_id(),
+        chunk_hash: &chunk_hash,
+        channel_id: PRIVATE_CHANNEL,
+        audience: ServerResolvedSourceAudience::new(&owner_bytes, &current_channels),
+    };
+    assert!(matches!(
+        resolve_source_evidence(&pool, community, resolution_request)
+            .await
+            .expect("resolve current authorized evidence"),
+        EvidenceResolution::Resolved(_)
+    ));
+
+    sqlx::query("DELETE FROM source_item_acls WHERE community_id=$1 AND item_id=$2")
+        .bind(community.as_uuid())
+        .bind(resolver_id.source_item_id())
+        .execute(&pool)
+        .await
+        .expect("revoke evidence immediately before resolution");
+    assert_eq!(
+        resolve_source_evidence(&pool, community, resolution_request)
+            .await
+            .expect("deny freshly revoked evidence"),
+        EvidenceResolution::Denied
+    );
+    sqlx::query(
+        "INSERT INTO source_item_acls \
+         (community_id, item_id, principal_type, principal_pubkey) \
+         VALUES ($1, $2, 'user', $3)",
+    )
+    .bind(community.as_uuid())
+    .bind(resolver_id.source_item_id())
+    .bind(owner_bytes.as_slice())
+    .execute(&pool)
+    .await
+    .expect("restore synthetic user ACL for later race proof");
 
     let raw_source_body = snapshot.upserts()[0].source().as_untrusted_text();
     let opaque_external_id = snapshot.upserts()[0].external_item_id().as_str();

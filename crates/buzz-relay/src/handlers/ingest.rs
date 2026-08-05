@@ -561,6 +561,49 @@ pub(crate) async fn validate_core_event_authorization(
 
     let author = event.pubkey.to_bytes().to_vec();
     let recipient = envelope.recipient.to_bytes().to_vec();
+    let relay = state.relay_keypair.public_key().to_bytes().to_vec();
+
+    if envelope.direction == CoreDirection::OwnerToRelay {
+        if recipient != relay {
+            return Err(IngestError::AuthFailed(
+                "restricted: Core evidence requests must target this relay".into(),
+            ));
+        }
+        let is_member = state
+            .db
+            .is_member(tenant.community(), envelope.channel_id, &author)
+            .await
+            .map_err(|error| {
+                IngestError::Internal(format!("error: checking Core channel membership: {error}"))
+            })?;
+        if !is_member {
+            return Err(IngestError::AuthFailed(
+                "restricted: Core evidence requester must be a current channel member".into(),
+            ));
+        }
+        return Ok(envelope);
+    }
+    if envelope.direction == CoreDirection::RelayToOwner {
+        if author != relay {
+            return Err(IngestError::AuthFailed(
+                "restricted: Core evidence results must be authored by this relay".into(),
+            ));
+        }
+        let is_member = state
+            .db
+            .is_member(tenant.community(), envelope.channel_id, &recipient)
+            .await
+            .map_err(|error| {
+                IngestError::Internal(format!("error: checking Core channel membership: {error}"))
+            })?;
+        if !is_member {
+            return Err(IngestError::AuthFailed(
+                "restricted: Core evidence recipient must be a current channel member".into(),
+            ));
+        }
+        return Ok(envelope);
+    }
+
     for endpoint in [&author, &recipient] {
         let is_member = state
             .db
@@ -593,6 +636,7 @@ pub(crate) async fn validate_core_event_authorization(
     let authorized = match envelope.direction {
         CoreDirection::AgentToOwner => agent_to_owner,
         CoreDirection::OwnerToAgent => owner_to_agent,
+        CoreDirection::OwnerToRelay | CoreDirection::RelayToOwner => false,
         CoreDirection::Either => agent_to_owner || owner_to_agent,
     };
     if !authorized {

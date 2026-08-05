@@ -811,17 +811,40 @@ async fn handle_ephemeral_event(
         }
     }
 
-    if is_core_kind(event_kind_u32(&event)) {
-        if let Err(error) =
-            super::ingest::validate_core_event_authorization(&conn.tenant, &state, &event).await
-        {
-            let message = match error {
-                IngestError::Rejected(message) | IngestError::AuthFailed(message) => message,
-                IngestError::Internal(_) => "error: internal server error".to_string(),
-            };
-            conn.send(RelayMessage::ok(event_id_hex, false, &message));
-            return;
+    let core_envelope = if is_core_kind(event_kind_u32(&event)) {
+        match super::ingest::validate_core_event_authorization(&conn.tenant, &state, &event).await {
+            Ok(envelope) => Some(envelope),
+            Err(error) => {
+                let message = match error {
+                    IngestError::Rejected(message) | IngestError::AuthFailed(message) => message,
+                    IngestError::Internal(_) => "error: internal server error".to_string(),
+                };
+                conn.send(RelayMessage::ok(event_id_hex, false, &message));
+                return;
+            }
         }
+    } else {
+        None
+    };
+
+    if event_kind_u32(&event) == buzz_core::kind::KIND_CORE_EVIDENCE_RESOLVE_REQUEST {
+        let Some(envelope) = core_envelope else {
+            conn.send(RelayMessage::ok(
+                event_id_hex,
+                false,
+                "invalid: evidence resolution envelope",
+            ));
+            return;
+        };
+        super::evidence_resolver::handle_verified_request(
+            &event,
+            envelope,
+            event_id_hex,
+            &conn,
+            &state,
+        )
+        .await;
+        return;
     }
 
     // Special handling for presence events (kind:20001).

@@ -48,8 +48,14 @@ fn excerpt_with_freshness(freshness: CitationFreshness) -> AuthorizedExcerpt {
         freshness,
     )
     .expect("citation");
-    AuthorizedExcerpt::new(citation, "The client follow-up is due Friday.", 10, 45)
-        .expect("authorized excerpt")
+    AuthorizedExcerpt::new_with_source_item_id(
+        Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").expect("source item UUID"),
+        citation,
+        "The client follow-up is due Friday.",
+        10,
+        45,
+    )
+    .expect("authorized excerpt")
 }
 
 struct Resolver {
@@ -243,6 +249,10 @@ async fn authorized_turn_emits_exact_trusted_insight_from_only_minimized_context
     assert_eq!(citation.title.as_str(), "Client follow-up");
     assert_eq!(citation.modified_at, 1_785_758_400);
     assert!(citation.resolver_id.as_str().starts_with("evidence:"));
+    assert_eq!(
+        citation.resolver_id.as_str(),
+        "evidence:550e8400-e29b-41d4-a716-446655440001"
+    );
     assert!(!citation.resolver_id.as_str().contains("opaque"));
     assert_eq!(
         payload.evidence[0].source_id.as_str(),
@@ -671,7 +681,14 @@ fn unsupported_excerpt() -> AuthorizedExcerpt {
         CitationFreshness::Fresh,
     )
     .expect("citation");
-    AuthorizedExcerpt::new(citation, "Unexpected source text.", 0, 23).expect("authorized excerpt")
+    AuthorizedExcerpt::new_with_source_item_id(
+        Uuid::parse_str("550e8400-e29b-41d4-a716-446655440002").expect("source item UUID"),
+        citation,
+        "Unexpected source text.",
+        0,
+        23,
+    )
+    .expect("authorized excerpt")
 }
 
 #[tokio::test]
