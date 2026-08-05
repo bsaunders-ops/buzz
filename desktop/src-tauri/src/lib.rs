@@ -692,6 +692,7 @@ pub fn run() {
             create_auth_event,
             nip44_encrypt_to_self,
             nip44_decrypt_from_self,
+            decrypt_evidence_resolution_event,
             get_channels,
             create_channel,
             ensure_starter_channels,

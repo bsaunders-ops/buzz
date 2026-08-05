@@ -12675,6 +12675,20 @@ export function maybeInstallE2eTauriMocks() {
         return (payload as { plaintext: string }).plaintext;
       case "nip44_decrypt_from_self":
         return (payload as { ciphertext: string }).ciphertext;
+      case "decrypt_evidence_resolution_event": {
+        const input = payload as {
+          eventJson: string;
+          expectedRelayPubkey: string;
+        };
+        const event = JSON.parse(input.eventJson) as RelayEvent;
+        if (
+          event.kind !== 24824 ||
+          event.pubkey.toLowerCase() !== input.expectedRelayPubkey.toLowerCase()
+        ) {
+          throw new Error("invalid evidence resolution event");
+        }
+        return event.content;
+      }
       case "create_auth_event":
         if (identity) {
           return JSON.stringify(

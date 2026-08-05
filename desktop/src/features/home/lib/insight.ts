@@ -24,9 +24,10 @@ const INSIGHT_CATEGORIES = new Set([
   "deal_movement",
   "meeting_movement",
   "relationship_opportunity",
+  "assistant_response",
 ]);
 const INSIGHT_PRIORITIES = new Set(["low", "normal", "high", "urgent"]);
-const INSIGHT_FRESHNESS = new Set(["realtime", "same_day", "recent"]);
+const INSIGHT_FRESHNESS = new Set(["realtime", "same_day", "recent", "stale"]);
 const EVIDENCE_SOURCES = new Set([
   "crm",
   "outlook",
@@ -41,6 +42,8 @@ const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA_256 = /^[0-9a-f]{64}$/;
 const OPAQUE_ID = /^[A-Za-z0-9._:-]{1,256}$/;
+const EVIDENCE_RESOLVER =
+  /^evidence:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_UNIX_SECONDS = 253_402_300_799;
 const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
@@ -59,6 +62,8 @@ export type InsightEvidence = {
     modifiedAt: number;
     resolverKey: string;
   } | null;
+  /** Exact cited chunk revision, retained only for authenticated resolution. */
+  sourceHash: string;
   /** Non-rendered key retained so repeated source labels never collide in React. */
   stableKey: string;
 };
@@ -69,6 +74,8 @@ export type InsightDraft =
   | { kind: "google_doc"; title: string; body: string };
 
 export type InsightPayload = {
+  /** Non-rendered identity used to bind evidence resolution requests. */
+  insightId: string;
   category: string;
   priority: string;
   change: string;
@@ -132,8 +139,8 @@ function parseCitation(value: unknown) {
     !Number.isSafeInteger(value.modified_at) ||
     value.modified_at < 0 ||
     value.modified_at > MAX_UNIX_SECONDS ||
-    !isSafeText(value.resolver_id, 256) ||
-    !OPAQUE_ID.test(value.resolver_id)
+    typeof value.resolver_id !== "string" ||
+    !EVIDENCE_RESOLVER.test(value.resolver_id)
   ) {
     return null;
   }
@@ -186,20 +193,11 @@ function parseEvidence(value: unknown): InsightEvidence[] | null {
     evidence.push({
       source: item.source as InsightEvidence["source"],
       citation,
+      sourceHash: item.source_hash,
       stableKey: dedupeKey,
     });
   }
   return evidence;
-}
-
-/**
- * Produce a non-executable, app-internal resolver path. Trusted runtime code
- * must authenticate the caller and reauthorize the evidence before resolving
- * this opaque key to any provider URL.
- */
-export function privateEvidenceResolverPath(evidence: InsightEvidence) {
-  if (!evidence.citation) return null;
-  return `buzz://evidence?resolver=${encodeURIComponent(evidence.citation.resolverKey)}`;
 }
 
 export function evidenceModifiedDateLabel(modifiedAt: number) {
@@ -290,6 +288,7 @@ export function parseInsightPayload(content: string): InsightPayload | null {
   const draft = value.draft === undefined ? null : parseDraft(value.draft);
   if (evidence === null || draft === undefined) return null;
   return {
+    insightId: value.insight_id,
     category: value.category,
     priority: value.priority,
     change: value.change,
@@ -309,6 +308,7 @@ export function insightCategoryLabel(category: string) {
       deal_movement: "Deal movement",
       meeting_movement: "Meeting movement",
       relationship_opportunity: "Relationship opportunity",
+      assistant_response: "Assistant response",
     }[category] ?? "Insight"
   );
 }
@@ -319,6 +319,7 @@ export function insightFreshnessLabel(freshness: string) {
       realtime: "Real-time",
       same_day: "Same day",
       recent: "Recent",
+      stale: "Stale",
     }[freshness] ?? "Unavailable"
   );
 }

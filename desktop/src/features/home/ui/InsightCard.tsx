@@ -3,11 +3,22 @@ import {
   evidenceSourceLabel,
   insightCategoryLabel,
   insightFreshnessLabel,
+  type InsightEvidence,
   type InsightPayload,
 } from "@/features/home/lib/insight";
 import type { ReactNode } from "react";
 
-export function InsightCard({ payload }: { payload: InsightPayload | null }) {
+type InsightCardProps = {
+  payload: InsightPayload | null;
+  onOpenSource?: (evidence: InsightEvidence) => Promise<void>;
+  resolvingEvidenceKey?: string | null;
+};
+
+export function InsightCard({
+  payload,
+  onOpenSource,
+  resolvingEvidenceKey = null,
+}: InsightCardProps) {
   if (!payload) {
     return (
       <section
@@ -103,6 +114,17 @@ export function InsightCard({ payload }: { payload: InsightPayload | null }) {
                 </span>
               ) : null}
               <span className="text-2xs"> — verified reference</span>
+              {evidence.citation && onOpenSource ? (
+                <button
+                  className="ml-2 text-xs font-medium text-primary hover:underline disabled:cursor-wait disabled:opacity-60"
+                  data-testid="home-insight-open-source"
+                  disabled={resolvingEvidenceKey === evidence.stableKey}
+                  onClick={() => void onOpenSource(evidence)}
+                  type="button"
+                >
+                  Open source
+                </button>
+              ) : null}
             </li>
           ))}
         </ul>
