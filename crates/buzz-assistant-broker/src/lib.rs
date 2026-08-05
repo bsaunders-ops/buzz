@@ -611,7 +611,7 @@ where
         let original = &excerpts[*index];
         let current = rechecked
             .iter()
-            .find(|candidate| *candidate == original)
+            .find(|candidate| original.matches_current_authorized_content(candidate))
             .ok_or(TurnError::AuthorizationChanged)?;
         selected.push(current);
     }

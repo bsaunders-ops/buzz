@@ -905,6 +905,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-connector-core",
  "buzz-core",
+ "buzz-db",
  "buzz-sdk",
  "chrono",
  "hex",

@@ -21,5 +21,6 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+buzz-db = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }

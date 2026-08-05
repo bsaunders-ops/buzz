@@ -469,6 +469,28 @@ impl AuthorizedExcerpt {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    /// Check that a newly authorized read still names the same source version,
+    /// metadata, offsets, and bytes. The authorization observation timestamp
+    /// is deliberately excluded because every database recheck records a new
+    /// `as_of` value even when authority and content are unchanged.
+    #[must_use]
+    pub fn matches_current_authorized_content(&self, current: &Self) -> bool {
+        self.text == current.text
+            && self.start_char == current.start_char
+            && self.end_char == current.end_char
+            && current.citation.as_of >= self.citation.as_of
+            && self.citation.title == current.citation.title
+            && self.citation.provider == current.citation.provider
+            && self.citation.source_kind == current.citation.source_kind
+            && self.citation.modified_at == current.citation.modified_at
+            && self.citation.resolvable_link == current.citation.resolvable_link
+            && self.citation.item_hash == current.citation.item_hash
+            && self.citation.remote_version == current.citation.remote_version
+            && self.citation.version_hash == current.citation.version_hash
+            && self.citation.chunk_hash == current.citation.chunk_hash
+            && self.citation.freshness == current.citation.freshness
+    }
 }
 
 /// Cache identity whose audience and source-version fields force revocation misses.
