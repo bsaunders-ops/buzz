@@ -99,6 +99,7 @@ pub async fn search_source_chunks_fts(
                           AND cursor.account_id=i.account_id AND cursor.scope_id=i.scope_id \
                           AND (cursor.last_success_at IS NULL \
                                OR cursor.last_success_at < statement_timestamp() - make_interval(mins => $6) \
+                               OR cursor.last_success_at > statement_timestamp() \
                                OR cursor.next_retry_at IS NOT NULL \
                                OR cursor.last_error_code IS NOT NULL) \
                     )) AS reconciliation_fresh \
@@ -505,6 +506,7 @@ pub async fn recheck_source_chunk_fts(
                       AND cursor.account_id=i.account_id AND cursor.scope_id=i.scope_id \
                       AND (cursor.last_success_at IS NULL \
                            OR cursor.last_success_at < statement_timestamp() - make_interval(mins => $10) \
+                           OR cursor.last_success_at > statement_timestamp() \
                            OR cursor.next_retry_at IS NOT NULL \
                            OR cursor.last_error_code IS NOT NULL) \
                 )) AS reconciliation_fresh, \
@@ -539,6 +541,7 @@ pub async fn recheck_source_chunk_fts(
                   AND cursor.account_id=i.account_id AND cursor.scope_id=i.scope_id \
                   AND (cursor.last_success_at IS NULL \
                        OR cursor.last_success_at < statement_timestamp() - make_interval(mins => $10) \
+                       OR cursor.last_success_at > statement_timestamp() \
                        OR cursor.next_retry_at IS NOT NULL \
                        OR cursor.last_error_code IS NOT NULL) \
            ))=$9 \
@@ -688,8 +691,21 @@ pub async fn resolve_source_evidence(
            ON s.community_id=i.community_id AND s.account_id=i.account_id \
           AND s.id=i.scope_id AND s.status='active' AND s.can_read \
          WHERE i.community_id=$1 AND i.id=$2 \
-           AND i.status='active' AND i.tombstoned_at IS NULL \
-           AND EXISTS ( \
+            AND i.status='active' AND i.tombstoned_at IS NULL \
+            AND EXISTS ( \
+                SELECT 1 FROM channels request_channel \
+                JOIN channel_members requester_membership \
+                  ON requester_membership.community_id=request_channel.community_id \
+                 AND requester_membership.channel_id=request_channel.id \
+                 AND requester_membership.pubkey=$4 \
+                 AND requester_membership.removed_at IS NULL \
+                WHERE request_channel.community_id=i.community_id \
+                  AND request_channel.id=$5 \
+                  AND request_channel.visibility='private' \
+                  AND request_channel.archived_at IS NULL \
+                  AND request_channel.deleted_at IS NULL \
+            ) \
+            AND EXISTS ( \
                SELECT 1 FROM source_chunks chunk \
                WHERE chunk.community_id=i.community_id AND chunk.item_id=i.id \
                  AND chunk.content_hash=$3 \
@@ -733,7 +749,20 @@ pub async fn resolve_source_evidence(
     }
 
     let state = sqlx::query(
-        "SELECT i.status, i.tombstoned_at, \
+        "SELECT i.id IS NOT NULL AS item_exists, i.status, i.tombstoned_at, \
+                EXISTS ( \
+                    SELECT 1 FROM channels request_channel \
+                    JOIN channel_members requester_membership \
+                      ON requester_membership.community_id=request_channel.community_id \
+                     AND requester_membership.channel_id=request_channel.id \
+                     AND requester_membership.pubkey=$3 \
+                     AND requester_membership.removed_at IS NULL \
+                    WHERE request_channel.community_id=$1 \
+                      AND request_channel.id=$4 \
+                      AND request_channel.visibility='private' \
+                      AND request_channel.archived_at IS NULL \
+                      AND request_channel.deleted_at IS NULL \
+                ) AS channel_authorized, \
                 EXISTS ( \
                     SELECT 1 FROM connector_accounts a \
                     WHERE a.community_id=i.community_id AND a.id=i.account_id \
@@ -763,7 +792,8 @@ pub async fn resolve_source_evidence(
                     WHERE chunk.community_id=i.community_id AND chunk.item_id=i.id \
                       AND chunk.content_hash=$5 \
                 ) AS exact_chunk \
-         FROM source_items i WHERE i.community_id=$1 AND i.id=$2",
+         FROM (SELECT 1) singleton \
+         LEFT JOIN source_items i ON i.community_id=$1 AND i.id=$2",
     )
     .bind(community_id.as_uuid())
     .bind(request.item_id)
@@ -776,6 +806,12 @@ pub async fn resolve_source_evidence(
     let Some(row) = state else {
         return Ok(EvidenceResolution::Unavailable);
     };
+    if !row.try_get::<bool, _>("channel_authorized")? {
+        return Ok(EvidenceResolution::Denied);
+    }
+    if !row.try_get::<bool, _>("item_exists")? {
+        return Ok(EvidenceResolution::Unavailable);
+    }
     let status: String = row.try_get("status")?;
     let tombstoned_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("tombstoned_at")?;
     if status != "active" || tombstoned_at.is_some() {

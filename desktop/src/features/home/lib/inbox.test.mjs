@@ -71,7 +71,7 @@ function insightPayload(overrides = {}) {
         citation: {
           title: "Client relationship record",
           modified_at: 1700000000,
-          resolver_id: "evidence:crm-record",
+          resolver_id: "evidence:550e8400-e29b-41d4-a716-446655440001",
         },
       },
     ],

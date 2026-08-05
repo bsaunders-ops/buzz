@@ -432,6 +432,36 @@ async fn fts_freshness_requires_every_configured_cursor_to_be_recent_and_healthy
         CitationFreshness::Fresh
     );
 
+    sqlx::query(
+        "UPDATE connector_delta_cursors SET last_success_at=NOW() + INTERVAL '1 minute' \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream='messages'",
+    )
+    .bind(community.as_uuid())
+    .bind(source.account_id)
+    .bind(source.scope_id)
+    .execute(&pool)
+    .await
+    .expect("future-date cursor success");
+    assert_eq!(
+        read_freshness(&pool, community).await,
+        CitationFreshness::Stale,
+        "a future-dated success timestamp is not trusted freshness"
+    );
+    sqlx::query(
+        "UPDATE connector_delta_cursors SET last_success_at=NOW() \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream='messages'",
+    )
+    .bind(community.as_uuid())
+    .bind(source.account_id)
+    .bind(source.scope_id)
+    .execute(&pool)
+    .await
+    .expect("restore current cursor success");
+    assert_eq!(
+        read_freshness(&pool, community).await,
+        CitationFreshness::Fresh
+    );
+
     seed_cursor(
         &pool,
         community,
@@ -489,6 +519,26 @@ async fn evidence_resolution_returns_metadata_only_after_current_complete_author
     let chunk_hash = source_chunk_hash(0, 0, 28, CONTENT);
     let direct_audience = ServerResolvedSourceAudience::new(ALLOWED.as_slice(), &[]);
 
+    sqlx::query(
+        "UPDATE channels SET visibility='private' \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("make request channel private");
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+         VALUES ($1, $2, $3, 'member')",
+    )
+    .bind(community.as_uuid())
+    .bind(channel)
+    .bind(ALLOWED.as_slice())
+    .execute(&pool)
+    .await
+    .expect("grant requester current private-channel membership");
+
     let resolved = resolve_source_evidence(
         &pool,
         community,
@@ -510,6 +560,77 @@ async fn evidence_resolution_returns_metadata_only_after_current_complete_author
         metadata.resolvable_link,
         "https://contoso.sharepoint.com/item"
     );
+
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NOW() \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel)
+    .bind(ALLOWED.as_slice())
+    .execute(&pool)
+    .await
+    .expect("remove direct-ACL requester from request channel");
+    assert_eq!(
+        resolve_source_evidence(
+            &pool,
+            community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &chunk_hash,
+                channel_id: channel,
+                audience: direct_audience,
+            },
+        )
+        .await
+        .expect("direct ACL after membership removal"),
+        EvidenceResolution::Denied,
+        "a direct-user ACL cannot bypass current request-channel membership"
+    );
+    sqlx::query(
+        "UPDATE channel_members SET removed_at=NULL \
+         WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(channel)
+    .bind(ALLOWED.as_slice())
+    .execute(&pool)
+    .await
+    .expect("restore requester membership");
+    sqlx::query(
+        "UPDATE channels SET visibility='open' \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("make request channel non-private");
+    assert_eq!(
+        resolve_source_evidence(
+            &pool,
+            community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &chunk_hash,
+                channel_id: channel,
+                audience: direct_audience,
+            },
+        )
+        .await
+        .expect("direct ACL in non-private channel"),
+        EvidenceResolution::Denied,
+        "evidence resolution is confined to private request channels"
+    );
+    sqlx::query(
+        "UPDATE channels SET visibility='private' \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("restore private request channel");
 
     assert!(!matches!(
         resolve_source_evidence(
@@ -619,14 +740,12 @@ async fn evidence_resolution_returns_metadata_only_after_current_complete_author
         EvidenceResolution::Stale
     );
 
-    sqlx::query(
-        "DELETE FROM source_item_acls WHERE community_id=$1 AND item_id=$2 AND principal_type='user'",
-    )
-    .bind(community.as_uuid())
-    .bind(source.item_id)
-    .execute(&pool)
-    .await
-    .expect("revoke direct ACL");
+    sqlx::query("DELETE FROM source_item_acls WHERE community_id=$1 AND item_id=$2")
+        .bind(community.as_uuid())
+        .bind(source.item_id)
+        .execute(&pool)
+        .await
+        .expect("revoke all source ACLs");
     assert_eq!(
         resolve_source_evidence(
             &pool,
