@@ -280,6 +280,7 @@ async fn synthetic_core_crm_read_reaches_only_the_authorized_private_assistant()
     .expect("bounded synthetic CRM operation");
     let snapshot = normalize_core_crm_response(
         &operation,
+        1,
         CRM_FIXTURE,
         vec![AclPrincipal::user(blake.public_key().to_bytes())],
     )

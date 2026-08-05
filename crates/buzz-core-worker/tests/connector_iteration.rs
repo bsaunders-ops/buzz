@@ -154,9 +154,18 @@ impl PageApplier for FakeApplier {
     }
 }
 
-#[derive(Default)]
 struct FakeFailureRecorder {
     codes: Vec<ConnectorIterationFailureCode>,
+    lease_remained_current: bool,
+}
+
+impl Default for FakeFailureRecorder {
+    fn default() -> Self {
+        Self {
+            codes: Vec::new(),
+            lease_remained_current: true,
+        }
+    }
 }
 
 impl FencedFailureRecorder for FakeFailureRecorder {
@@ -166,7 +175,7 @@ impl FencedFailureRecorder for FakeFailureRecorder {
         code: ConnectorIterationFailureCode,
     ) -> Result<bool, ConnectorBoundaryError> {
         self.codes.push(code);
-        Ok(true)
+        Ok(self.lease_remained_current)
     }
 }
 
@@ -414,6 +423,39 @@ async fn provider_failure_is_fenced_once_without_cursor_advance() {
     assert_eq!(
         outcome,
         ConnectorIterationOutcome::Deferred {
+            code: ConnectorIterationFailureCode::ProviderRateLimited,
+        }
+    );
+    assert_eq!(applier.applications, 0);
+    assert_eq!(applier.committed_cursor_hash, CURRENT_CURSOR_HASH);
+    assert_eq!(
+        failures.codes,
+        vec![ConnectorIterationFailureCode::ProviderRateLimited]
+    );
+}
+
+#[tokio::test]
+async fn stale_lease_never_reports_the_failure_as_recorded() {
+    let mut claimer = FakeClaimer {
+        claim: Some(claim()),
+    };
+    let mut provider = FakeProvider {
+        response: Some(Err(ProviderPageError::RateLimited)),
+        fetches: 0,
+    };
+    let mut applier = successful_applier(ApplyOutcome::Applied { changed_items: 1 });
+    let mut failures = FakeFailureRecorder {
+        codes: Vec::new(),
+        lease_remained_current: false,
+    };
+
+    let outcome = run_connector_iteration(&mut claimer, &mut provider, &mut applier, &mut failures)
+        .await
+        .expect("stale lease is a closed outcome");
+
+    assert_eq!(
+        outcome,
+        ConnectorIterationOutcome::LostLease {
             code: ConnectorIterationFailureCode::ProviderRateLimited,
         }
     );

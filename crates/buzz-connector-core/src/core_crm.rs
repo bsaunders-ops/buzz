@@ -411,8 +411,11 @@ fn validate_limit(value: u16, maximum: u16) -> Result<()> {
 }
 
 fn validate_uuid(value: &str) -> Result<()> {
+    parse_uuid(value).map(|_| ())
+}
+
+fn parse_uuid(value: &str) -> Result<Uuid> {
     Uuid::parse_str(value)
-        .map(|_| ())
         .map_err(|_| ConnectorError::InvalidData("Core CRM identifier is invalid"))
 }
 
@@ -512,6 +515,7 @@ impl CoreCrmRequestBuilder {
         }
         Ok(CoreCrmHttpRequest {
             url: self.url.clone(),
+            request_id: id,
             body,
         })
     }
@@ -520,6 +524,7 @@ impl CoreCrmRequestBuilder {
 /// Immutable fixed request descriptor used by the production transport.
 pub struct CoreCrmHttpRequest {
     url: Url,
+    request_id: u64,
     body: Vec<u8>,
 }
 
@@ -536,6 +541,12 @@ impl std::fmt::Debug for CoreCrmHttpRequest {
 }
 
 impl CoreCrmHttpRequest {
+    /// Exact JSON-RPC request identifier expected in the response.
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
     /// Exact destination URL.
     #[must_use]
     pub const fn url(&self) -> &Url {
@@ -583,13 +594,42 @@ impl CoreCrmHttpRequest {
     }
 }
 
+/// Bounded MCP response paired with the exact request identifier that produced it.
+pub struct CoreCrmMcpResponse {
+    request_id: u64,
+    body: Vec<u8>,
+}
+
+impl CoreCrmMcpResponse {
+    /// Pair one bounded response body with its originating nonzero request identifier.
+    pub fn new(request_id: u64, body: Vec<u8>) -> Result<Self> {
+        if request_id == 0 {
+            return Err(ConnectorError::InvalidData(
+                "Core CRM request identifier is invalid",
+            ));
+        }
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(ConnectorError::BoundExceeded("Core CRM response bytes"));
+        }
+        Ok(Self { request_id, body })
+    }
+
+    const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
 /// Injected MCP transport boundary for deterministic adapter tests.
 pub trait CoreCrmMcpTransport: Send + Sync {
-    /// Execute one closed read and return a bounded JSON-RPC response body.
+    /// Execute one closed read and preserve its request/response correlation.
     fn call<'a>(
         &'a self,
         operation: &'a CoreCrmReadOperation,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCrmMcpResponse>> + Send + 'a>>;
 }
 
 /// Production Streamable HTTP JSON transport for the current Core CRM MCP version.
@@ -615,10 +655,9 @@ impl CoreCrmHttpTransport {
         })
     }
 
-    async fn execute(&self, operation: &CoreCrmReadOperation) -> Result<Vec<u8>> {
-        let descriptor = self
-            .builder
-            .build(operation, self.next_id.fetch_add(1, Ordering::Relaxed))?;
+    async fn execute(&self, operation: &CoreCrmReadOperation) -> Result<CoreCrmMcpResponse> {
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let descriptor = self.builder.build(operation, request_id)?;
         let response = self
             .client
             .post(descriptor.url.clone())
@@ -665,7 +704,7 @@ impl CoreCrmHttpTransport {
             }
             bytes.extend_from_slice(&chunk);
         }
-        Ok(bytes)
+        CoreCrmMcpResponse::new(request_id, bytes)
     }
 }
 
@@ -673,7 +712,7 @@ impl CoreCrmMcpTransport for CoreCrmHttpTransport {
     fn call<'a>(
         &'a self,
         operation: &'a CoreCrmReadOperation,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCrmMcpResponse>> + Send + 'a>> {
         Box::pin(self.execute(operation))
     }
 }
@@ -697,7 +736,7 @@ impl<T: CoreCrmMcpTransport> CoreCrmReadAdapter<T> {
         acls: Vec<AclPrincipal>,
     ) -> Result<CoreCrmSnapshot> {
         let response = self.transport.call(operation).await?;
-        normalize_core_crm_response(operation, &response, acls)
+        normalize_core_crm_response(operation, response.request_id(), response.body(), acls)
     }
 }
 
@@ -708,9 +747,33 @@ pub enum CoreCrmSnapshotCoverage {
     BoundedInitialSnapshotOnly,
 }
 
+/// A validated identifier from a bounded discovery read that can seed a detail read.
+///
+/// Discovery results are deliberately not source upserts because the current
+/// capped MCP search/list operations cannot prove corpus completeness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreCrmDiscoveryResult {
+    /// Contact identifier accepted by `get_contact`.
+    Contact {
+        /// Validated contact UUID.
+        id: Uuid,
+    },
+    /// Company identifier accepted by `get_company`.
+    Company {
+        /// Validated company UUID.
+        id: Uuid,
+    },
+    /// Guidance slug accepted by `get_guidance_doc`.
+    GuidanceDocument {
+        /// Validated immutable guidance slug.
+        slug: String,
+    },
+}
+
 /// Validated provider-neutral source upserts from one bounded read.
 pub struct CoreCrmSnapshot {
     upserts: Vec<SourceItemUpsert>,
+    discovery_results: Vec<CoreCrmDiscoveryResult>,
     coverage: CoreCrmSnapshotCoverage,
 }
 
@@ -719,6 +782,11 @@ impl CoreCrmSnapshot {
     #[must_use]
     pub fn upserts(&self) -> &[SourceItemUpsert] {
         &self.upserts
+    }
+    /// Bounded typed targets for subsequent complete detail reads.
+    #[must_use]
+    pub fn discovery_results(&self) -> &[CoreCrmDiscoveryResult] {
+        &self.discovery_results
     }
     /// Snapshot-only coverage limitation.
     #[must_use]
@@ -736,6 +804,7 @@ impl CoreCrmSnapshot {
 /// Validate a JSON-RPC/MCP envelope and normalize only its expected tool result.
 pub fn normalize_core_crm_response(
     operation: &CoreCrmReadOperation,
+    expected_request_id: u64,
     response: &[u8],
     acls: Vec<AclPrincipal>,
 ) -> Result<CoreCrmSnapshot> {
@@ -744,7 +813,11 @@ pub fn normalize_core_crm_response(
     }
     let envelope: McpEnvelope = serde_json::from_slice(response)
         .map_err(|_| ConnectorError::InvalidData("Core CRM JSON-RPC envelope is invalid"))?;
-    if envelope.jsonrpc != "2.0" || envelope.id == 0 || envelope.result.is_error.unwrap_or(false) {
+    if expected_request_id == 0
+        || envelope.jsonrpc != "2.0"
+        || envelope.id != expected_request_id
+        || envelope.result.is_error.unwrap_or(false)
+    {
         return Err(ConnectorError::InvalidData(
             "Core CRM tool returned an error",
         ));
@@ -756,6 +829,7 @@ pub fn normalize_core_crm_response(
     }
     let text = &envelope.result.content[0].text;
     let mut upserts = Vec::new();
+    let mut discovery_results = Vec::new();
     match operation {
         CoreCrmReadOperation::GetContact(_) => {
             let record: ContactRecord = parse_tool_json(text)?;
@@ -856,6 +930,9 @@ pub fn normalize_core_crm_response(
             validate_page_len(records.len(), operation.page_limit())?;
             for record in records {
                 validate_contact_summary(&record)?;
+                discovery_results.push(CoreCrmDiscoveryResult::Contact {
+                    id: parse_uuid(&record.id)?,
+                });
             }
         }
         CoreCrmReadOperation::SearchCompanies(_) => {
@@ -863,6 +940,9 @@ pub fn normalize_core_crm_response(
             validate_page_len(records.len(), operation.page_limit())?;
             for record in records {
                 validate_company_summary(&record)?;
+                discovery_results.push(CoreCrmDiscoveryResult::Company {
+                    id: parse_uuid(&record.id)?,
+                });
             }
         }
         CoreCrmReadOperation::ListGuidanceDocs(_) => {
@@ -870,11 +950,14 @@ pub fn normalize_core_crm_response(
             validate_page_len(records.len(), operation.page_limit())?;
             for record in records {
                 validate_guidance_summary(&record)?;
+                discovery_results
+                    .push(CoreCrmDiscoveryResult::GuidanceDocument { slug: record.slug });
             }
         }
     }
     Ok(CoreCrmSnapshot {
         upserts,
+        discovery_results,
         coverage: CoreCrmSnapshotCoverage::BoundedInitialSnapshotOnly,
     })
 }
@@ -1283,6 +1366,16 @@ fn append_activity(
     acls: &[AclPrincipal],
     upserts: &mut Vec<SourceItemUpsert>,
 ) -> Result<()> {
+    if record.description_truncated.unwrap_or(false)
+        || record
+            .transcripts
+            .iter()
+            .any(|transcript| transcript.content_truncated.unwrap_or(false))
+    {
+        return Err(ConnectorError::InvalidData(
+            "Core CRM activity detail is truncated",
+        ));
+    }
     validate_uuid(&record.id)?;
     validate_uuid(&record.contact_id)?;
     validate_optional_uuid(record.voice_note_id.as_deref())?;

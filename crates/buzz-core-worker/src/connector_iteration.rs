@@ -213,6 +213,11 @@ pub enum ConnectorIterationOutcome {
         /// Closed safe failure code recorded for the claim.
         code: ConnectorIterationFailureCode,
     },
+    /// The claim lease changed before its failure could be recorded.
+    LostLease {
+        /// Closed safe failure code that was not recorded under the stale lease.
+        code: ConnectorIterationFailureCode,
+    },
 }
 
 /// Boxed result of one injected connector iteration.
@@ -289,8 +294,11 @@ async fn record_deferred<F: FencedFailureRecorder>(
     claim: &TrustedConnectorClaim,
     code: ConnectorIterationFailureCode,
 ) -> Result<ConnectorIterationOutcome, ConnectorBoundaryError> {
-    let _lease_remained_current = recorder.record_failure(claim, code).await?;
-    Ok(ConnectorIterationOutcome::Deferred { code })
+    if recorder.record_failure(claim, code).await? {
+        Ok(ConnectorIterationOutcome::Deferred { code })
+    } else {
+        Ok(ConnectorIterationOutcome::LostLease { code })
+    }
 }
 
 /// Claim, fetch, validate, and apply at most one provider page.
