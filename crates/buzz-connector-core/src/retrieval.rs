@@ -416,6 +416,7 @@ impl Citation {
 /// A post-rank reauthorized, turn-minimized source excerpt.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthorizedExcerpt {
+    source_item_id: Option<Uuid>,
     citation: Citation,
     text: String,
     start_char: usize,
@@ -451,6 +452,7 @@ impl AuthorizedExcerpt {
             return Err(ConnectorError::InvalidData("source excerpt is invalid"));
         }
         Ok(Self {
+            source_item_id: None,
             citation,
             text,
             start_char,
@@ -462,6 +464,27 @@ impl AuthorizedExcerpt {
     #[must_use]
     pub const fn citation(&self) -> &Citation {
         &self.citation
+    }
+
+    /// Trusted tenant-local source item locator.
+    ///
+    /// This value is present only for database-authorized retrievals and is
+    /// deliberately excluded from model excerpt serialization.
+    #[must_use]
+    pub const fn source_item_id(&self) -> Option<Uuid> {
+        self.source_item_id
+    }
+
+    fn new_with_source_item_id(
+        source_item_id: Uuid,
+        citation: Citation,
+        text: impl Into<String>,
+        start_char: usize,
+        end_char: usize,
+    ) -> Result<Self> {
+        let mut excerpt = Self::new(citation, text, start_char, end_char)?;
+        excerpt.source_item_id = Some(source_item_id);
+        Ok(excerpt)
     }
 
     /// Selected source text only.
@@ -477,6 +500,7 @@ impl AuthorizedExcerpt {
     #[must_use]
     pub fn matches_current_authorized_content(&self, current: &Self) -> bool {
         self.text == current.text
+            && self.source_item_id == current.source_item_id
             && self.start_char == current.start_char
             && self.end_char == current.end_char
             && current.citation.as_of >= self.citation.as_of
@@ -664,6 +688,7 @@ fn excerpt_from_recheck(
         || rechecked_item_hash != candidate_item_hash
         || rechecked_version != *candidate_version
         || rechecked_chunk_hash != candidate_chunk_hash
+        || rechecked.reconciliation_fresh != candidate.reconciliation_fresh
         || rechecked.acl_revision.len() != 32
     {
         return Err(ConnectorError::AuthorizationChanged);
@@ -678,13 +703,23 @@ fn excerpt_from_recheck(
         rechecked_item_hash,
         rechecked_version,
         rechecked_chunk_hash,
-        CitationFreshness::Fresh,
+        if rechecked.reconciliation_fresh {
+            CitationFreshness::Fresh
+        } else {
+            CitationFreshness::Stale
+        },
     )?;
     let start_char = usize::try_from(rechecked.start_char)
         .map_err(|_| ConnectorError::InvalidData("stored source offsets are invalid"))?;
     let end_char = usize::try_from(rechecked.end_char)
         .map_err(|_| ConnectorError::InvalidData("stored source offsets are invalid"))?;
-    AuthorizedExcerpt::new(citation, rechecked.content, start_char, end_char)
+    AuthorizedExcerpt::new_with_source_item_id(
+        rechecked.item_id,
+        citation,
+        rechecked.content,
+        start_char,
+        end_char,
+    )
 }
 
 /// Rank authorized PostgreSQL FTS candidates and re-read every candidate before
@@ -735,6 +770,7 @@ pub async fn retrieve_authorized_fts(
                 remote_version: remote_version.value(),
                 remote_etag: remote_version.etag(),
                 chunk_hash: &chunk_hash,
+                reconciliation_fresh: candidate.reconciliation_fresh,
                 audience,
             },
         )

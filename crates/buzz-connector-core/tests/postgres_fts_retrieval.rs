@@ -1,14 +1,15 @@
 use buzz_connector_core::{
     retrieval::{
-        retrieve_authorized_fts, source_item_identity_hash, FullTextRetrievalQuery,
-        RetrievalAudience,
+        retrieve_authorized_fts, source_item_identity_hash, CitationFreshness,
+        FullTextRetrievalQuery, RetrievalAudience,
     },
     types::{ConnectorProvider, RemoteVersion, SourceKind},
 };
 use buzz_core::CommunityId;
 use buzz_db::core_storage::{
-    recheck_source_chunk_fts, search_source_chunks_fts, source_chunk_hash,
-    ServerResolvedSourceAudience, SourceFtsCandidateRecheckRequest, SourceFtsSearchRequest,
+    recheck_source_chunk_fts, resolve_source_evidence, search_source_chunks_fts, source_chunk_hash,
+    EvidenceResolution, EvidenceResolveRequest, ServerResolvedSourceAudience,
+    SourceFtsCandidateRecheckRequest, SourceFtsSearchRequest,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -90,6 +91,29 @@ struct SeededSource {
     scope_id: Uuid,
     item_id: Uuid,
     chunk_id: Uuid,
+}
+
+async fn seed_cursor(
+    pool: &PgPool,
+    community: CommunityId,
+    source: &SeededSource,
+    stream: &str,
+    state_sql: &str,
+) {
+    let sql = format!(
+        "INSERT INTO connector_delta_cursors \
+         (community_id, account_id, scope_id, stream, encrypted_cursor, \
+          cursor_integrity_hash, cursor_key_version, last_success_at, next_retry_at, last_error_code) \
+         VALUES ($1, $2, $3, $4, decode('01', 'hex'), decode(repeat('11', 32), 'hex'), 1, {state_sql})"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(community.as_uuid())
+        .bind(source.account_id)
+        .bind(source.scope_id)
+        .bind(stream)
+        .execute(pool)
+        .await
+        .expect("insert connector cursor");
 }
 
 async fn seed_source(pool: &PgPool, community: CommunityId, channel_id: Uuid) -> SeededSource {
@@ -192,6 +216,14 @@ fn query(community: CommunityId, caller: [u8; 32], channels: Vec<Uuid>) -> FullT
     .expect("valid FTS query")
 }
 
+async fn read_freshness(pool: &PgPool, community: CommunityId) -> CitationFreshness {
+    retrieve_authorized_fts(pool, community, &query(community, ALLOWED, vec![]))
+        .await
+        .expect("authorized freshness read")[0]
+        .citation()
+        .freshness
+}
+
 #[test]
 fn item_identity_hash_is_domain_separated_and_binds_full_authority() {
     let original = source_item_identity_hash(
@@ -266,6 +298,12 @@ async fn fts_adapter_retrieves_before_embeddings_and_enforces_current_authority(
         .expect("authorized FTS retrieval");
     assert_eq!(excerpts.len(), 1);
     assert_eq!(excerpts[0].text(), CONTENT);
+    assert_eq!(excerpts[0].source_item_id(), Some(source.item_id));
+    assert_eq!(
+        excerpts[0].citation().freshness,
+        CitationFreshness::Stale,
+        "a scope with no configured cursor is stale"
+    );
     assert_eq!(
         excerpts[0].citation().provider,
         ConnectorProvider::MicrosoftGraph
@@ -378,6 +416,303 @@ async fn fts_adapter_retrieves_before_embeddings_and_enforces_current_authority(
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
+async fn fts_freshness_requires_every_configured_cursor_to_be_recent_and_healthy() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, channel) = seed_community(&pool, "fts-freshness").await;
+    let source = seed_source(&pool, community, channel).await;
+
+    assert_eq!(
+        read_freshness(&pool, community).await,
+        CitationFreshness::Stale
+    );
+
+    seed_cursor(&pool, community, &source, "messages", "NOW(), NULL, NULL").await;
+    assert_eq!(
+        read_freshness(&pool, community).await,
+        CitationFreshness::Fresh
+    );
+
+    seed_cursor(
+        &pool,
+        community,
+        &source,
+        "calendar",
+        "NOW() - INTERVAL '16 minutes', NULL, NULL",
+    )
+    .await;
+    assert_eq!(
+        read_freshness(&pool, community).await,
+        CitationFreshness::Stale
+    );
+
+    sqlx::query(
+        "UPDATE connector_delta_cursors SET last_success_at=NOW(), \
+         next_retry_at=NOW() + INTERVAL '1 minute', last_error_code='retry' \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream='calendar'",
+    )
+    .bind(community.as_uuid())
+    .bind(source.account_id)
+    .bind(source.scope_id)
+    .execute(&pool)
+    .await
+    .expect("mark cursor retrying");
+    assert_eq!(
+        read_freshness(&pool, community).await,
+        CitationFreshness::Stale
+    );
+
+    sqlx::query(
+        "UPDATE connector_delta_cursors SET next_retry_at=NULL, last_error_code=NULL \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(source.account_id)
+    .bind(source.scope_id)
+    .execute(&pool)
+    .await
+    .expect("make all cursors healthy");
+    assert_eq!(
+        read_freshness(&pool, community).await,
+        CitationFreshness::Fresh
+    );
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn evidence_resolution_returns_metadata_only_after_current_complete_authorization() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, channel) = seed_community(&pool, "evidence-a").await;
+    let (other_community, _) = seed_community(&pool, "evidence-b").await;
+    let source = seed_source(&pool, community, channel).await;
+    let chunk_hash = source_chunk_hash(0, 0, 28, CONTENT);
+    let direct_audience = ServerResolvedSourceAudience::new(ALLOWED.as_slice(), &[]);
+
+    let resolved = resolve_source_evidence(
+        &pool,
+        community,
+        EvidenceResolveRequest {
+            item_id: source.item_id,
+            chunk_hash: &chunk_hash,
+            channel_id: channel,
+            audience: direct_audience,
+        },
+    )
+    .await
+    .expect("resolve authorized source");
+    let EvidenceResolution::Resolved(metadata) = resolved else {
+        panic!("authorized evidence must resolve");
+    };
+    assert_eq!(metadata.title, "Needle source");
+    assert_eq!(metadata.source_type, "document");
+    assert_eq!(
+        metadata.resolvable_link,
+        "https://contoso.sharepoint.com/item"
+    );
+
+    assert!(!matches!(
+        resolve_source_evidence(
+            &pool,
+            other_community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &chunk_hash,
+                channel_id: channel,
+                audience: direct_audience,
+            },
+        )
+        .await
+        .expect("cross-tenant resolution"),
+        EvidenceResolution::Resolved(_)
+    ));
+    let denied_audience = ServerResolvedSourceAudience::new(DENIED.as_slice(), &[]);
+    assert_eq!(
+        resolve_source_evidence(
+            &pool,
+            community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &chunk_hash,
+                channel_id: channel,
+                audience: denied_audience,
+            },
+        )
+        .await
+        .expect("denied-user resolution"),
+        EvidenceResolution::Denied
+    );
+    let forged_channels = [channel];
+    let forged_channel_audience =
+        ServerResolvedSourceAudience::new(DENIED.as_slice(), &forged_channels);
+    assert_eq!(
+        resolve_source_evidence(
+            &pool,
+            community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &chunk_hash,
+                channel_id: channel,
+                audience: forged_channel_audience,
+            },
+        )
+        .await
+        .expect("non-member channel resolution"),
+        EvidenceResolution::Denied
+    );
+
+    let different_channel = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO channels (community_id, id, name, created_by) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(community.as_uuid())
+    .bind(different_channel)
+    .bind("different-private-channel")
+    .bind(OWNER.as_slice())
+    .execute(&pool)
+    .await
+    .expect("insert different request channel");
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+         VALUES ($1, $2, $3, 'member')",
+    )
+    .bind(community.as_uuid())
+    .bind(channel)
+    .bind(DENIED.as_slice())
+    .execute(&pool)
+    .await
+    .expect("grant membership in source-authorized channel");
+    let authorized_channels = [channel, different_channel];
+    let multi_channel_audience =
+        ServerResolvedSourceAudience::new(DENIED.as_slice(), &authorized_channels);
+    assert_eq!(
+        resolve_source_evidence(
+            &pool,
+            community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &chunk_hash,
+                channel_id: different_channel,
+                audience: multi_channel_audience,
+            },
+        )
+        .await
+        .expect("different-channel resolution"),
+        EvidenceResolution::Denied,
+        "an ACL on another authorized channel must not resolve in this channel"
+    );
+
+    let changed_hash = [9_u8; 32];
+    assert_eq!(
+        resolve_source_evidence(
+            &pool,
+            community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &changed_hash,
+                channel_id: channel,
+                audience: direct_audience,
+            },
+        )
+        .await
+        .expect("changed-hash resolution"),
+        EvidenceResolution::Stale
+    );
+
+    sqlx::query(
+        "DELETE FROM source_item_acls WHERE community_id=$1 AND item_id=$2 AND principal_type='user'",
+    )
+    .bind(community.as_uuid())
+    .bind(source.item_id)
+    .execute(&pool)
+    .await
+    .expect("revoke direct ACL");
+    assert_eq!(
+        resolve_source_evidence(
+            &pool,
+            community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &chunk_hash,
+                channel_id: channel,
+                audience: direct_audience,
+            },
+        )
+        .await
+        .expect("revoked resolution"),
+        EvidenceResolution::Denied
+    );
+
+    sqlx::query(
+        "INSERT INTO source_item_acls \
+         (community_id, id, item_id, principal_type, principal_pubkey) \
+         VALUES ($1, $2, $3, 'user', $4)",
+    )
+    .bind(community.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(source.item_id)
+    .bind(ALLOWED.as_slice())
+    .execute(&pool)
+    .await
+    .expect("restore direct ACL");
+    sqlx::query("UPDATE source_items SET tombstoned_at=NOW() WHERE community_id=$1 AND id=$2")
+        .bind(community.as_uuid())
+        .bind(source.item_id)
+        .execute(&pool)
+        .await
+        .expect("tombstone source");
+    assert_eq!(
+        resolve_source_evidence(
+            &pool,
+            community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &chunk_hash,
+                channel_id: channel,
+                audience: direct_audience,
+            },
+        )
+        .await
+        .expect("tombstoned resolution"),
+        EvidenceResolution::Unavailable
+    );
+    sqlx::query("UPDATE source_items SET tombstoned_at=NULL WHERE community_id=$1 AND id=$2")
+        .bind(community.as_uuid())
+        .bind(source.item_id)
+        .execute(&pool)
+        .await
+        .expect("restore source after tombstone check");
+    sqlx::query(
+        "UPDATE approved_source_scopes SET status='paused' \
+         WHERE community_id=$1 AND account_id=$2 AND id=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(source.account_id)
+    .bind(source.scope_id)
+    .execute(&pool)
+    .await
+    .expect("pause evidence scope");
+    assert_eq!(
+        resolve_source_evidence(
+            &pool,
+            community,
+            EvidenceResolveRequest {
+                item_id: source.item_id,
+                chunk_hash: &chunk_hash,
+                channel_id: channel,
+                audience: direct_audience,
+            },
+        )
+        .await
+        .expect("paused-scope resolution"),
+        EvidenceResolution::Unavailable
+    );
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
 async fn fts_adapter_fails_closed_on_malformed_ranked_metadata() {
     let (admin, pool, name) = scratch_db().await;
     let (community, channel) = seed_community(&pool, "fts-malformed").await;
@@ -446,6 +781,7 @@ async fn fts_recheck_omits_ranked_candidates_after_revocation_or_version_change(
             remote_version: &ranked.remote_version,
             remote_etag: ranked.remote_etag.as_deref(),
             chunk_hash: &ranked.chunk_hash,
+            reconciliation_fresh: ranked.reconciliation_fresh,
             audience,
         },
     )
@@ -480,6 +816,7 @@ async fn fts_recheck_omits_ranked_candidates_after_revocation_or_version_change(
             remote_version: &ranked.remote_version,
             remote_etag: ranked.remote_etag.as_deref(),
             chunk_hash: &ranked.chunk_hash,
+            reconciliation_fresh: ranked.reconciliation_fresh,
             audience,
         },
     )

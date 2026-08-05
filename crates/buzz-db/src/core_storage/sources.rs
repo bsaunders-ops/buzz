@@ -1,13 +1,17 @@
 use buzz_core::CommunityId;
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgRow, PgPool, Row};
+use url::Url;
 
 use super::{
     require_hash, require_pubkey, source_chunk_hash, AuthorizedSourceExcerptRecord,
-    AuthorizedSourceFtsExcerptRecord, SourceCandidateRecheckRequest, SourceCitationRecord,
+    AuthorizedSourceFtsExcerptRecord, EvidenceResolution, EvidenceResolveRequest,
+    ResolvedSourceEvidence, SourceCandidateRecheckRequest, SourceCitationRecord,
     SourceFtsCandidateRecheckRequest, SourceFtsCitationRecord, SourceFtsSearchRequest,
     SourceSearchRequest, SourceVectorSearchRequest, EMBEDDING_DIMENSIONS,
 };
+
+const RECONCILIATION_FRESHNESS_MINUTES: i32 = 15;
 
 fn validate_limit(limit: i64) -> crate::Result<()> {
     if !(1..=100).contains(&limit) {
@@ -56,6 +60,7 @@ fn fts_citation_from_row(row: PgRow) -> crate::Result<SourceFtsCitationRecord> {
         chunk_hash: row.try_get("chunk_hash")?,
         start_char: row.try_get("start_char")?,
         end_char: row.try_get("end_char")?,
+        reconciliation_fresh: row.try_get("reconciliation_fresh")?,
     })
 }
 
@@ -83,7 +88,20 @@ pub async fn search_source_chunks_fts(
         "WITH eligible_items AS MATERIALIZED ( \
              SELECT i.community_id, i.id, i.account_id, i.scope_id, i.external_item_id, \
                     a.provider, i.title, i.source_type, i.modified_at, \
-                    i.resolvable_link, i.remote_version, i.remote_etag \
+                    i.resolvable_link, i.remote_version, i.remote_etag, \
+                    (EXISTS ( \
+                        SELECT 1 FROM connector_delta_cursors cursor \
+                        WHERE cursor.community_id=i.community_id \
+                          AND cursor.account_id=i.account_id AND cursor.scope_id=i.scope_id \
+                    ) AND NOT EXISTS ( \
+                        SELECT 1 FROM connector_delta_cursors cursor \
+                        WHERE cursor.community_id=i.community_id \
+                          AND cursor.account_id=i.account_id AND cursor.scope_id=i.scope_id \
+                          AND (cursor.last_success_at IS NULL \
+                               OR cursor.last_success_at < statement_timestamp() - make_interval(mins => $6) \
+                               OR cursor.next_retry_at IS NOT NULL \
+                               OR cursor.last_error_code IS NOT NULL) \
+                    )) AS reconciliation_fresh \
              FROM source_items i \
              JOIN connector_accounts a \
                ON a.community_id=i.community_id AND a.id=i.account_id AND a.status='active' \
@@ -110,7 +128,8 @@ pub async fn search_source_chunks_fts(
          SELECT i.id AS item_id, c.id AS chunk_id, i.account_id, i.scope_id, \
                 i.external_item_id, i.provider, i.title, i.source_type, i.modified_at, \
                 i.resolvable_link, i.remote_version, i.remote_etag, \
-                c.content_hash AS chunk_hash, c.start_char, c.end_char \
+                c.content_hash AS chunk_hash, c.start_char, c.end_char, \
+                i.reconciliation_fresh \
          FROM eligible_items i \
          JOIN source_chunks c ON c.community_id=i.community_id AND c.item_id=i.id \
          WHERE c.search_tsv @@ websearch_to_tsquery('simple', $4) \
@@ -123,6 +142,7 @@ pub async fn search_source_chunks_fts(
     .bind(authorized_channel_ids)
     .bind(request.query)
     .bind(request.limit)
+    .bind(RECONCILIATION_FRESHNESS_MINUTES)
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(fts_citation_from_row).collect()
@@ -475,6 +495,19 @@ pub async fn recheck_source_chunk_fts(
                 i.external_item_id, a.provider, i.title, i.source_type, i.modified_at, \
                 i.resolvable_link, i.remote_version, i.remote_etag, c.content_hash AS chunk_hash, \
                 c.chunk_index, c.start_char, c.end_char, c.content, \
+                (EXISTS ( \
+                    SELECT 1 FROM connector_delta_cursors cursor \
+                    WHERE cursor.community_id=i.community_id \
+                      AND cursor.account_id=i.account_id AND cursor.scope_id=i.scope_id \
+                ) AND NOT EXISTS ( \
+                    SELECT 1 FROM connector_delta_cursors cursor \
+                    WHERE cursor.community_id=i.community_id \
+                      AND cursor.account_id=i.account_id AND cursor.scope_id=i.scope_id \
+                      AND (cursor.last_success_at IS NULL \
+                           OR cursor.last_success_at < statement_timestamp() - make_interval(mins => $10) \
+                           OR cursor.next_retry_at IS NOT NULL \
+                           OR cursor.last_error_code IS NOT NULL) \
+                )) AS reconciliation_fresh, \
                 clock_timestamp() AS authorization_checked_at, \
                 COALESCE(( \
                     SELECT string_agg( \
@@ -496,6 +529,19 @@ pub async fn recheck_source_chunk_fts(
            AND i.status='active' AND i.tombstoned_at IS NULL \
            AND i.remote_version=$4 AND i.remote_etag IS NOT DISTINCT FROM $5 \
            AND c.content_hash=$6 \
+           AND (EXISTS ( \
+                SELECT 1 FROM connector_delta_cursors cursor \
+                WHERE cursor.community_id=i.community_id \
+                  AND cursor.account_id=i.account_id AND cursor.scope_id=i.scope_id \
+           ) AND NOT EXISTS ( \
+                SELECT 1 FROM connector_delta_cursors cursor \
+                WHERE cursor.community_id=i.community_id \
+                  AND cursor.account_id=i.account_id AND cursor.scope_id=i.scope_id \
+                  AND (cursor.last_success_at IS NULL \
+                       OR cursor.last_success_at < statement_timestamp() - make_interval(mins => $10) \
+                       OR cursor.next_retry_at IS NOT NULL \
+                       OR cursor.last_error_code IS NOT NULL) \
+           ))=$9 \
            AND EXISTS ( \
                SELECT 1 FROM source_item_acls acl \
                WHERE acl.community_id=i.community_id AND acl.item_id=i.id \
@@ -520,6 +566,8 @@ pub async fn recheck_source_chunk_fts(
     .bind(request.chunk_hash)
     .bind(requester_pubkey)
     .bind(authorized_channel_ids)
+    .bind(request.reconciliation_fresh)
+    .bind(RECONCILIATION_FRESHNESS_MINUTES)
     .fetch_optional(pool)
     .await?;
 
@@ -577,7 +625,168 @@ pub async fn recheck_source_chunk_fts(
             content,
             acl_revision: hasher.finalize().to_vec(),
             authorization_checked_at: row.try_get("authorization_checked_at")?,
+            reconciliation_fresh: row.try_get("reconciliation_fresh")?,
         })
     })
     .transpose()
+}
+
+fn evidence_link_is_allowed(provider: &str, raw_link: &str) -> bool {
+    let Ok(link) = Url::parse(raw_link) else {
+        return false;
+    };
+    if link.scheme() != "https"
+        || link.port().is_some()
+        || !link.username().is_empty()
+        || link.password().is_some()
+        || link.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = link.host_str() else {
+        return false;
+    };
+    match provider {
+        "microsoft_graph" => {
+            host.eq_ignore_ascii_case("outlook.office.com")
+                || host.eq_ignore_ascii_case("outlook.office365.com")
+                || host
+                    .to_ascii_lowercase()
+                    .strip_suffix(".sharepoint.com")
+                    .is_some_and(|tenant| !tenant.is_empty() && !tenant.contains('.'))
+        }
+        "google_drive" => [
+            "drive.google.com",
+            "docs.google.com",
+            "sheets.google.com",
+            "slides.google.com",
+        ]
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed)),
+        "core_crm" => host.eq_ignore_ascii_case("crm.coreadvs.com"),
+        _ => false,
+    }
+}
+
+/// Resolve one opaque evidence locator only after a current tenant, lifecycle,
+/// exact-revision, scope, ACL, and channel-membership authorization read.
+pub async fn resolve_source_evidence(
+    pool: &PgPool,
+    community_id: CommunityId,
+    request: EvidenceResolveRequest<'_>,
+) -> crate::Result<EvidenceResolution> {
+    let requester_pubkey = request.audience.requester_pubkey();
+    require_pubkey("requester_pubkey", requester_pubkey)?;
+    require_hash("chunk_hash", request.chunk_hash)?;
+
+    let resolved = sqlx::query(
+        "SELECT a.provider, i.title, i.source_type, i.modified_at, i.resolvable_link \
+         FROM source_items i \
+         JOIN connector_accounts a \
+           ON a.community_id=i.community_id AND a.id=i.account_id AND a.status='active' \
+         JOIN approved_source_scopes s \
+           ON s.community_id=i.community_id AND s.account_id=i.account_id \
+          AND s.id=i.scope_id AND s.status='active' AND s.can_read \
+         WHERE i.community_id=$1 AND i.id=$2 \
+           AND i.status='active' AND i.tombstoned_at IS NULL \
+           AND EXISTS ( \
+               SELECT 1 FROM source_chunks chunk \
+               WHERE chunk.community_id=i.community_id AND chunk.item_id=i.id \
+                 AND chunk.content_hash=$3 \
+           ) \
+           AND EXISTS ( \
+               SELECT 1 FROM source_item_acls acl \
+               WHERE acl.community_id=i.community_id AND acl.item_id=i.id \
+                 AND ( \
+                   (acl.principal_type='user' AND acl.principal_pubkey=$4) \
+                   OR \
+                   (acl.principal_type='channel' AND acl.channel_id=$5 \
+                    AND EXISTS ( \
+                        SELECT 1 FROM channel_members member \
+                        WHERE member.community_id=acl.community_id \
+                          AND member.channel_id=acl.channel_id \
+                          AND member.pubkey=$4 AND member.removed_at IS NULL \
+                    )) \
+                 ) \
+           )",
+    )
+    .bind(community_id.as_uuid())
+    .bind(request.item_id)
+    .bind(request.chunk_hash)
+    .bind(requester_pubkey)
+    .bind(request.channel_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = resolved {
+        let provider: String = row.try_get("provider")?;
+        let resolvable_link: String = row.try_get("resolvable_link")?;
+        if !evidence_link_is_allowed(&provider, &resolvable_link) {
+            return Ok(EvidenceResolution::Unavailable);
+        }
+        return Ok(EvidenceResolution::Resolved(ResolvedSourceEvidence {
+            title: row.try_get("title")?,
+            source_type: row.try_get("source_type")?,
+            modified_at: row.try_get("modified_at")?,
+            resolvable_link,
+        }));
+    }
+
+    let state = sqlx::query(
+        "SELECT i.status, i.tombstoned_at, \
+                EXISTS ( \
+                    SELECT 1 FROM connector_accounts a \
+                    WHERE a.community_id=i.community_id AND a.id=i.account_id \
+                      AND a.status='active' \
+                ) AND EXISTS ( \
+                    SELECT 1 FROM approved_source_scopes s \
+                    WHERE s.community_id=i.community_id AND s.account_id=i.account_id \
+                      AND s.id=i.scope_id AND s.status='active' AND s.can_read \
+                ) AS source_readable, \
+                EXISTS ( \
+                    SELECT 1 FROM source_item_acls acl \
+                    WHERE acl.community_id=i.community_id AND acl.item_id=i.id \
+                      AND ( \
+                        (acl.principal_type='user' AND acl.principal_pubkey=$3) \
+                        OR \
+                        (acl.principal_type='channel' AND acl.channel_id=$4 \
+                         AND EXISTS ( \
+                             SELECT 1 FROM channel_members member \
+                             WHERE member.community_id=acl.community_id \
+                               AND member.channel_id=acl.channel_id \
+                               AND member.pubkey=$3 AND member.removed_at IS NULL \
+                         )) \
+                      ) \
+                ) AS has_authority, \
+                EXISTS ( \
+                    SELECT 1 FROM source_chunks chunk \
+                    WHERE chunk.community_id=i.community_id AND chunk.item_id=i.id \
+                      AND chunk.content_hash=$5 \
+                ) AS exact_chunk \
+         FROM source_items i WHERE i.community_id=$1 AND i.id=$2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(request.item_id)
+    .bind(requester_pubkey)
+    .bind(request.channel_id)
+    .bind(request.chunk_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = state else {
+        return Ok(EvidenceResolution::Unavailable);
+    };
+    let status: String = row.try_get("status")?;
+    let tombstoned_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("tombstoned_at")?;
+    if status != "active" || tombstoned_at.is_some() {
+        Ok(EvidenceResolution::Unavailable)
+    } else if !row.try_get::<bool, _>("source_readable")?
+        || !row.try_get::<bool, _>("has_authority")?
+    {
+        Ok(EvidenceResolution::Denied)
+    } else if !row.try_get::<bool, _>("exact_chunk")? {
+        Ok(EvidenceResolution::Stale)
+    } else {
+        Ok(EvidenceResolution::Unavailable)
+    }
 }

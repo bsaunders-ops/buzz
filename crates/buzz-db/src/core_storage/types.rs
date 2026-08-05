@@ -1514,6 +1514,9 @@ pub struct SourceFtsCitationRecord {
     pub start_char: i64,
     /// Exclusive Unicode-scalar offset in normalized source text.
     pub end_char: i64,
+    /// Whether every configured cursor for this account/scope reconciled
+    /// successfully within the server-controlled freshness objective.
+    pub reconciliation_fresh: bool,
 }
 
 impl std::fmt::Debug for SourceFtsCitationRecord {
@@ -1651,6 +1654,9 @@ pub struct AuthorizedSourceFtsExcerptRecord {
     pub acl_revision: Vec<u8>,
     /// Database timestamp of the authorization recheck.
     pub authorization_checked_at: DateTime<Utc>,
+    /// Whether every configured cursor still satisfies the server-controlled
+    /// freshness objective at the authorization recheck.
+    pub reconciliation_fresh: bool,
 }
 
 impl std::fmt::Debug for AuthorizedSourceFtsExcerptRecord {
@@ -1689,8 +1695,69 @@ pub struct SourceFtsCandidateRecheckRequest<'a> {
     pub remote_etag: Option<&'a str>,
     /// Exact chunk hash returned by the rank query.
     pub chunk_hash: &'a [u8],
+    /// Exact reconciliation state observed during candidate ranking.
+    pub reconciliation_fresh: bool,
     /// Server-authenticated request audience.
     pub audience: ServerResolvedSourceAudience<'a>,
+}
+
+/// Authorization-bound request to resolve one opaque local evidence locator.
+#[derive(Clone, Copy, Debug)]
+pub struct EvidenceResolveRequest<'a> {
+    /// Opaque tenant-local source item UUID carried by the trusted broker.
+    pub item_id: Uuid,
+    /// Exact cited source chunk hash.
+    pub chunk_hash: &'a [u8],
+    /// Exact private channel carrying the resolve request.
+    pub channel_id: Uuid,
+    /// Server-authenticated direct-user and channel audience.
+    pub audience: ServerResolvedSourceAudience<'a>,
+}
+
+/// Provider metadata released only after a complete current authorization read.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedSourceEvidence {
+    /// Human-readable source title.
+    pub title: String,
+    /// Closed source type wire value.
+    pub source_type: String,
+    /// Provider modification timestamp.
+    pub modified_at: DateTime<Utc>,
+    /// Stable provider HTTPS link, validated by the connector layer before use.
+    pub resolvable_link: String,
+}
+
+impl std::fmt::Debug for ResolvedSourceEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedSourceEvidence")
+            .field("source_metadata_redacted", &true)
+            .finish()
+    }
+}
+
+/// Outcome of a current evidence authorization and revision check.
+#[derive(Clone, PartialEq, Eq)]
+pub enum EvidenceResolution {
+    /// Current authority and exact chunk revision matched.
+    Resolved(ResolvedSourceEvidence),
+    /// The source exists but the requester lacks current positive authority.
+    Denied,
+    /// The opaque source exists but the cited chunk revision no longer matches.
+    Stale,
+    /// The source is absent, inactive, tombstoned, or otherwise unavailable.
+    Unavailable,
+}
+
+impl std::fmt::Debug for EvidenceResolution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Resolved(_) => "EvidenceResolution::Resolved(<redacted>)",
+            Self::Denied => "EvidenceResolution::Denied",
+            Self::Stale => "EvidenceResolution::Stale",
+            Self::Unavailable => "EvidenceResolution::Unavailable",
+        })
+    }
 }
 
 impl std::fmt::Debug for AuthorizedSourceExcerptRecord {
