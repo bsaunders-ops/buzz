@@ -478,7 +478,8 @@ pub async fn apply_source_change_page(
         "UPDATE connector_delta_cursors \
          SET encrypted_cursor=$8, cursor_integrity_hash=$9, cursor_key_version=$10, \
              last_page_digest=$12, \
-             last_success_at=$7, lease_owner=NULL, lease_until=NULL, retry_count=0, \
+             last_success_at=CASE WHEN $13 THEN $7 ELSE last_success_at END, \
+             lease_owner=NULL, lease_until=NULL, retry_count=0, \
              next_retry_at=NULL, last_error_code=NULL, updated_at=$7 \
          WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream=$4 \
            AND lease_owner=$5 AND generation=$6 AND lease_until > $7 \
@@ -496,6 +497,7 @@ pub async fn apply_source_change_page(
     .bind(page.next_cursor_key_version)
     .bind(page.expected_cursor_integrity_hash)
     .bind(page.page_digest)
+    .bind(page.reconciliation_complete)
     .execute(&mut *transaction)
     .await?
     .rows_affected();
@@ -546,6 +548,7 @@ mod tests {
             next_cursor_integrity_hash: &[3; 32],
             next_cursor_key_version: 1,
             page_digest: &[4; 32],
+            reconciliation_complete: true,
             upserts: &[item],
             tombstones: &[],
             now: chrono::Utc::now(),
@@ -581,6 +584,7 @@ mod tests {
             next_cursor_integrity_hash: &[3; 32],
             next_cursor_key_version: 1,
             page_digest: &[4; 32],
+            reconciliation_complete: true,
             upserts: items,
             tombstones: &[],
             now: chrono::Utc::now(),

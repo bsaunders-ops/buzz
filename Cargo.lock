@@ -905,6 +905,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-connector-core",
  "buzz-core",
+ "buzz-core-worker",
  "buzz-db",
  "buzz-sdk",
  "chrono",
@@ -1065,15 +1066,23 @@ dependencies = [
 name = "buzz-core-worker"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
+ "base64 0.22.1",
  "buzz-connector-core",
+ "buzz-core",
+ "buzz-db",
  "chrono",
  "clap",
+ "getrandom 0.4.3",
+ "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

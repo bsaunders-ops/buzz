@@ -7,23 +7,31 @@ use buzz_assistant_broker::{
 };
 use buzz_connector_core::{
     apply::ApplyOutcome,
-    core_crm::{normalize_core_crm_response, CoreCrmReadOperation, CoreCrmSnapshotCoverage},
+    core_crm::{normalize_core_crm_response, CoreCrmReadOperation},
+    core_crm_sync::{CoreCrmSyncCursorV1, CoreCrmSyncTarget, CoreCrmTrackedTarget},
     persistence::apply_postgres_change_page,
     retrieval::{AuthorizedExcerpt, FullTextRetrievalQuery},
-    types::{
-        AccountId, AclPrincipal, ChangePage, ConnectorProvider, EncryptedCursor, RemoteCheckpoint,
-        ScopeId,
-    },
+    types::{AccountId, AclPrincipal, ConnectorProvider, EncryptedCursor, ScopeId},
 };
 use buzz_core::{
-    core_protocol::{EvidenceResolverId, InsightPayload},
+    core_protocol::{
+        EvidenceResolveRequestPayload, EvidenceResolveResultPayload, EvidenceResolvedSourceType,
+        EvidenceResolverId, InsightPayload,
+    },
     CommunityId,
 };
-use buzz_db::core_storage::{
-    claim_delta_scope, resolve_source_evidence, EvidenceResolution, EvidenceResolveRequest,
-    ServerResolvedSourceAudience,
+use buzz_core_worker::{
+    connector_iteration::{PageProvider, ProviderPageError, TrustedConnectorClaim},
+    core_crm_provider::{
+        CoreCrmCursorCodec, CoreCrmPageProvider, CoreCrmReadOutcome, CoreCrmSnapshotReader,
+    },
+    postgres_core_crm::CoreCrmAesCursorCodec,
 };
-use chrono::Utc;
+use buzz_db::core_storage::{
+    claim_next_core_crm_delta_scope, resolve_source_evidence, CoreCrmDeltaScopeClaim,
+    EvidenceResolution, EvidenceResolveRequest, ServerResolvedSourceAudience,
+};
+use chrono::{Duration, Utc};
 use nostr::{EventBuilder, Keys, PublicKey};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -37,7 +45,8 @@ const OTHER_PRIVATE_CHANNEL: Uuid = Uuid::from_u128(0x401);
 // One minute after the fixture's latest provider modification timestamp.
 const CREATED_AT: i64 = 1_785_596_705;
 const CREDENTIAL_REFERENCE: &str = "kv-synthetic-secret-sentinel";
-const STREAM: &str = "bounded-snapshot";
+const STREAM: &str = "known-records";
+const CURSOR_KEY: [u8; 32] = [91; 32];
 
 fn test_db_url() -> String {
     std::env::var("BUZZ_TEST_DATABASE_URL")
@@ -94,6 +103,35 @@ async fn seed_community(pool: &PgPool, label: &str, users: &[PublicKey]) -> Comm
     CommunityId::from_uuid(community)
 }
 
+async fn seed_private_channel(
+    pool: &PgPool,
+    community: CommunityId,
+    channel_id: Uuid,
+    owner: PublicKey,
+) {
+    sqlx::query(
+        "INSERT INTO channels \
+         (community_id, id, name, channel_type, visibility, created_by) \
+         VALUES ($1, $2, 'core-relationship-assistant', 'dm', 'private', $3)",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(owner.to_bytes().as_slice())
+    .execute(pool)
+    .await
+    .expect("insert private assistant channel");
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+         VALUES ($1, $2, $3, 'owner')",
+    )
+    .bind(community.as_uuid())
+    .bind(channel_id)
+    .bind(owner.to_bytes().as_slice())
+    .execute(pool)
+    .await
+    .expect("insert private assistant owner membership");
+}
+
 async fn seed_core_crm_scope(
     pool: &PgPool,
     community: CommunityId,
@@ -101,6 +139,29 @@ async fn seed_core_crm_scope(
 ) -> (Uuid, Uuid) {
     let account_id = Uuid::new_v4();
     let scope_id = Uuid::new_v4();
+    let logical_cursor = CoreCrmSyncCursorV1::new(vec![CoreCrmTrackedTarget::new(
+        CoreCrmSyncTarget::contact(
+            Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("fixture contact UUID"),
+        ),
+        Vec::new(),
+    )
+    .expect("tracked contact")])
+    .expect("initial known-record cursor");
+    let seed_claim = TrustedConnectorClaim::new(
+        *community.as_uuid(),
+        AccountId::new(account_id),
+        ScopeId::new(scope_id),
+        ConnectorProvider::CoreCrm,
+        STREAM,
+        1,
+        EncryptedCursor::new(vec![1; 32], [1; 32], 1, 0).expect("seed cursor"),
+        std::collections::BTreeSet::from([AclPrincipal::user(owner.to_bytes())]),
+    )
+    .expect("seed claim");
+    let initial_cursor = CoreCrmAesCursorCodec::new(CURSOR_KEY, 1)
+        .expect("synthetic cursor codec")
+        .encode(&seed_claim, &logical_cursor)
+        .expect("encrypt initial known-record cursor");
     sqlx::query(
         "INSERT INTO connector_accounts \
          (community_id, id, provider, owner_pubkey, external_account_id, credential_reference) \
@@ -135,12 +196,53 @@ async fn seed_core_crm_scope(
     .bind(account_id)
     .bind(scope_id)
     .bind(STREAM)
-    .bind(vec![1_u8; 48])
-    .bind(vec![1_u8; 32])
+    .bind(initial_cursor.ciphertext())
+    .bind(initial_cursor.integrity_hash().as_slice())
     .execute(pool)
     .await
     .expect("insert bounded snapshot cursor");
     (account_id, scope_id)
+}
+
+fn trusted_claim(claimed: CoreCrmDeltaScopeClaim) -> TrustedConnectorClaim {
+    let owner: [u8; 32] = claimed.owner_pubkey.try_into().expect("owner pubkey");
+    let integrity_hash: [u8; 32] = claimed
+        .lease
+        .cursor_integrity_hash
+        .try_into()
+        .expect("cursor hash");
+    let generation = u64::try_from(claimed.lease.generation).expect("lease generation");
+    TrustedConnectorClaim::new(
+        *claimed.community_id.as_uuid(),
+        AccountId::new(claimed.account_id),
+        ScopeId::new(claimed.scope_id),
+        ConnectorProvider::CoreCrm,
+        claimed.stream,
+        generation,
+        EncryptedCursor::new(
+            claimed.lease.encrypted_cursor,
+            integrity_hash,
+            u32::try_from(claimed.lease.cursor_key_version).expect("cursor key version"),
+            generation - 1,
+        )
+        .expect("claimed cursor"),
+        std::collections::BTreeSet::from([AclPrincipal::user(owner)]),
+    )
+    .expect("trusted claimed authority")
+}
+
+struct FixtureCoreCrmReader;
+
+impl CoreCrmSnapshotReader for FixtureCoreCrmReader {
+    async fn read(
+        &mut self,
+        operation: &CoreCrmReadOperation,
+        acls: Vec<AclPrincipal>,
+    ) -> Result<CoreCrmReadOutcome, ProviderPageError> {
+        normalize_core_crm_response(operation, 1, CRM_FIXTURE, acls)
+            .map(CoreCrmReadOutcome::Snapshot)
+            .map_err(|_| ProviderPageError::InvalidResponse)
+    }
 }
 
 struct Resolver {
@@ -275,74 +377,70 @@ async fn synthetic_core_crm_read_reaches_only_the_authorized_private_assistant()
         &[blake.public_key(), denied_user.public_key()],
     )
     .await;
+    seed_private_channel(&pool, community, PRIVATE_CHANNEL, blake.public_key()).await;
     let (account_id, scope_id) = seed_core_crm_scope(&pool, community, blake.public_key()).await;
 
-    let operation = CoreCrmReadOperation::try_from_tool_call(
-        "get_contact",
-        json!({
-            "id": "11111111-1111-4111-8111-111111111111",
-            "activity_limit": 20
-        }),
-    )
-    .expect("bounded synthetic CRM operation");
-    let snapshot = normalize_core_crm_response(
-        &operation,
-        1,
-        CRM_FIXTURE,
-        vec![AclPrincipal::user(blake.public_key().to_bytes())],
-    )
-    .expect("normalize synthetic CRM fixture");
-    assert_eq!(
-        snapshot.coverage(),
-        CoreCrmSnapshotCoverage::BoundedInitialSnapshotOnly
-    );
-    assert!(snapshot.require_complete_corpus().is_err());
-    assert_eq!(snapshot.upserts().len(), 1);
-
-    let worker_id = Uuid::new_v4();
     let now = Utc::now();
-    let lease = claim_delta_scope(
+    let lost_worker = Uuid::new_v4();
+    let lost_claim = claim_next_core_crm_delta_scope(
         &pool,
-        community,
-        account_id,
-        scope_id,
-        STREAM,
-        worker_id,
-        now,
+        lost_worker,
+        now - Duration::minutes(2),
         StdDuration::from_secs(60),
     )
     .await
-    .expect("claim bounded synthetic cursor")
-    .expect("synthetic cursor lease");
-    let previous_cursor_hash: [u8; 32] = lease
-        .cursor_integrity_hash
-        .as_slice()
-        .try_into()
-        .expect("fixture cursor hash");
-    let generation = u64::try_from(lease.generation).expect("positive lease generation");
-    let page = ChangePage::new(
-        *community.as_uuid(),
-        ConnectorProvider::CoreCrm,
-        AccountId::new(account_id),
-        ScopeId::new(scope_id),
-        STREAM,
-        previous_cursor_hash,
-        snapshot.upserts().to_vec(),
-        Vec::new(),
-        EncryptedCursor::new(vec![2_u8; 48], [2_u8; 32], 1, generation)
-            .expect("bounded next cursor"),
-        RemoteCheckpoint::new("bounded-snapshot", "synthetic-fixture-v1")
-            .expect("bounded snapshot checkpoint"),
+    .expect("claim expiring synthetic cursor")
+    .expect("expiring synthetic cursor lease");
+    let lost_generation = lost_claim.lease.generation;
+    let lost_claim = trusted_claim(lost_claim);
+    let mut lost_provider = CoreCrmPageProvider::new(
+        FixtureCoreCrmReader,
+        CoreCrmAesCursorCodec::new(CURSOR_KEY, 1).expect("cursor codec"),
+    );
+    let lost_page = lost_provider
+        .fetch_one_page(&lost_claim)
+        .await
+        .expect("identity-bound lost-lease page");
+    assert!(lost_page.reconciliation_complete());
+
+    let worker_id = Uuid::new_v4();
+    let claimed =
+        claim_next_core_crm_delta_scope(&pool, worker_id, now, StdDuration::from_secs(60))
+            .await
+            .expect("reclaim expired synthetic cursor")
+            .expect("current synthetic cursor lease");
+    assert!(claimed.lease.generation > lost_generation);
+    assert!(apply_postgres_change_page(
+        &pool,
+        community,
+        &lost_page,
+        lost_worker,
+        lost_generation,
+        now,
     )
-    .expect("bounded Core CRM change page");
+    .await
+    .is_err());
+
+    let lease_generation = claimed.lease.generation;
+    let claim = trusted_claim(claimed);
+    let mut provider = CoreCrmPageProvider::new(
+        FixtureCoreCrmReader,
+        CoreCrmAesCursorCodec::new(CURSOR_KEY, 1).expect("cursor codec"),
+    );
+    let page = provider
+        .fetch_one_page(&claim)
+        .await
+        .expect("exact identity-bound Core CRM page");
+    assert_eq!(page.upserts().len(), 1);
+    assert!(page.reconciliation_complete());
     assert_eq!(
-        apply_postgres_change_page(&pool, community, &page, worker_id, lease.generation, now,)
+        apply_postgres_change_page(&pool, community, &page, worker_id, lease_generation, now,)
             .await
             .expect("apply synthetic CRM page"),
         ApplyOutcome::Applied { changed_items: 1 }
     );
     assert_eq!(
-        apply_postgres_change_page(&pool, community, &page, worker_id, lease.generation, now,)
+        apply_postgres_change_page(&pool, community, &page, worker_id, lease_generation, now,)
             .await
             .expect("retry identical CRM page"),
         ApplyOutcome::AlreadyApplied
@@ -466,6 +564,10 @@ async fn synthetic_core_crm_read_reaches_only_the_authorized_private_assistant()
     );
     let payload: InsightPayload = serde_json::from_str(&event.content).expect("kind-44300 payload");
     assert_eq!(payload.evidence.len(), 1);
+    let payload_json: Value = serde_json::from_str(&event.content).expect("payload JSON");
+    assert_eq!(payload_json["category"], "assistant_response");
+    assert_eq!(payload_json["priority"], "normal");
+    assert!(!event.content.contains("https://"));
 
     let cited = &payload.evidence[0];
     let citation = cited
@@ -483,12 +585,112 @@ async fn synthetic_core_crm_read_reaches_only_the_authorized_private_assistant()
         channel_id: PRIVATE_CHANNEL,
         audience: ServerResolvedSourceAudience::new(&owner_bytes, &current_channels),
     };
-    assert!(matches!(
+    let relay = Keys::generate();
+    let resolve_now = Utc::now().timestamp();
+    let request_payload: EvidenceResolveRequestPayload = serde_json::from_value(json!({
+        "schema_version": 1,
+        "request_id": Uuid::new_v4(),
+        "insight_id": payload.insight_id,
+        "resolver_id": citation.resolver_id,
+        "expected_chunk_hash": cited.source_hash,
+        "nonce": "ab".repeat(32),
+        "created_at": resolve_now,
+        "expires_at": resolve_now + 60
+    }))
+    .expect("kind-24823 payload");
+    let resolve_request_event = buzz_sdk::core_protocol::build_core_evidence_resolve_request(
+        PRIVATE_CHANNEL,
+        &relay.public_key(),
+        &request_payload,
+        resolve_now,
+    )
+    .expect("relay evidence request")
+    .sign_with_keys(&blake)
+    .expect("sign relay evidence request");
+    assert_eq!(resolve_request_event.kind.as_u16(), 24_823);
+
+    let resolved = match resolve_source_evidence(&pool, community, resolution_request)
+        .await
+        .expect("resolve current authorized evidence")
+    {
+        EvidenceResolution::Resolved(resolved) => resolved,
+        other => panic!("expected current authorized evidence, got {other:?}"),
+    };
+    let result_payload = EvidenceResolveResultPayload::resolved(
+        request_payload.request_id,
+        request_payload.expires_at,
+        &resolved.title,
+        resolved.modified_at.timestamp(),
+        EvidenceResolvedSourceType::CrmRecord,
+        &resolved.resolvable_link,
+        resolve_now,
+    )
+    .expect("kind-24824 payload");
+    let resolve_result_event = buzz_sdk::core_protocol::encrypt_core_evidence_resolve_result(
+        PRIVATE_CHANNEL,
+        &blake.public_key(),
+        &relay,
+        &result_payload,
+        resolve_now,
+    )
+    .expect("encrypted relay evidence result")
+    .sign_with_keys(&relay)
+    .expect("sign relay evidence result");
+    assert_eq!(resolve_result_event.kind.as_u16(), 24_824);
+
+    sqlx::query(
+        "UPDATE source_chunks SET content_hash=$3 \
+         WHERE community_id=$1 AND item_id=$2 AND content_hash=$4",
+    )
+    .bind(community.as_uuid())
+    .bind(resolver_id.source_item_id())
+    .bind(vec![88_u8; 32])
+    .bind(&chunk_hash)
+    .execute(&pool)
+    .await
+    .expect("simulate changed source chunk");
+    assert_eq!(
         resolve_source_evidence(&pool, community, resolution_request)
             .await
-            .expect("resolve current authorized evidence"),
-        EvidenceResolution::Resolved(_)
-    ));
+            .expect("deny changed source chunk"),
+        EvidenceResolution::Stale
+    );
+    sqlx::query(
+        "UPDATE source_chunks SET content_hash=$3 \
+         WHERE community_id=$1 AND item_id=$2 AND content_hash=$4",
+    )
+    .bind(community.as_uuid())
+    .bind(resolver_id.source_item_id())
+    .bind(&chunk_hash)
+    .bind(vec![88_u8; 32])
+    .execute(&pool)
+    .await
+    .expect("restore cited source chunk");
+
+    sqlx::query(
+        "UPDATE source_items SET status='unavailable', tombstoned_at=NOW() \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(resolver_id.source_item_id())
+    .execute(&pool)
+    .await
+    .expect("tombstone evidence before resolution");
+    assert_eq!(
+        resolve_source_evidence(&pool, community, resolution_request)
+            .await
+            .expect("deny tombstoned evidence"),
+        EvidenceResolution::Unavailable
+    );
+    sqlx::query(
+        "UPDATE source_items SET status='active', tombstoned_at=NULL \
+         WHERE community_id=$1 AND id=$2",
+    )
+    .bind(community.as_uuid())
+    .bind(resolver_id.source_item_id())
+    .execute(&pool)
+    .await
+    .expect("restore evidence after tombstone proof");
 
     sqlx::query("DELETE FROM source_item_acls WHERE community_id=$1 AND item_id=$2")
         .bind(community.as_uuid())
@@ -514,11 +716,11 @@ async fn synthetic_core_crm_read_reaches_only_the_authorized_private_assistant()
     .await
     .expect("restore synthetic user ACL for later race proof");
 
-    let raw_source_body = snapshot.upserts()[0].source().as_untrusted_text();
-    let opaque_external_id = snapshot.upserts()[0].external_item_id().as_str();
+    let raw_source_body = page.upserts()[0].source().as_untrusted_text();
+    let opaque_external_id = page.upserts()[0].external_item_id().as_str();
     let log_visible = format!(
         "{page:?}{turn:?}{:?}{:?}",
-        snapshot.upserts()[0],
+        page.upserts()[0],
         payload.evidence
     );
     let visible_outputs = format!("{}{}{}", model.inputs.join(""), event.content, log_visible);
@@ -547,6 +749,51 @@ async fn synthetic_core_crm_read_reaches_only_the_authorized_private_assistant()
         model_envelope.get("trust").and_then(Value::as_str),
         Some("untrusted_external_source")
     );
+
+    sqlx::query(
+        "UPDATE connector_delta_cursors \
+         SET last_success_at=NOW() - INTERVAL '16 minutes' \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream=$4",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(scope_id)
+    .bind(STREAM)
+    .execute(&pool)
+    .await
+    .expect("make synthetic cursor stale");
+    let mut stale_resolver = resolver(
+        community,
+        blake.public_key(),
+        assistant.public_key(),
+        PRIVATE_CHANNEL,
+    );
+    let mut stale_retriever = PgAuthorizedFtsRetriever::new(&pool);
+    let mut stale_model = Model::default();
+    let mut stale_sink = Sink::default();
+    run_private_assistant_turn(
+        &turn,
+        &versions(),
+        &mut stale_resolver,
+        &mut stale_retriever,
+        &mut stale_model,
+        &mut stale_sink,
+        CREATED_AT,
+    )
+    .await
+    .expect("stale evidence remains explicitly labeled");
+    let stale_event = stale_sink
+        .0
+        .pop()
+        .expect("one stale publish command")
+        .sign_with_keys(&assistant)
+        .expect("sign stale synthetic command");
+    let stale_payload: Value =
+        serde_json::from_str(&stale_event.content).expect("stale insight payload");
+    assert_eq!(stale_payload["freshness"], "stale");
+    assert!(stale_payload["confidence"]
+        .as_u64()
+        .is_some_and(|value| value <= 50));
 
     let mut revoking_resolver = resolver(
         community,

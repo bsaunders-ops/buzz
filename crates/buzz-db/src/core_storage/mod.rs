@@ -31,7 +31,9 @@ pub use audit::{
     append_audit_entry, claim_audit_export_batch, complete_audit_export_batch,
     retry_audit_export_batch,
 };
-pub use delta::{claim_delta_scope, complete_delta_scope, fail_delta_scope};
+pub use delta::{
+    claim_delta_scope, claim_next_core_crm_delta_scope, complete_delta_scope, fail_delta_scope,
+};
 pub use insights::claim_insight_slot;
 pub use source_hash::source_chunk_hash;
 pub use source_pages::apply_source_change_page;

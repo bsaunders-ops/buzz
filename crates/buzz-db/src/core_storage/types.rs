@@ -471,6 +471,8 @@ pub struct NewSourceChangePage<'a> {
     pub next_cursor_key_version: i32,
     /// Deterministic digest of the complete page and remote checkpoint.
     pub page_digest: &'a [u8],
+    /// Whether this page completed a full known-record reconciliation cycle.
+    pub reconciliation_complete: bool,
     /// Complete item replacements.
     pub upserts: &'a [NewIndexedSourceItem],
     /// Item tombstones.
@@ -486,6 +488,7 @@ impl std::fmt::Debug for NewSourceChangePage<'_> {
             .field("provider", &self.provider)
             .field("upsert_count", &self.upserts.len())
             .field("tombstone_count", &self.tombstones.len())
+            .field("reconciliation_complete", &self.reconciliation_complete)
             .field("authority_cursor_and_content_redacted", &true)
             .finish()
     }
@@ -1390,6 +1393,34 @@ pub struct DeltaLeaseClaim {
     pub generation: i64,
     /// Bounded lease expiry.
     pub lease_until: DateTime<Utc>,
+}
+
+/// One globally due read-only Core CRM cursor claimed with its complete server authority.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CoreCrmDeltaScopeClaim {
+    /// Tenant owning the claimed cursor.
+    pub community_id: CommunityId,
+    /// Connector account boundary.
+    pub account_id: Uuid,
+    /// Approved source-scope boundary.
+    pub scope_id: Uuid,
+    /// Configured cursor stream.
+    pub stream: String,
+    /// Private account owner receiving the indexed source ACL.
+    pub owner_pubkey: Vec<u8>,
+    /// Fenced encrypted cursor lease.
+    pub lease: DeltaLeaseClaim,
+}
+
+impl std::fmt::Debug for CoreCrmDeltaScopeClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoreCrmDeltaScopeClaim")
+            .field("stream", &self.stream)
+            .field("generation", &self.lease.generation)
+            .field("authority_cursor_and_owner_redacted", &true)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for DeltaLeaseClaim {

@@ -155,6 +155,31 @@ impl CoreCrmReadOperation {
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(50)
     }
+
+    fn require_matching_detail_identity(&self, actual: &str) -> Result<()> {
+        let field = match self {
+            Self::GetContact(_)
+            | Self::GetCompany(_)
+            | Self::GetProject(_)
+            | Self::GetActivity(_) => "id",
+            Self::GetGuidanceDoc(_) => "slug",
+            Self::SearchContacts(_)
+            | Self::SearchCompanies(_)
+            | Self::ListProjects(_)
+            | Self::ListActivities(_)
+            | Self::ListGuidanceDocs(_) => {
+                return Err(ConnectorError::InvalidData(
+                    "Core CRM detail identity is unavailable",
+                ))
+            }
+        };
+        if self.arguments().get(field).and_then(Value::as_str) != Some(actual) {
+            return Err(ConnectorError::InvalidData(
+                "Core CRM detail identity does not match the request",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn validate_arguments<T>(arguments: Value) -> Result<CoreCrmReadArguments>
@@ -532,7 +557,7 @@ impl std::fmt::Debug for CoreCrmHttpRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CoreCrmHttpRequest")
-            .field("url", &CORE_CRM_MCP_URL)
+            .field("authority", &"fixed_core_crm")
             .field("method", &"POST")
             .field("body_redacted", &true)
             .field("body_bytes", &self.body.len())
@@ -834,6 +859,7 @@ pub fn normalize_core_crm_response(
         CoreCrmReadOperation::GetContact(_) => {
             let record: ContactRecord = parse_tool_json(text)?;
             validate_contact(&record)?;
+            operation.require_matching_detail_identity(&record.id)?;
             upserts.push(record_upsert(
                 RecordSource::new(
                     "contact",
@@ -850,6 +876,7 @@ pub fn normalize_core_crm_response(
         CoreCrmReadOperation::GetCompany(_) => {
             let record: CompanyRecord = parse_tool_json(text)?;
             validate_company(&record)?;
+            operation.require_matching_detail_identity(&record.id)?;
             upserts.push(record_upsert(
                 RecordSource::new(
                     "company",
@@ -866,6 +893,7 @@ pub fn normalize_core_crm_response(
         CoreCrmReadOperation::GetProject(_) => {
             let record: ProjectRecord = parse_tool_json(text)?;
             validate_project(&record)?;
+            operation.require_matching_detail_identity(&record.id)?;
             upserts.push(record_upsert(
                 RecordSource::new(
                     "project",
@@ -900,6 +928,7 @@ pub fn normalize_core_crm_response(
         }
         CoreCrmReadOperation::GetActivity(_) => {
             let record: ActivityRecord = parse_tool_json(text)?;
+            operation.require_matching_detail_identity(&record.id)?;
             append_activity(&record, &acls, &mut upserts)?;
         }
         CoreCrmReadOperation::ListActivities(_) => {
@@ -912,6 +941,7 @@ pub fn normalize_core_crm_response(
         CoreCrmReadOperation::GetGuidanceDoc(_) => {
             let record: GuidanceRecord = parse_tool_json(text)?;
             validate_guidance(&record)?;
+            operation.require_matching_detail_identity(&record.slug)?;
             upserts.push(record_upsert(
                 RecordSource::new(
                     "guidance",

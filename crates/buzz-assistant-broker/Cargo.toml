@@ -22,5 +22,6 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 buzz-db = { workspace = true }
+buzz-core-worker = { path = "../buzz-core-worker" }
 chrono = { workspace = true }
 tokio = { workspace = true }

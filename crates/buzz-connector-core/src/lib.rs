@@ -9,6 +9,8 @@ pub mod apply;
 pub mod chunk;
 /// Bounded read-only Core CRM MCP adapter.
 pub mod core_crm;
+/// Deterministic known-record reconciliation for Core CRM snapshots.
+pub mod core_crm_sync;
 /// Provider-specific outbound network policy contracts.
 pub mod egress;
 /// Local embedding artifact and version contracts.

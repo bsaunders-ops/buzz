@@ -131,7 +131,9 @@ fn request_builder_fixes_mcp_authority_method_protocol_redirects_and_bounds() {
     assert!(request.max_request_bytes() <= 64 * 1024);
     assert!(request.max_response_bytes() <= 4 * 1024 * 1024);
     assert!(request.has_bearer_authorization());
-    assert!(!format!("{builder:?}{request:?}").contains("synthetic-secret-token"));
+    let debug = format!("{builder:?}{request:?}");
+    assert!(!debug.contains("synthetic-secret-token"));
+    assert!(!debug.contains("https://"));
 }
 
 #[test]
@@ -432,6 +434,32 @@ fn json_rpc_response_id_must_match_the_exact_request() {
 
     assert!(normalize_core_crm_response(&operation, 2, GUIDANCE_RESPONSE, principals()).is_err());
     assert!(normalize_core_crm_response(&operation, 1, GUIDANCE_RESPONSE, principals()).is_ok());
+}
+
+#[test]
+fn detail_response_identity_must_match_the_exact_requested_record() {
+    let operation = operation(
+        "get_contact",
+        json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "activity_limit": 20
+        }),
+    );
+    let mut envelope: Value = serde_json::from_slice(CONTACT_RESPONSE).expect("fixture JSON");
+    let text = envelope["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let mut contact: Value = serde_json::from_str(text).expect("contact JSON");
+    contact["id"] = json!("99999999-9999-4999-8999-999999999999");
+    envelope["result"]["content"][0]["text"] = Value::String(contact.to_string());
+
+    assert!(normalize_core_crm_response(
+        &operation,
+        1,
+        &serde_json::to_vec(&envelope).expect("envelope"),
+        principals(),
+    )
+    .is_err());
 }
 
 #[test]

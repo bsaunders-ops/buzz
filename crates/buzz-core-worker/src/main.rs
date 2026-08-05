@@ -2,9 +2,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use buzz_connector_core::core_crm::BearerToken;
 use buzz_core_worker::connector_iteration::{ConnectorIterationOutcome, ConnectorIterationRunner};
+use buzz_core_worker::postgres_core_crm::CoreCrmConnectorRunner;
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlx::postgres::PgPoolOptions;
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(45);
 
@@ -66,11 +71,7 @@ impl WorkerRole {
     const fn required_secrets(self) -> &'static [&'static str] {
         match self {
             Self::AgentSupervisor => &["OPENAI_COMPAT_API_KEY", "BUZZ_ACP_SIGNING_KEY"],
-            Self::ConnectorWorker => &[
-                "CORE_CRM_CREDENTIAL_B64",
-                "MICROSOFT_CONNECTOR_CREDENTIAL_B64",
-                "GOOGLE_CONNECTOR_CREDENTIAL_B64",
-            ],
+            Self::ConnectorWorker => &["CORE_CRM_CREDENTIAL_B64", "CORE_CRM_CURSOR_KEY_B64"],
             Self::SanitizerIndexer | Self::SignalRunner | Self::LearningWorker => &[],
             Self::ActionExecutor => &[
                 "CORE_CRM_CREDENTIAL_B64",
@@ -110,9 +111,6 @@ async fn serve_with_connector_registry(
     role: WorkerRole,
     mut connector_registry: Option<Box<dyn ConnectorIterationRunner>>,
 ) -> Result<()> {
-    if matches!(role, WorkerRole::ConnectorWorker) && connector_registry.is_none() {
-        bail!("connector provider registry is not configured");
-    }
     validate_environment(role)?;
     let health_path = health_path();
     let database = if let Some(expected_role) = role.expected_database_role() {
@@ -128,6 +126,13 @@ async fn serve_with_connector_registry(
     } else {
         None
     };
+    if matches!(role, WorkerRole::ConnectorWorker) && connector_registry.is_none() {
+        let pool = database
+            .as_ref()
+            .context("connector database is not configured")?
+            .clone();
+        connector_registry = Some(build_core_crm_registry(pool)?);
+    }
 
     write_heartbeat(&health_path, role)?;
     tracing::info!(role = role.slug(), "Core worker process boundary ready");
@@ -150,6 +155,38 @@ async fn serve_with_connector_registry(
         }
         write_heartbeat(&health_path, role)?;
     }
+}
+
+fn decode_secret(key: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let encoded = Zeroizing::new(required_env(key)?);
+    let decoded = STANDARD
+        .decode(encoded.as_bytes())
+        .with_context(|| format!("required setting {key} is invalid"))?;
+    if decoded.is_empty() {
+        bail!("required setting {key} is invalid");
+    }
+    Ok(Zeroizing::new(decoded))
+}
+
+fn build_core_crm_registry(pool: sqlx::PgPool) -> Result<Box<dyn ConnectorIterationRunner>> {
+    let token_bytes = decode_secret("CORE_CRM_CREDENTIAL_B64")?;
+    let token = std::str::from_utf8(&token_bytes)
+        .context("Core CRM credential encoding is invalid")?
+        .to_owned();
+    let cursor_key = decode_secret("CORE_CRM_CURSOR_KEY_B64")?;
+    let cursor_key: [u8; 32] = cursor_key
+        .as_slice()
+        .try_into()
+        .context("Core CRM cursor key must be exactly 32 bytes")?;
+    let runner = CoreCrmConnectorRunner::new(
+        pool,
+        Uuid::new_v4(),
+        BearerToken::new(token).context("Core CRM credential is invalid")?,
+        cursor_key,
+        1,
+    )
+    .context("Core CRM provider registry configuration failed")?;
+    Ok(Box::new(runner))
 }
 
 async fn run_connector_role_once(
@@ -279,6 +316,14 @@ mod tests {
     #[test]
     fn agent_supervisor_never_receives_a_database_role() {
         assert_eq!(WorkerRole::AgentSupervisor.expected_database_role(), None);
+    }
+
+    #[test]
+    fn connector_worker_registers_only_core_crm_read_secrets() {
+        assert_eq!(
+            WorkerRole::ConnectorWorker.required_secrets(),
+            &["CORE_CRM_CREDENTIAL_B64", "CORE_CRM_CURSOR_KEY_B64"]
+        );
     }
 
     #[tokio::test]

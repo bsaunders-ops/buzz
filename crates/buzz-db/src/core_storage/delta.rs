@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use super::{bounded_lease, require_hash, DeltaLeaseClaim};
+use super::{bounded_lease, require_hash, CoreCrmDeltaScopeClaim, DeltaLeaseClaim};
 
 fn validate_stream(stream: &str) -> crate::Result<()> {
     let mut bytes = stream.bytes();
@@ -37,6 +37,82 @@ fn validate_error_code(error_code: &str) -> crate::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Claim at most one due, active, strictly read-only Core CRM known-record stream.
+///
+/// Provider, scope capability, private owner ACL, cursor, and fencing generation
+/// are resolved in one database transaction; caller input cannot select another
+/// provider or authority.
+pub async fn claim_next_core_crm_delta_scope(
+    pool: &PgPool,
+    worker_id: Uuid,
+    now: DateTime<Utc>,
+    lease_for: StdDuration,
+) -> crate::Result<Option<CoreCrmDeltaScopeClaim>> {
+    let lease_until = now
+        .checked_add_signed(bounded_lease(lease_for)?)
+        .ok_or_else(|| {
+            crate::DbError::InvalidData("delta lease timestamp is out of range".into())
+        })?;
+    let mut transaction = pool.begin().await?;
+    let row = sqlx::query(
+        "WITH due AS ( \
+           SELECT cursor.community_id, cursor.account_id, cursor.scope_id, cursor.stream \
+           FROM connector_delta_cursors cursor \
+           JOIN connector_accounts account \
+             ON account.community_id=cursor.community_id AND account.id=cursor.account_id \
+           JOIN approved_source_scopes scope \
+             ON scope.community_id=cursor.community_id AND scope.account_id=cursor.account_id \
+            AND scope.id=cursor.scope_id \
+           WHERE account.provider='core_crm' AND account.status='active' \
+             AND scope.status='active' AND scope.can_read=true AND scope.can_write=false \
+             AND cursor.stream='known-records' \
+             AND (cursor.lease_until IS NULL OR cursor.lease_until <= $1) \
+             AND (cursor.next_retry_at IS NULL OR cursor.next_retry_at <= $1) \
+             AND (cursor.last_success_at IS NULL \
+                  OR cursor.last_success_at > $1 \
+                  OR cursor.last_success_at <= $1 - INTERVAL '5 minutes') \
+           ORDER BY cursor.updated_at, cursor.community_id, cursor.account_id, cursor.scope_id \
+           FOR UPDATE OF cursor SKIP LOCKED \
+           LIMIT 1 \
+         ) \
+         UPDATE connector_delta_cursors cursor \
+         SET lease_owner=$2, lease_until=$3, generation=cursor.generation+1, updated_at=$1 \
+         FROM due, connector_accounts account \
+         WHERE cursor.community_id=due.community_id AND cursor.account_id=due.account_id \
+           AND cursor.scope_id=due.scope_id AND cursor.stream=due.stream \
+           AND account.community_id=cursor.community_id AND account.id=cursor.account_id \
+         RETURNING cursor.community_id, cursor.account_id, cursor.scope_id, cursor.stream, \
+                   account.owner_pubkey, cursor.encrypted_cursor, \
+                   cursor.cursor_integrity_hash, cursor.cursor_key_version, \
+                   cursor.generation, cursor.lease_until",
+    )
+    .bind(now)
+    .bind(worker_id)
+    .bind(lease_until)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    row.map(|row| {
+        let community_id: Uuid = row.try_get("community_id")?;
+        Ok(CoreCrmDeltaScopeClaim {
+            community_id: CommunityId::from_uuid(community_id),
+            account_id: row.try_get("account_id")?,
+            scope_id: row.try_get("scope_id")?,
+            stream: row.try_get("stream")?,
+            owner_pubkey: row.try_get("owner_pubkey")?,
+            lease: DeltaLeaseClaim {
+                encrypted_cursor: row.try_get("encrypted_cursor")?,
+                cursor_integrity_hash: row.try_get("cursor_integrity_hash")?,
+                cursor_key_version: row.try_get("cursor_key_version")?,
+                generation: row.try_get("generation")?,
+                lease_until: row.try_get("lease_until")?,
+            },
+        })
+    })
+    .transpose()
 }
 
 /// Claim or recover one encrypted delta stream with a bounded fenced lease.

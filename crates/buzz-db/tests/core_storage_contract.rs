@@ -14,20 +14,20 @@ use buzz_db::core_storage::{
     action_ordered_members_hash, append_audit_entry, apply_source_change_page,
     begin_action_remote_attempt, claim_action_execution, claim_action_receipt_publication,
     claim_audit_export_batch, claim_delta_scope, claim_insight_slot,
-    complete_action_receipt_publication, complete_audit_export_batch, complete_delta_scope,
-    fail_delta_scope, insert_action_proposal, mark_action_timeout_for_reconciliation,
-    recheck_source_chunk, record_action_decision, record_action_member_outcome,
-    retry_action_receipt_publication, retry_audit_export_batch, search_source_chunks,
-    search_source_chunks_by_embedding, source_chunk_hash, ActionClaimDecision,
-    ActionDecisionRecordOutcome, ActionMemberHashInput, ActionMemberOutcome, ActionProposalStatus,
-    ApprovedSourceScopeRecord, AuditEntityType, AuditEnvelope, AuditEventType, AuditObjectVersion,
-    AuditOutcome, ConnectorAccountRecord, DeltaLeaseClaim, DeltaLeaseDecision, ExternalConnector,
-    ExternalOperation, IndexedSourceKind, InsightClaimDecision, InsightClaimOutcome,
-    InsightPriority, KeyVaultSecretName, NewActionMemberOutcome, NewAssistantInsight,
-    NewExternalActionProposal, NewExternalActionProposalItem, NewIndexedSourceChunk,
-    NewIndexedSourceItem, NewSourceAclPrincipal, NewSourceChangePage, NewSourceTombstone,
-    SourceCandidateRecheckRequest, SourceItemAclRecord, SourcePageApplyOutcome,
-    SourceSearchRequest, SourceVectorSearchRequest,
+    claim_next_core_crm_delta_scope, complete_action_receipt_publication,
+    complete_audit_export_batch, complete_delta_scope, fail_delta_scope, insert_action_proposal,
+    mark_action_timeout_for_reconciliation, recheck_source_chunk, record_action_decision,
+    record_action_member_outcome, retry_action_receipt_publication, retry_audit_export_batch,
+    search_source_chunks, search_source_chunks_by_embedding, source_chunk_hash,
+    ActionClaimDecision, ActionDecisionRecordOutcome, ActionMemberHashInput, ActionMemberOutcome,
+    ActionProposalStatus, ApprovedSourceScopeRecord, AuditEntityType, AuditEnvelope,
+    AuditEventType, AuditObjectVersion, AuditOutcome, ConnectorAccountRecord, DeltaLeaseClaim,
+    DeltaLeaseDecision, ExternalConnector, ExternalOperation, IndexedSourceKind,
+    InsightClaimDecision, InsightClaimOutcome, InsightPriority, KeyVaultSecretName,
+    NewActionMemberOutcome, NewAssistantInsight, NewExternalActionProposal,
+    NewExternalActionProposalItem, NewIndexedSourceChunk, NewIndexedSourceItem,
+    NewSourceAclPrincipal, NewSourceChangePage, NewSourceTombstone, SourceCandidateRecheckRequest,
+    SourceItemAclRecord, SourcePageApplyOutcome, SourceSearchRequest, SourceVectorSearchRequest,
 };
 use chrono::{Duration, NaiveDate, Utc};
 use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -400,6 +400,7 @@ fn microsoft_resolver_page<'a>(
         next_cursor_integrity_hash: &[5_u8; 32],
         next_cursor_key_version: 1,
         page_digest,
+        reconciliation_complete: true,
         upserts,
         tombstones: &[],
         now,
@@ -3000,6 +3001,18 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
 
     let worker = Uuid::new_v4();
     let now = Utc::now();
+    sqlx::query(
+        "UPDATE connector_delta_cursors SET last_success_at=$5 \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream=$4",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(scope_id)
+    .bind("changes")
+    .bind(now - Duration::hours(1))
+    .execute(&pool)
+    .await
+    .expect("seed prior complete-cycle success");
     let lease = claim_delta_scope(
         &pool,
         community,
@@ -3043,6 +3056,7 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
         next_cursor_integrity_hash: &[2_u8; 32],
         next_cursor_key_version: 1,
         page_digest: &[4_u8; 32],
+        reconciliation_complete: false,
         upserts: &upserts,
         tombstones: &[],
         now: now + Duration::seconds(1),
@@ -3092,6 +3106,17 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
     assert_eq!(projection.2, vec![2_u8; 32]);
     assert_eq!(projection.3, None);
     assert_eq!((projection.4, projection.5), (0, 29));
+    let partial_success: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT last_success_at FROM connector_delta_cursors \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream='changes'",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(scope_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect partial reconciliation timestamp");
+    assert!(partial_success.is_some_and(|value| value < now - Duration::minutes(59)));
 
     let second_worker = Uuid::new_v4();
     let second_lease = claim_delta_scope(
@@ -3137,6 +3162,7 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
         next_cursor_integrity_hash: &[3_u8; 32],
         next_cursor_key_version: 1,
         page_digest: &[5_u8; 32],
+        reconciliation_complete: true,
         upserts: &replacement_upserts,
         tombstones: &[],
         now: now + Duration::seconds(3),
@@ -3170,6 +3196,21 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
     .await
     .expect("inspect complete ACL and source replacement");
     assert_eq!(replacement, (0, 1, "v2".into(), "replacement".into()));
+    let completed_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT last_success_at FROM connector_delta_cursors \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream='changes'",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(scope_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect complete reconciliation timestamp");
+    assert!(completed_at.is_some_and(|value| {
+        (value - (now + Duration::seconds(3)))
+            .num_microseconds()
+            .is_some_and(|delta| delta.abs() <= 1)
+    }));
 
     let third_worker = Uuid::new_v4();
     let third_lease = claim_delta_scope(
@@ -3201,6 +3242,7 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
         next_cursor_integrity_hash: &[4_u8; 32],
         next_cursor_key_version: 1,
         page_digest: &[6_u8; 32],
+        reconciliation_complete: true,
         upserts: &[],
         tombstones: &tombstones,
         now: now + Duration::seconds(5),
@@ -3234,6 +3276,91 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
         .await
         .is_err());
 
+    let rollback_worker = Uuid::new_v4();
+    let rollback_lease = claim_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "changes",
+        rollback_worker,
+        now + Duration::seconds(6),
+        StdDuration::from_secs(60),
+    )
+    .await
+    .expect("claim rollback cursor")
+    .expect("rollback cursor lease");
+    let rollback_upserts = vec![NewIndexedSourceItem {
+        external_item_id: "drive-item-rollback".into(),
+        remote_version: "v1".into(),
+        remote_etag: None,
+        title: "Must roll back".into(),
+        source_kind: IndexedSourceKind::Document,
+        modified_at: now + Duration::seconds(6),
+        resolvable_link: "https://drive.google.com/open?id=drive-item-rollback".into(),
+        acls: vec![NewSourceAclPrincipal::Channel(Uuid::new_v4())],
+        chunks: vec![NewIndexedSourceChunk {
+            chunk_index: 0,
+            start_char: 0,
+            end_char: 8,
+            content: "rollback".into(),
+            content_hash: source_chunk_hash(0, 0, 8, "rollback"),
+        }],
+    }];
+    let rollback_page = NewSourceChangePage {
+        community_id: community,
+        account_id,
+        scope_id,
+        provider: ExternalConnector::GoogleDrive,
+        stream: "changes",
+        worker_id: rollback_worker,
+        lease_generation: rollback_lease.generation,
+        expected_cursor_integrity_hash: &[4_u8; 32],
+        next_encrypted_cursor: &[5_u8; 48],
+        next_cursor_integrity_hash: &[5_u8; 32],
+        next_cursor_key_version: 1,
+        page_digest: &[7_u8; 32],
+        reconciliation_complete: true,
+        upserts: &rollback_upserts,
+        tombstones: &[],
+        now: now + Duration::seconds(7),
+    };
+    assert!(apply_source_change_page(&pool, community, rollback_page)
+        .await
+        .is_err());
+    let rollback_projection: (i64, Vec<u8>, Option<Uuid>) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM source_items \
+            WHERE community_id=$1 AND external_item_id='drive-item-rollback'), \
+           cursor_integrity_hash, lease_owner \
+         FROM connector_delta_cursors \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream='changes'",
+    )
+    .bind(community.as_uuid())
+    .bind(account_id)
+    .bind(scope_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect rolled-back source page");
+    assert_eq!(
+        rollback_projection,
+        (0, vec![4_u8; 32], Some(rollback_worker))
+    );
+    assert!(fail_delta_scope(
+        &pool,
+        community,
+        account_id,
+        scope_id,
+        "changes",
+        rollback_worker,
+        rollback_lease.generation,
+        "page.apply_rejected",
+        now + Duration::seconds(8),
+        StdDuration::from_secs(1),
+    )
+    .await
+    .expect("record fenced rollback failure"));
+
     sqlx::query(
         "UPDATE connector_accounts SET provider='microsoft_graph' \
          WHERE community_id=$1 AND id=$2",
@@ -3260,7 +3387,7 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
         scope_id,
         "changes",
         fourth_worker,
-        now + Duration::seconds(6),
+        now + Duration::seconds(10),
         StdDuration::from_secs(60),
     )
     .await
@@ -3297,7 +3424,7 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
             fourth_lease.generation,
             &attacker_items,
             &[7_u8; 32],
-            now + Duration::seconds(7),
+            now + Duration::seconds(11),
         ),
     )
     .await
@@ -3317,13 +3444,142 @@ async fn change_pages_commit_index_acl_tombstone_and_cursor_once() {
                 fourth_lease.generation,
                 &approved_items,
                 &[8_u8; 32],
-                now + Duration::seconds(7),
+                now + Duration::seconds(11),
             ),
         )
         .await
         .expect("apply exact configured SharePoint resolver authority"),
         SourcePageApplyOutcome::Applied { changed_items: 1 }
     );
+
+    drop_scratch_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres with pgvector"]
+async fn global_claimer_selects_only_read_only_core_crm_known_records() {
+    let (admin, pool, name) = scratch_db().await;
+    let (community, _) = seed_community(&pool, "core-crm-claimer").await;
+    let owner = vec![3_u8; 32];
+
+    for (provider, can_write, stream) in [
+        ("google_drive", false, "known-records"),
+        ("core_crm", true, "known-records"),
+        ("core_crm", false, "other-stream"),
+        ("core_crm", false, "known-records"),
+    ] {
+        let account_id = Uuid::new_v4();
+        let scope_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO connector_accounts \
+             (community_id, id, provider, owner_pubkey, external_account_id, credential_reference) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(community.as_uuid())
+        .bind(account_id)
+        .bind(provider)
+        .bind(&owner)
+        .bind(format!("account-{account_id}"))
+        .bind(format!("kv-account-{account_id}"))
+        .execute(&pool)
+        .await
+        .expect("insert claimer account");
+        sqlx::query(
+            "INSERT INTO approved_source_scopes \
+             (community_id, id, account_id, external_scope_id, scope_type, can_read, can_write) \
+             VALUES ($1, $2, $3, $4, 'known_records', true, $5)",
+        )
+        .bind(community.as_uuid())
+        .bind(scope_id)
+        .bind(account_id)
+        .bind(format!("scope-{scope_id}"))
+        .bind(can_write)
+        .execute(&pool)
+        .await
+        .expect("insert claimer scope");
+        sqlx::query(
+            "INSERT INTO connector_delta_cursors \
+             (community_id, account_id, scope_id, stream, encrypted_cursor, \
+              cursor_integrity_hash, cursor_key_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, 1)",
+        )
+        .bind(community.as_uuid())
+        .bind(account_id)
+        .bind(scope_id)
+        .bind(stream)
+        .bind(vec![1_u8; 48])
+        .bind(vec![1_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("insert claimer cursor");
+    }
+
+    let worker = Uuid::new_v4();
+    let claimed_at = Utc::now();
+    let claim =
+        claim_next_core_crm_delta_scope(&pool, worker, claimed_at, StdDuration::from_secs(60))
+            .await
+            .expect("claim read-only Core CRM scope")
+            .expect("one eligible Core CRM scope");
+    assert_eq!(claim.community_id, community);
+    assert_eq!(claim.stream, "known-records");
+    assert_eq!(claim.owner_pubkey, owner);
+    assert_eq!(claim.lease.generation, 1);
+
+    sqlx::query(
+        "UPDATE connector_delta_cursors \
+         SET lease_owner=NULL, lease_until=NULL, last_success_at=$5 \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream=$4",
+    )
+    .bind(community.as_uuid())
+    .bind(claim.account_id)
+    .bind(claim.scope_id)
+    .bind(&claim.stream)
+    .bind(claimed_at)
+    .execute(&pool)
+    .await
+    .expect("complete synthetic polling interval");
+
+    assert!(claim_next_core_crm_delta_scope(
+        &pool,
+        Uuid::new_v4(),
+        claimed_at + Duration::minutes(4),
+        StdDuration::from_secs(60),
+    )
+    .await
+    .expect("no other eligible Core CRM scope")
+    .is_none());
+    let interval_claim = claim_next_core_crm_delta_scope(
+        &pool,
+        Uuid::new_v4(),
+        claimed_at + Duration::minutes(5),
+        StdDuration::from_secs(60),
+    )
+    .await
+    .expect("claim after Core CRM polling interval")
+    .expect("Core CRM polling interval elapsed");
+    sqlx::query(
+        "UPDATE connector_delta_cursors \
+         SET lease_owner=NULL, lease_until=NULL, last_success_at=$5 \
+         WHERE community_id=$1 AND account_id=$2 AND scope_id=$3 AND stream=$4",
+    )
+    .bind(community.as_uuid())
+    .bind(interval_claim.account_id)
+    .bind(interval_claim.scope_id)
+    .bind(&interval_claim.stream)
+    .bind(claimed_at + Duration::days(1))
+    .execute(&pool)
+    .await
+    .expect("future-date Core CRM cursor");
+    assert!(claim_next_core_crm_delta_scope(
+        &pool,
+        Uuid::new_v4(),
+        claimed_at + Duration::minutes(6),
+        StdDuration::from_secs(60),
+    )
+    .await
+    .expect("recover future-dated Core CRM cursor")
+    .is_some());
 
     drop_scratch_db(&admin, pool, &name).await;
 }
