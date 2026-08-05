@@ -68,7 +68,11 @@ function insightPayload(overrides = {}) {
         source_id: "contact:private-123",
         source_hash:
           "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        citation: null,
+        citation: {
+          title: "Client relationship record",
+          modified_at: 1700000000,
+          resolver_id: "evidence:crm-record",
+        },
       },
     ],
     confidence: 92,

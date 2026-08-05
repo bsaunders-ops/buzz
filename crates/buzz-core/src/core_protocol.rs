@@ -636,12 +636,18 @@ pub enum EvidenceSource {
     PublicWeb,
 }
 
-/// Non-authoritative citation metadata for public research evidence.
+/// Safe citation descriptor for evidence resolution.
+///
+/// The resolver identifier is opaque and must be reauthorized by trusted
+/// runtime code before it is exchanged for a provider link. It is never an
+/// executable URL.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CitationRef {
     /// Bounded human-readable citation title.
     pub title: ProtocolLabel,
+    /// Provider modification time as Unix seconds.
+    pub modified_at: i64,
     /// Opaque resolver identifier; never an executable URL.
     pub resolver_id: OpaqueId,
 }
@@ -672,6 +678,15 @@ where
         if item.source == EvidenceSource::PublicWeb && item.citation.is_none() {
             return Err(de::Error::custom(
                 "public_web evidence requires citation metadata",
+            ));
+        }
+        if item
+            .citation
+            .as_ref()
+            .is_some_and(|citation| citation.modified_at < 0)
+        {
+            return Err(de::Error::custom(
+                "citation modified_at must be a non-negative Unix timestamp",
             ));
         }
         if evidence[..index].iter().any(|prior| {

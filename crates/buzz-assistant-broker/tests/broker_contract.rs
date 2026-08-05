@@ -10,7 +10,9 @@ use buzz_connector_core::{
     types::{ConnectorProvider, RemoteVersion, SourceKind},
 };
 use buzz_core::{
-    core_protocol::{EvidenceSource, InsightPayload},
+    core_protocol::{
+        EvidenceSource, InsightCategory, InsightFreshness, InsightPayload, InsightPriority,
+    },
     CommunityId,
 };
 use chrono::{TimeZone, Utc};
@@ -21,7 +23,7 @@ use uuid::Uuid;
 const COMMUNITY: Uuid = Uuid::from_u128(0x100);
 const PRIVATE_CHANNEL: Uuid = Uuid::from_u128(0x200);
 const SOURCE_CHANNEL: Uuid = Uuid::from_u128(0x300);
-const CREATED_AT: i64 = 1_700_000_000;
+const CREATED_AT: i64 = 1_785_762_000;
 
 fn excerpt() -> AuthorizedExcerpt {
     let citation = Citation::new(
@@ -229,6 +231,14 @@ async fn authorized_turn_emits_exact_trusted_insight_from_only_minimized_context
     assert_eq!(payload.created_at, CREATED_AT);
     assert_eq!(payload.evidence.len(), 1);
     assert_eq!(payload.evidence[0].source, EvidenceSource::Outlook);
+    let citation = payload.evidence[0]
+        .citation
+        .as_ref()
+        .expect("private citation descriptor");
+    assert_eq!(citation.title.as_str(), "Client follow-up");
+    assert_eq!(citation.modified_at, 1_785_758_400);
+    assert!(citation.resolver_id.as_str().starts_with("evidence:"));
+    assert!(!citation.resolver_id.as_str().contains("opaque"));
     assert_eq!(
         payload.evidence[0].source_id.as_str(),
         format!("item:{}", hex::encode([1; 32]))
@@ -242,6 +252,10 @@ async fn authorized_turn_emits_exact_trusted_insight_from_only_minimized_context
     assert_eq!(payload.firm_version.as_str(), "firm-v3");
     assert_eq!(payload.personal_version.as_str(), "personal-v4");
     assert_eq!(payload.model_version.as_str(), "model-v5");
+    assert_eq!(payload.category, InsightCategory::DealMovement);
+    assert_eq!(payload.priority, InsightPriority::Normal);
+    assert_eq!(payload.confidence.get(), 70);
+    assert_eq!(payload.freshness, InsightFreshness::SameDay);
 }
 
 #[tokio::test]

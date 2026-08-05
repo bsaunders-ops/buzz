@@ -1,4 +1,5 @@
 import {
+  evidenceModifiedDateLabel,
   evidenceSourceLabel,
   insightCategoryLabel,
   insightFreshnessLabel,
@@ -89,12 +90,17 @@ export function InsightCard({ payload }: { payload: InsightPayload | null }) {
         <h4 className="text-sm font-semibold text-foreground">Evidence</h4>
         <ul className="mt-2 space-y-1 text-muted-foreground">
           {payload.evidence.map((evidence) => (
-            <li
-              key={`${evidence.source}-${evidence.citation?.title ?? "private"}`}
-            >
+            <li key={evidence.stableKey}>
               <span>{evidenceSourceLabel(evidence.source)}</span>
-              {evidence.source === "public_web" && evidence.citation ? (
+              {evidence.citation ? (
                 <span>: {evidence.citation.title}</span>
+              ) : null}
+              {evidence.citation ? (
+                <span className="text-2xs">
+                  {" "}
+                  · modified{" "}
+                  {evidenceModifiedDateLabel(evidence.citation.modifiedAt)}
+                </span>
               ) : null}
               <span className="text-2xs"> — verified reference</span>
             </li>

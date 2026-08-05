@@ -694,14 +694,14 @@ const INSIGHT_JSON_VERSION_2: &str = r#"{
 
 #[test]
 fn insight_and_proposal_evidence_is_nonempty_bounded_and_unique() {
-    let public_web = r#"{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","resolver_id":"citation:abc"}}"#;
+    let public_web = r#"{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","modified_at":1700000000,"resolver_id":"citation:abc"}}"#;
     assert!(serde_json::from_str::<buzz_core::core_protocol::EvidenceRef>(public_web).is_ok());
 
     let valid = r#"{
         "schema_version":1,"insight_id":"550e8400-e29b-41d4-a716-446655440000",
         "category":"deal_movement","change":"changed","why_it_matters":"matters",
         "priority":"normal",
-        "evidence":[{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","resolver_id":"citation:abc"}}],
+        "evidence":[{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","modified_at":1700000000,"resolver_id":"citation:abc"}}],
         "confidence":80,"freshness":"recent","recommendation":"review","draft":null,
         "dedupe_key":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "created_at":1700000000,"safety_policy_version":"s1","persona_version":"p1",
@@ -709,10 +709,10 @@ fn insight_and_proposal_evidence_is_nonempty_bounded_and_unique() {
 }"#;
     assert!(serde_json::from_str::<InsightPayload>(valid).is_ok());
     assert!(serde_json::from_str::<InsightPayload>(&valid.replace(
-        r#"[{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","resolver_id":"citation:abc"}}]"#,
+        r#"[{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","modified_at":1700000000,"resolver_id":"citation:abc"}}]"#,
         "[]"
     )).is_err());
-    let evidence = r#"{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","resolver_id":"citation:abc"}}"#;
+    let evidence = r#"{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","modified_at":1700000000,"resolver_id":"citation:abc"}}"#;
     assert!(serde_json::from_str::<InsightPayload>(&valid.replace(
         format!("[{evidence}]").as_str(),
         format!("[{evidence},{evidence}]").as_str()

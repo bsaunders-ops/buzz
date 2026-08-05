@@ -4,7 +4,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { InsightCard } from "../ui/InsightCard.tsx";
-import { parseInsightPayload } from "./insight.ts";
+import { parseInsightPayload, privateEvidenceResolverPath } from "./insight.ts";
 
 function validPayload(overrides = {}) {
   return {
@@ -20,6 +20,11 @@ function validPayload(overrides = {}) {
         source_id: "contact:private-123",
         source_hash:
           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        citation: {
+          title: "Acme relationship record",
+          modified_at: 1700000000,
+          resolver_id: "evidence:crm-123",
+        },
       },
       {
         source: "public_web",
@@ -28,6 +33,7 @@ function validPayload(overrides = {}) {
           "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         citation: {
           title: "Q2 market report",
+          modified_at: 1700000100,
           resolver_id: "citation:report-789",
         },
       },
@@ -61,8 +67,26 @@ test("parses the exact v1 insight payload into typed display fields", () => {
     change: "The buyer asked for revised terms",
     whyItMatters: "The decision window closes Friday",
     evidence: [
-      { source: "crm", citation: null },
-      { source: "public_web", citation: { title: "Q2 market report" } },
+      {
+        source: "crm",
+        citation: {
+          title: "Acme relationship record",
+          modifiedAt: 1700000000,
+          resolverKey: "evidence:crm-123",
+        },
+        stableKey:
+          "crm\u0000contact:private-123\u0000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      },
+      {
+        source: "public_web",
+        citation: {
+          title: "Q2 market report",
+          modifiedAt: 1700000100,
+          resolverKey: "citation:report-789",
+        },
+        stableKey:
+          "public_web\u0000article:public-456\u0000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
     ],
     confidence: 88,
     freshness: "recent",
@@ -82,6 +106,22 @@ test("rejects malformed and future insight payloads without partial parsing", ()
     validPayload({ priority: "future_priority" }),
     validPayload({ freshness: "future_freshness" }),
     validPayload({ unexpected: "unknown fields must fail closed" }),
+    validPayload({
+      evidence: [
+        {
+          source: "crm",
+          source_id: "contact:private-123",
+          source_hash:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          citation: {
+            title: "Acme relationship record",
+            modified_at: 1700000000,
+            resolver_id: "evidence:crm-123",
+            provider_url: "https://example.invalid/private",
+          },
+        },
+      ],
+    }),
     validPayload({ evidence: [] }),
     validPayload({
       evidence: [
@@ -109,7 +149,10 @@ test("InsightCard shows source families and public citation titles without expos
   );
   const visibleText = html.replace(/<[^>]*>/g, "");
 
-  assert.match(visibleText, /CRM record/);
+  assert.match(
+    visibleText,
+    /CRM record: Acme relationship record · modified 2023-11-14/,
+  );
   assert.match(visibleText, /Public web research: Q2 market report/);
   assert.match(visibleText, /Confidence/);
   assert.match(visibleText, /Freshness/);
@@ -118,9 +161,22 @@ test("InsightCard shows source families and public citation titles without expos
   assert.ok(!html.includes("contact:private-123"));
   assert.ok(!html.includes("article:public-456"));
   assert.ok(!html.includes("citation:report-789"));
+  assert.ok(!html.includes("evidence:crm-123"));
   assert.ok(!html.includes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
   assert.ok(!html.includes(rawPayload));
   assert.ok(!html.includes("href="));
+});
+
+test("builds only an app-internal opaque evidence resolver path", () => {
+  const insight = parseInsightPayload(JSON.stringify(validPayload()));
+  assert.ok(insight);
+  assert.equal(
+    privateEvidenceResolverPath(insight.evidence[0]),
+    "buzz://evidence?resolver=evidence%3Acrm-123",
+  );
+  assert.ok(
+    !privateEvidenceResolverPath(insight.evidence[0]).includes("contact"),
+  );
 });
 
 test("InsightCard presents malformed payloads as unavailable without raw JSON", () => {

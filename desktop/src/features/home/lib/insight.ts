@@ -41,6 +41,7 @@ const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA_256 = /^[0-9a-f]{64}$/;
 const OPAQUE_ID = /^[A-Za-z0-9._:-]{1,256}$/;
+const MAX_UNIX_SECONDS = 253_402_300_799;
 const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 export type InsightEvidence = {
@@ -53,7 +54,13 @@ export type InsightEvidence = {
     | "granola"
     | "buzz_event"
     | "public_web";
-  citation: { title: string } | null;
+  citation: {
+    title: string;
+    modifiedAt: number;
+    resolverKey: string;
+  } | null;
+  /** Non-rendered key retained so repeated source labels never collide in React. */
+  stableKey: string;
 };
 
 export type InsightDraft =
@@ -113,17 +120,28 @@ function isSafeText(value: unknown, maximum: number): value is string {
 }
 
 function parseCitation(value: unknown) {
-  if (!isObject(value) || !hasExactKeys(value, ["title", "resolver_id"])) {
+  if (
+    !isObject(value) ||
+    !hasExactKeys(value, ["title", "modified_at", "resolver_id"])
+  ) {
     return null;
   }
   if (
     !isSafeText(value.title, 128) ||
+    typeof value.modified_at !== "number" ||
+    !Number.isSafeInteger(value.modified_at) ||
+    value.modified_at < 0 ||
+    value.modified_at > MAX_UNIX_SECONDS ||
     !isSafeText(value.resolver_id, 256) ||
     !OPAQUE_ID.test(value.resolver_id)
   ) {
     return null;
   }
-  return { title: value.title };
+  return {
+    title: value.title,
+    modifiedAt: value.modified_at,
+    resolverKey: value.resolver_id,
+  };
 }
 
 function parseEvidence(value: unknown): InsightEvidence[] | null {
@@ -168,9 +186,24 @@ function parseEvidence(value: unknown): InsightEvidence[] | null {
     evidence.push({
       source: item.source as InsightEvidence["source"],
       citation,
+      stableKey: dedupeKey,
     });
   }
   return evidence;
+}
+
+/**
+ * Produce a non-executable, app-internal resolver path. Trusted runtime code
+ * must authenticate the caller and reauthorize the evidence before resolving
+ * this opaque key to any provider URL.
+ */
+export function privateEvidenceResolverPath(evidence: InsightEvidence) {
+  if (!evidence.citation) return null;
+  return `buzz://evidence?resolver=${encodeURIComponent(evidence.citation.resolverKey)}`;
+}
+
+export function evidenceModifiedDateLabel(modifiedAt: number) {
+  return new Date(modifiedAt * 1_000).toISOString().slice(0, 10);
 }
 
 function parseDraft(value: unknown): InsightDraft | null | undefined {
