@@ -3,7 +3,8 @@ use std::{future::Future, pin::Pin};
 use buzz_assistant_broker::{
     run_private_assistant_turn, AssistantAuthorityResolver, AssistantModel, AuthorizedFtsRetriever,
     BrokerVersionStamps, InsightCommandSink, ModelFailure, ModelRequest, PrivateAssistantRoute,
-    PublishFailure, RetrievalFailure, ServerAuthenticatedTurn, TurnError, LOCKED_SYSTEM_POLICY,
+    PublishFailure, RetrievalFailure, ServerAuthenticatedTurn, TrustedInsightContext,
+    TrustedProactiveInsightCategory, TurnError, LOCKED_SYSTEM_POLICY,
 };
 use buzz_connector_core::{
     retrieval::{AuthorizedExcerpt, Citation, CitationFreshness, FullTextRetrievalQuery},
@@ -26,6 +27,10 @@ const SOURCE_CHANNEL: Uuid = Uuid::from_u128(0x300);
 const CREATED_AT: i64 = 1_785_762_000;
 
 fn excerpt() -> AuthorizedExcerpt {
+    excerpt_with_freshness(CitationFreshness::Fresh)
+}
+
+fn excerpt_with_freshness(freshness: CitationFreshness) -> AuthorizedExcerpt {
     let citation = Citation::new(
         "Client follow-up",
         ConnectorProvider::MicrosoftGraph,
@@ -40,7 +45,7 @@ fn excerpt() -> AuthorizedExcerpt {
         [1; 32],
         RemoteVersion::new("v7", Some("etag-v7".into())).expect("remote version"),
         [3; 32],
-        CitationFreshness::Fresh,
+        freshness,
     )
     .expect("citation");
     AuthorizedExcerpt::new(citation, "The client follow-up is due Friday.", 10, 45)
@@ -252,10 +257,120 @@ async fn authorized_turn_emits_exact_trusted_insight_from_only_minimized_context
     assert_eq!(payload.firm_version.as_str(), "firm-v3");
     assert_eq!(payload.personal_version.as_str(), "personal-v4");
     assert_eq!(payload.model_version.as_str(), "model-v5");
-    assert_eq!(payload.category, InsightCategory::DealMovement);
+    assert_eq!(payload.category, InsightCategory::AssistantResponse);
     assert_eq!(payload.priority, InsightPriority::Normal);
     assert_eq!(payload.confidence.get(), 70);
     assert_eq!(payload.freshness, InsightFreshness::SameDay);
+}
+
+#[tokio::test]
+async fn stale_evidence_is_explicit_and_caps_confidence_at_fifty() {
+    let caller = Keys::generate();
+    let assistant = Keys::generate();
+    let community = CommunityId::from_uuid(COMMUNITY);
+    let turn = ServerAuthenticatedTurn::from_server_facts(
+        community,
+        caller.public_key(),
+        assistant.public_key(),
+        PRIVATE_CHANNEL,
+        "What needs my attention?",
+    )
+    .expect("turn");
+    let mut resolver = Resolver {
+        route: PrivateAssistantRoute::server_verified(
+            community,
+            caller.public_key(),
+            assistant.public_key(),
+            PRIVATE_CHANNEL,
+        ),
+        channels: vec![SOURCE_CHANNEL],
+    };
+    let mut retriever = Retriever {
+        excerpts: vec![excerpt_with_freshness(CitationFreshness::Stale)],
+        seen_channels: vec![],
+    };
+    let mut model = Model::default();
+    let mut sink = Sink::default();
+
+    run_private_assistant_turn(
+        &turn,
+        &versions(),
+        &mut resolver,
+        &mut retriever,
+        &mut model,
+        &mut sink,
+        CREATED_AT,
+    )
+    .await
+    .expect("authorized stale turn");
+
+    let event = sink
+        .0
+        .pop()
+        .expect("command")
+        .sign_with_keys(&assistant)
+        .expect("signed command");
+    let payload: InsightPayload = serde_json::from_str(&event.content).expect("payload");
+    assert_eq!(payload.category, InsightCategory::AssistantResponse);
+    assert_eq!(payload.priority, InsightPriority::Normal);
+    assert_eq!(payload.freshness, InsightFreshness::Stale);
+    assert!(payload.confidence.get() <= 50);
+}
+
+#[tokio::test]
+async fn only_trusted_context_assigns_a_proactive_category_and_priority() {
+    let caller = Keys::generate();
+    let assistant = Keys::generate();
+    let community = CommunityId::from_uuid(COMMUNITY);
+    let turn = ServerAuthenticatedTurn::from_server_facts_with_context(
+        community,
+        caller.public_key(),
+        assistant.public_key(),
+        PRIVATE_CHANNEL,
+        "Summarize the trusted signal.",
+        TrustedInsightContext::proactive(
+            TrustedProactiveInsightCategory::CommitmentDeadline,
+            InsightPriority::High,
+        ),
+    )
+    .expect("trusted proactive turn");
+    let mut resolver = Resolver {
+        route: PrivateAssistantRoute::server_verified(
+            community,
+            caller.public_key(),
+            assistant.public_key(),
+            PRIVATE_CHANNEL,
+        ),
+        channels: vec![SOURCE_CHANNEL],
+    };
+    let mut retriever = Retriever {
+        excerpts: vec![excerpt()],
+        seen_channels: vec![],
+    };
+    let mut model = Model::default();
+    let mut sink = Sink::default();
+
+    run_private_assistant_turn(
+        &turn,
+        &versions(),
+        &mut resolver,
+        &mut retriever,
+        &mut model,
+        &mut sink,
+        CREATED_AT,
+    )
+    .await
+    .expect("trusted proactive turn");
+
+    let event = sink
+        .0
+        .pop()
+        .expect("command")
+        .sign_with_keys(&assistant)
+        .expect("signed command");
+    let payload: InsightPayload = serde_json::from_str(&event.content).expect("payload");
+    assert_eq!(payload.category, InsightCategory::CommitmentDeadline);
+    assert_eq!(payload.priority, InsightPriority::High);
 }
 
 #[tokio::test]

@@ -4,13 +4,14 @@ use std::{fmt, marker::PhantomData};
 
 use nostr::nips::nip44::v2::ConversationKey;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use url::Url;
 use uuid::Uuid;
 
 use crate::kind::{
     KIND_CORE_ACTION_DECISION, KIND_CORE_ACTION_PROPOSAL, KIND_CORE_ACTION_RECEIPT,
-    KIND_CORE_CALL_CONTROL, KIND_CORE_COPILOT_SUGGESTION, KIND_CORE_INSIGHT,
-    KIND_CORE_INSIGHT_DISPOSITION, KIND_CORE_LEARNING_BUNDLE_HEAD, KIND_CORE_LEARNING_RECORD,
-    KIND_CORE_TRANSCRIPT_SEGMENT,
+    KIND_CORE_CALL_CONTROL, KIND_CORE_COPILOT_SUGGESTION, KIND_CORE_EVIDENCE_RESOLVE_REQUEST,
+    KIND_CORE_EVIDENCE_RESOLVE_RESULT, KIND_CORE_INSIGHT, KIND_CORE_INSIGHT_DISPOSITION,
+    KIND_CORE_LEARNING_BUNDLE_HEAD, KIND_CORE_LEARNING_RECORD, KIND_CORE_TRANSCRIPT_SEGMENT,
 };
 
 /// Maximum lifetime of an external action proposal, in seconds.
@@ -19,6 +20,8 @@ pub const MAX_PROPOSAL_LIFETIME_SECONDS: i64 = 900;
 pub const MAX_PROPOSAL_FUTURE_SKEW_SECONDS: i64 = 300;
 /// Maximum disposition snooze window (30 days), in seconds.
 pub const MAX_SNOOZE_SECONDS: i64 = 30 * 24 * 60 * 60;
+/// Maximum lifetime of an evidence-resolution request or result, in seconds.
+pub const MAX_EVIDENCE_RESOLVE_LIFETIME_SECONDS: i64 = 60;
 /// Maximum serialized content size for relay-readable Core payloads.
 pub const MAX_CORE_PLAINTEXT_CONTENT_LEN: usize = 65_535;
 /// Domain separator for owner-agent learning bundle coordinates.
@@ -31,6 +34,10 @@ pub enum CoreDirection {
     AgentToOwner,
     /// The owner authors and its registered agent is the `p` recipient.
     OwnerToAgent,
+    /// The owner authors and the trusted relay is the `p` recipient.
+    OwnerToRelay,
+    /// The trusted relay authors and the owner is the `p` recipient.
+    RelayToOwner,
     /// Either member of the registered pair may author to the other.
     Either,
 }
@@ -60,6 +67,8 @@ pub const fn is_core_kind(kind: u32) -> bool {
             | KIND_CORE_CALL_CONTROL
             | KIND_CORE_TRANSCRIPT_SEGMENT
             | KIND_CORE_COPILOT_SUGGESTION
+            | KIND_CORE_EVIDENCE_RESOLVE_REQUEST
+            | KIND_CORE_EVIDENCE_RESOLVE_RESULT
     )
 }
 
@@ -88,6 +97,8 @@ pub const fn core_direction(kind: u32) -> Option<CoreDirection> {
         KIND_CORE_INSIGHT_DISPOSITION
         | KIND_CORE_ACTION_DECISION
         | KIND_CORE_TRANSCRIPT_SEGMENT => Some(CoreDirection::OwnerToAgent),
+        KIND_CORE_EVIDENCE_RESOLVE_REQUEST => Some(CoreDirection::OwnerToRelay),
+        KIND_CORE_EVIDENCE_RESOLVE_RESULT => Some(CoreDirection::RelayToOwner),
         KIND_CORE_LEARNING_RECORD | KIND_CORE_CALL_CONTROL => Some(CoreDirection::Either),
         _ => None,
     }
@@ -197,6 +208,7 @@ pub fn validate_core_envelope(
             | KIND_CORE_CALL_CONTROL
             | KIND_CORE_TRANSCRIPT_SEGMENT
             | KIND_CORE_COPILOT_SUGGESTION
+            | KIND_CORE_EVIDENCE_RESOLVE_RESULT
     );
     if encrypted && crate::observer::validate_syntactic_nip44_v2(&event.content).is_err() {
         return Err(ProtocolValidationError(
@@ -237,6 +249,7 @@ pub fn validate_core_plaintext_content(
             | KIND_CORE_ACTION_PROPOSAL
             | KIND_CORE_ACTION_DECISION
             | KIND_CORE_ACTION_RECEIPT
+            | KIND_CORE_EVIDENCE_RESOLVE_REQUEST
     );
     if relay_readable {
         validate_core_plaintext_content_size(&event.content)?;
@@ -270,11 +283,17 @@ pub fn validate_core_plaintext_content(
                 .map_err(parse_error)?;
             payload.validate()?;
         }
+        KIND_CORE_EVIDENCE_RESOLVE_REQUEST => {
+            let payload = serde_json::from_str::<EvidenceResolveRequestPayload>(&event.content)
+                .map_err(parse_error)?;
+            payload.validate_at(now)?;
+        }
         KIND_CORE_LEARNING_RECORD
         | KIND_CORE_LEARNING_BUNDLE_HEAD
         | KIND_CORE_CALL_CONTROL
         | KIND_CORE_TRANSCRIPT_SEGMENT
-        | KIND_CORE_COPILOT_SUGGESTION => {}
+        | KIND_CORE_COPILOT_SUGGESTION
+        | KIND_CORE_EVIDENCE_RESOLVE_RESULT => {}
         _ => {
             return Err(ProtocolValidationError("event is not a Core kind".into()));
         }
@@ -611,6 +630,390 @@ impl<'de> Deserialize<'de> for Sha256Hex {
     {
         let value = String::deserialize(deserializer)?;
         Self::try_from(value.as_str()).map_err(de::Error::custom)
+    }
+}
+
+/// Opaque resolver coordinate for one tenant-local source item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EvidenceResolverId(Uuid);
+
+impl EvidenceResolverId {
+    /// Return the opaque local source-item identifier.
+    pub const fn source_item_id(self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for EvidenceResolverId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "evidence:{}", self.0.hyphenated())
+    }
+}
+
+impl TryFrom<&str> for EvidenceResolverId {
+    type Error = ProtocolValidationError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let raw = value.strip_prefix("evidence:").ok_or_else(|| {
+            ProtocolValidationError(
+                "resolver_id must be evidence:<canonical lowercase UUID>".into(),
+            )
+        })?;
+        let parsed = Uuid::parse_str(raw).map_err(|_| {
+            ProtocolValidationError(
+                "resolver_id must be evidence:<canonical lowercase UUID>".into(),
+            )
+        })?;
+        if parsed.is_nil() || parsed.hyphenated().to_string() != raw {
+            return Err(ProtocolValidationError(
+                "resolver_id must be evidence:<canonical lowercase UUID>".into(),
+            ));
+        }
+        Ok(Self(parsed))
+    }
+}
+
+impl Serialize for EvidenceResolverId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for EvidenceResolverId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value.as_str()).map_err(de::Error::custom)
+    }
+}
+
+/// Validated HTTPS URL returned only inside an encrypted resolver result.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct EvidenceProviderUrl(String);
+
+impl fmt::Debug for EvidenceProviderUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EvidenceProviderUrl(<redacted>)")
+    }
+}
+
+impl EvidenceProviderUrl {
+    /// Borrow the validated HTTPS URL.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for EvidenceProviderUrl {
+    type Error = ProtocolValidationError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let parsed = Url::parse(value)
+            .map_err(|_| ProtocolValidationError("evidence URL must be valid HTTPS".into()))?;
+        let authority = value
+            .strip_prefix("https://")
+            .and_then(|remainder| remainder.split(['/', '?', '#']).next());
+        let has_explicit_port = authority.is_some_and(|authority| {
+            if authority.starts_with('[') {
+                authority
+                    .rfind(']')
+                    .is_some_and(|closing| closing + 1 < authority.len())
+            } else {
+                authority.contains(':')
+            }
+        });
+        if value.len() > 2_048
+            || value.chars().any(char::is_control)
+            || parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || has_explicit_port
+            || parsed.fragment().is_some()
+        {
+            return Err(ProtocolValidationError(
+                "evidence URL must be credential-free HTTPS with a host and no port or fragment"
+                    .into(),
+            ));
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl Serialize for EvidenceProviderUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for EvidenceProviderUrl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value.as_str()).map_err(de::Error::custom)
+    }
+}
+
+/// Closed source type returned with resolved citation metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceResolvedSourceType {
+    /// Outlook email.
+    Email,
+    /// Microsoft calendar event.
+    CalendarEvent,
+    /// Provider-native document.
+    Document,
+    /// Provider-native spreadsheet.
+    Spreadsheet,
+    /// Provider-native presentation.
+    Presentation,
+    /// Core CRM record.
+    CrmRecord,
+    /// Core CRM-backed transcript.
+    CrmTranscript,
+    /// Buzz message or event.
+    BuzzEvent,
+    /// Sanitized public-web source.
+    PublicWeb,
+}
+
+/// Ephemeral owner-to-relay evidence-resolution request (kind 24823).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceResolveRequestPayload {
+    /// Payload schema version.
+    pub schema_version: Version1,
+    /// Unique request identifier.
+    pub request_id: CanonicalUuidV4,
+    /// Insight containing the cited evidence.
+    pub insight_id: CanonicalUuidV4,
+    /// Opaque local source-item coordinate.
+    pub resolver_id: EvidenceResolverId,
+    /// Exact cited chunk revision.
+    pub expected_chunk_hash: Sha256Hex,
+    /// One-time 32-byte nonce encoded as lowercase hex.
+    pub nonce: Sha256Hex,
+    /// Unix-seconds creation time.
+    pub created_at: i64,
+    /// Unix-seconds expiry, no more than 60 seconds after creation.
+    pub expires_at: i64,
+}
+
+impl EvidenceResolveRequestPayload {
+    /// Validate freshness and the maximum request lifetime at relay wall time.
+    pub fn validate_at(&self, now: i64) -> Result<(), ProtocolValidationError> {
+        let maximum_expiry = self
+            .created_at
+            .checked_add(MAX_EVIDENCE_RESOLVE_LIFETIME_SECONDS)
+            .ok_or_else(|| ProtocolValidationError("evidence request lifetime overflow".into()))?;
+        if self.created_at < 0
+            || self.created_at > now
+            || self.expires_at <= self.created_at
+            || self.expires_at > maximum_expiry
+            || self.expires_at <= now
+        {
+            return Err(ProtocolValidationError(
+                "evidence request must be current and expire within 60 seconds".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Public status of an encrypted evidence-resolution result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceResolveStatus {
+    /// Current authorization and exact source revision resolved.
+    Resolved,
+    /// Current authorization denied access.
+    Denied,
+    /// The cited source revision no longer matches.
+    Stale,
+    /// Resolution was temporarily unavailable.
+    Unavailable,
+}
+
+/// Encrypted relay-to-owner evidence-resolution result (kind 24824).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EvidenceResolveResultPayload {
+    /// Validated provider metadata and URL after the complete current recheck.
+    Resolved {
+        /// Payload schema version.
+        schema_version: Version1,
+        /// Identifier of the request being answered.
+        request_id: CanonicalUuidV4,
+        /// Unix-seconds expiry of this ephemeral result.
+        expires_at: i64,
+        /// Current source title.
+        title: ProtocolLabel,
+        /// Current provider modification time as Unix seconds.
+        modified_at: i64,
+        /// Closed current source type.
+        source_type: EvidenceResolvedSourceType,
+        /// Validated provider HTTPS URL.
+        url: EvidenceProviderUrl,
+    },
+    /// Current authorization denied access.
+    Denied {
+        /// Payload schema version.
+        schema_version: Version1,
+        /// Identifier of the request being answered.
+        request_id: CanonicalUuidV4,
+        /// Unix-seconds expiry of this ephemeral result.
+        expires_at: i64,
+    },
+    /// The exact cited revision is no longer current.
+    Stale {
+        /// Payload schema version.
+        schema_version: Version1,
+        /// Identifier of the request being answered.
+        request_id: CanonicalUuidV4,
+        /// Unix-seconds expiry of this ephemeral result.
+        expires_at: i64,
+    },
+    /// Resolution was temporarily unavailable.
+    Unavailable {
+        /// Payload schema version.
+        schema_version: Version1,
+        /// Identifier of the request being answered.
+        request_id: CanonicalUuidV4,
+        /// Unix-seconds expiry of this ephemeral result.
+        expires_at: i64,
+    },
+}
+
+impl fmt::Debug for EvidenceResolveResultPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EvidenceResolveResultPayload")
+            .field("status", &self.status())
+            .field("request_id", &self.request_id())
+            .field("expires_at", &self.expires_at())
+            .field("resolved_metadata_redacted", &true)
+            .finish()
+    }
+}
+
+impl EvidenceResolveResultPayload {
+    /// Construct and validate a resolved result from trusted current metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolved(
+        request_id: CanonicalUuidV4,
+        expires_at: i64,
+        title: &str,
+        modified_at: i64,
+        source_type: EvidenceResolvedSourceType,
+        url: &str,
+        now: i64,
+    ) -> Result<Self, ProtocolValidationError> {
+        let payload = Self::Resolved {
+            schema_version: Version1,
+            request_id,
+            expires_at,
+            title: ProtocolLabel::try_from(title)?,
+            modified_at,
+            source_type,
+            url: EvidenceProviderUrl::try_from(url)?,
+        };
+        payload.validate_at(now)?;
+        Ok(payload)
+    }
+
+    /// Construct and validate a metadata-free denied, stale, or unavailable result.
+    pub fn unresolved(
+        request_id: CanonicalUuidV4,
+        status: EvidenceResolveStatus,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<Self, ProtocolValidationError> {
+        let payload = match status {
+            EvidenceResolveStatus::Resolved => {
+                return Err(ProtocolValidationError(
+                    "resolved evidence requires current metadata".into(),
+                ));
+            }
+            EvidenceResolveStatus::Denied => Self::Denied {
+                schema_version: Version1,
+                request_id,
+                expires_at,
+            },
+            EvidenceResolveStatus::Stale => Self::Stale {
+                schema_version: Version1,
+                request_id,
+                expires_at,
+            },
+            EvidenceResolveStatus::Unavailable => Self::Unavailable {
+                schema_version: Version1,
+                request_id,
+                expires_at,
+            },
+        };
+        payload.validate_at(now)?;
+        Ok(payload)
+    }
+
+    /// Return the closed public status without exposing resolved metadata.
+    pub const fn status(&self) -> EvidenceResolveStatus {
+        match self {
+            Self::Resolved { .. } => EvidenceResolveStatus::Resolved,
+            Self::Denied { .. } => EvidenceResolveStatus::Denied,
+            Self::Stale { .. } => EvidenceResolveStatus::Stale,
+            Self::Unavailable { .. } => EvidenceResolveStatus::Unavailable,
+        }
+    }
+
+    /// Return the request identifier being answered.
+    pub const fn request_id(&self) -> CanonicalUuidV4 {
+        match self {
+            Self::Resolved { request_id, .. }
+            | Self::Denied { request_id, .. }
+            | Self::Stale { request_id, .. }
+            | Self::Unavailable { request_id, .. } => *request_id,
+        }
+    }
+
+    /// Return the Unix-seconds expiry.
+    pub const fn expires_at(&self) -> i64 {
+        match self {
+            Self::Resolved { expires_at, .. }
+            | Self::Denied { expires_at, .. }
+            | Self::Stale { expires_at, .. }
+            | Self::Unavailable { expires_at, .. } => *expires_at,
+        }
+    }
+
+    /// Validate that the encrypted result is live for at most 60 more seconds.
+    pub fn validate_at(&self, now: i64) -> Result<(), ProtocolValidationError> {
+        let maximum_expiry = now
+            .checked_add(MAX_EVIDENCE_RESOLVE_LIFETIME_SECONDS)
+            .ok_or_else(|| ProtocolValidationError("evidence result lifetime overflow".into()))?;
+        let expires_at = self.expires_at();
+        if now < 0 || expires_at <= now || expires_at > maximum_expiry {
+            return Err(ProtocolValidationError(
+                "evidence result must be current and expire within 60 seconds".into(),
+            ));
+        }
+        if matches!(
+            self,
+            Self::Resolved { modified_at, .. } if *modified_at < 0
+        ) {
+            return Err(ProtocolValidationError(
+                "resolved evidence modified_at must be non-negative".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1605,6 +2008,8 @@ pub enum InsightPriority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InsightCategory {
+    /// Direct response to an owner question without inferred proactive routing.
+    AssistantResponse,
     /// Commitment or deadline movement.
     CommitmentDeadline,
     /// Deal or client movement.
@@ -1625,6 +2030,8 @@ pub enum InsightFreshness {
     SameDay,
     /// Event remains useful but is older than the current day.
     Recent,
+    /// Connector reconciliation is missing, failed, retrying, or outside its objective.
+    Stale,
 }
 
 /// Optional safe draft included with an insight.

@@ -95,6 +95,54 @@ pub enum RetrievalFailure {
 #[error("model unavailable")]
 pub struct ModelFailure;
 
+/// Closed proactive category selectable only by trusted server-side signal code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustedProactiveInsightCategory {
+    /// Commitment or deadline movement.
+    CommitmentDeadline,
+    /// Deal or client movement.
+    DealMovement,
+    /// Meeting movement or preparation.
+    MeetingMovement,
+    /// Relationship or buyer opportunity.
+    RelationshipOpportunity,
+}
+
+/// Server-owned classification context that is never accepted from model output or evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedInsightContext {
+    category: InsightCategory,
+    priority: InsightPriority,
+}
+
+impl TrustedInsightContext {
+    /// Classification for a normal owner question.
+    pub const fn direct_question() -> Self {
+        Self {
+            category: InsightCategory::AssistantResponse,
+            priority: InsightPriority::Normal,
+        }
+    }
+
+    /// Classification supplied by a trusted proactive signal runner.
+    pub const fn proactive(
+        category: TrustedProactiveInsightCategory,
+        priority: InsightPriority,
+    ) -> Self {
+        let category = match category {
+            TrustedProactiveInsightCategory::CommitmentDeadline => {
+                InsightCategory::CommitmentDeadline
+            }
+            TrustedProactiveInsightCategory::DealMovement => InsightCategory::DealMovement,
+            TrustedProactiveInsightCategory::MeetingMovement => InsightCategory::MeetingMovement,
+            TrustedProactiveInsightCategory::RelationshipOpportunity => {
+                InsightCategory::RelationshipOpportunity
+            }
+        };
+        Self { category, priority }
+    }
+}
+
 /// Content-free publish-command failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("publish command rejected")]
@@ -111,6 +159,7 @@ pub struct ServerAuthenticatedTurn {
     assistant: PublicKey,
     private_channel: Uuid,
     question: String,
+    insight_context: TrustedInsightContext,
 }
 
 impl std::fmt::Debug for ServerAuthenticatedTurn {
@@ -133,6 +182,25 @@ impl ServerAuthenticatedTurn {
         private_channel: Uuid,
         question: impl Into<String>,
     ) -> Result<Self, TurnError> {
+        Self::from_server_facts_with_context(
+            community,
+            caller,
+            assistant,
+            private_channel,
+            question,
+            TrustedInsightContext::direct_question(),
+        )
+    }
+
+    /// Bind server facts and an explicit trusted proactive classification context.
+    pub fn from_server_facts_with_context(
+        community: CommunityId,
+        caller: PublicKey,
+        assistant: PublicKey,
+        private_channel: Uuid,
+        question: impl Into<String>,
+        insight_context: TrustedInsightContext,
+    ) -> Result<Self, TurnError> {
         let question = question.into();
         if caller == assistant
             || private_channel.is_nil()
@@ -148,6 +216,7 @@ impl ServerAuthenticatedTurn {
             assistant,
             private_channel,
             question,
+            insight_context,
         })
     }
 }
@@ -492,6 +561,7 @@ struct DerivedEvidenceLabels {
 fn derive_evidence_labels(
     excerpts: &[&AuthorizedExcerpt],
     created_at: i64,
+    context: TrustedInsightContext,
 ) -> Result<DerivedEvidenceLabels, TurnError> {
     if created_at < 0 || excerpts.is_empty() {
         return Err(TurnError::InvalidRequest);
@@ -500,7 +570,6 @@ fn derive_evidence_labels(
     let mut oldest_age = 0_i64;
     let mut all_provider_fresh = true;
     let mut distinct_items = BTreeSet::new();
-    let mut meeting_evidence = false;
     for excerpt in excerpts {
         let citation = excerpt.citation();
         let modified_at = citation.modified_at.timestamp();
@@ -511,38 +580,28 @@ fn derive_evidence_labels(
         oldest_age = oldest_age.max(age);
         all_provider_fresh &= citation.freshness == CitationFreshness::Fresh;
         distinct_items.insert(citation.item_hash);
-        meeting_evidence |= matches!(
-            citation.source_kind,
-            SourceKind::CalendarEvent | SourceKind::CrmTranscript
-        );
     }
 
-    let freshness = if !all_provider_fresh || oldest_age > SAME_DAY_WINDOW_SECONDS {
+    let freshness = if !all_provider_fresh {
+        InsightFreshness::Stale
+    } else if oldest_age > SAME_DAY_WINDOW_SECONDS {
         InsightFreshness::Recent
     } else if oldest_age <= REALTIME_WINDOW_SECONDS {
         InsightFreshness::Realtime
     } else {
         InsightFreshness::SameDay
     };
-    let priority = match freshness {
-        InsightFreshness::Realtime | InsightFreshness::SameDay => InsightPriority::Normal,
-        InsightFreshness::Recent => InsightPriority::Low,
-    };
     let base_confidence = match freshness {
         InsightFreshness::Realtime => 75_u8,
         InsightFreshness::SameDay => 70_u8,
-        InsightFreshness::Recent if all_provider_fresh => 60_u8,
-        InsightFreshness::Recent => 50_u8,
+        InsightFreshness::Recent => 60_u8,
+        InsightFreshness::Stale => 45_u8,
     };
     let corroboration = if distinct_items.len() > 1 { 5 } else { 0 };
 
     Ok(DerivedEvidenceLabels {
-        category: if meeting_evidence {
-            InsightCategory::MeetingMovement
-        } else {
-            InsightCategory::DealMovement
-        },
-        priority,
+        category: context.category,
+        priority: context.priority,
         confidence: base_confidence.saturating_add(corroboration).min(80),
         freshness,
     })
@@ -565,6 +624,10 @@ fn dedupe_hash(
     hasher.update(turn.caller.to_bytes());
     hasher.update(turn.assistant.to_bytes());
     hasher.update(turn.private_channel.as_bytes());
+    let classification =
+        serde_json::to_vec(&(turn.insight_context.category, turn.insight_context.priority))
+            .map_err(|_| TurnError::InsightConstructionFailed)?;
+    update_field(&mut hasher, &classification);
     for value in [
         result.change.as_str(),
         result.why_it_matters.as_str(),
@@ -599,7 +662,7 @@ fn build_payload(
     evidence: Vec<EvidenceRef>,
     created_at: i64,
 ) -> Result<InsightPayload, TurnError> {
-    let labels = derive_evidence_labels(selected, created_at)?;
+    let labels = derive_evidence_labels(selected, created_at, turn.insight_context)?;
     let dedupe = dedupe_hash(turn, versions, result, &evidence)?;
     serde_json::from_value(serde_json::json!({
         "schema_version": 1,

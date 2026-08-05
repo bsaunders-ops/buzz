@@ -2,7 +2,7 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use nostr::{nips::nip44::v2::ConversationKey, EventBuilder, Kind, PublicKey, Tag};
+use nostr::{nips::nip44::v2::ConversationKey, EventBuilder, Keys, Kind, PublicKey, Tag};
 use uuid::Uuid;
 
 use crate::SdkError;
@@ -17,6 +17,30 @@ pub fn parse_core_payload<T: DeserializeOwned>(json: &str) -> Result<T, SdkError
 /// Parse and wall-clock validate a Core action proposal.
 pub fn parse_action_proposal_at(json: &str, now: i64) -> Result<ActionProposalPayload, SdkError> {
     let payload: ActionProposalPayload = parse_core_payload(json)?;
+    payload
+        .validate_at(now)
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    Ok(payload)
+}
+
+/// Parse and wall-clock validate an ephemeral evidence-resolution request.
+pub fn parse_evidence_resolve_request_at(
+    json: &str,
+    now: i64,
+) -> Result<EvidenceResolveRequestPayload, SdkError> {
+    let payload: EvidenceResolveRequestPayload = parse_core_payload(json)?;
+    payload
+        .validate_at(now)
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    Ok(payload)
+}
+
+/// Parse and wall-clock validate a decrypted evidence-resolution result.
+pub fn parse_evidence_resolve_result_at(
+    json: &str,
+    now: i64,
+) -> Result<EvidenceResolveResultPayload, SdkError> {
+    let payload: EvidenceResolveResultPayload = parse_core_payload(json)?;
     payload
         .validate_at(now)
         .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
@@ -221,10 +245,58 @@ pub fn build_core_copilot_suggestion(
     )
 }
 
+/// Build a kind-24823 relay-readable ephemeral evidence-resolution request.
+pub fn build_core_evidence_resolve_request(
+    channel_id: Uuid,
+    relay: &PublicKey,
+    payload: &EvidenceResolveRequestPayload,
+    now: i64,
+) -> Result<EventBuilder, SdkError> {
+    payload
+        .validate_at(now)
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    plaintext_builder(
+        buzz_core::kind::KIND_CORE_EVIDENCE_RESOLVE_REQUEST,
+        channel_id,
+        relay,
+        payload,
+    )
+}
+
+/// Build a kind-24824 encrypted ephemeral relay evidence-resolution result.
+pub fn build_core_evidence_resolve_result(
+    channel_id: Uuid,
+    owner: &PublicKey,
+    ciphertext: &str,
+) -> Result<EventBuilder, SdkError> {
+    encrypted_builder(
+        buzz_core::kind::KIND_CORE_EVIDENCE_RESOLVE_RESULT,
+        channel_id,
+        owner,
+        ciphertext,
+        None,
+    )
+}
+
+/// Validate, NIP-44 encrypt, and build a relay-authored kind-24824 result.
+pub fn encrypt_core_evidence_resolve_result(
+    channel_id: Uuid,
+    owner: &PublicKey,
+    relay_keys: &Keys,
+    payload: &EvidenceResolveResultPayload,
+    now: i64,
+) -> Result<EventBuilder, SdkError> {
+    payload
+        .validate_at(now)
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    let ciphertext = buzz_core::observer::encrypt_observer_payload(relay_keys, owner, payload)
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    build_core_evidence_resolve_result(channel_id, owner, &ciphertext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::Keys;
 
     #[test]
     fn plaintext_builder_accepts_exact_cap_and_rejects_cap_plus_one() {
@@ -249,5 +321,59 @@ mod tests {
             &over_cap,
         )
         .is_err());
+    }
+
+    #[test]
+    fn evidence_resolution_builders_freeze_kind_route_and_encryption() {
+        let owner = Keys::generate();
+        let relay = Keys::generate();
+        let channel_id =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("fixed UUID");
+        let request: EvidenceResolveRequestPayload = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "request_id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+            "insight_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+            "resolver_id": "evidence:123e4567-e89b-42d3-a456-426614174000",
+            "expected_chunk_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "nonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "created_at": 1_700_000_000,
+            "expires_at": 1_700_000_060,
+        }))
+        .expect("request");
+        let request_event = build_core_evidence_resolve_request(
+            channel_id,
+            &relay.public_key(),
+            &request,
+            1_700_000_001,
+        )
+        .expect("request builder")
+        .sign_with_keys(&owner)
+        .expect("request event");
+        assert_eq!(request_event.kind.as_u16(), 24_823);
+        assert_eq!(
+            validate_core_envelope(&request_event)
+                .expect("request envelope")
+                .direction,
+            CoreDirection::OwnerToRelay
+        );
+
+        let ciphertext = buzz_core::observer::encrypt_observer_payload(
+            &relay,
+            &owner.public_key(),
+            &serde_json::json!({"schema_version": 1}),
+        )
+        .expect("ciphertext");
+        let response_event =
+            build_core_evidence_resolve_result(channel_id, &owner.public_key(), &ciphertext)
+                .expect("response builder")
+                .sign_with_keys(&relay)
+                .expect("response event");
+        assert_eq!(response_event.kind.as_u16(), 24_824);
+        assert_eq!(
+            validate_core_envelope(&response_event)
+                .expect("response envelope")
+                .direction,
+            CoreDirection::RelayToOwner
+        );
     }
 }
