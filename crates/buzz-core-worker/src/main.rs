@@ -28,6 +28,8 @@ enum Command {
         #[arg(long, value_enum)]
         role: WorkerRole,
     },
+    /// Run exactly one read-only Core CRM claim/fetch/apply attempt, then exit.
+    CoreCrmCanary,
     /// Verify the current container's worker heartbeat.
     Health,
 }
@@ -99,8 +101,30 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Serve { role } => serve(role).await,
+        Command::CoreCrmCanary => core_crm_canary().await,
         Command::Health => health(),
     }
+}
+
+async fn core_crm_canary() -> Result<()> {
+    let role = WorkerRole::ConnectorWorker;
+    validate_environment(role)?;
+    let url = required_env("DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&url)
+        .await
+        .context("worker database connection failed")?;
+    verify_database_role(&pool, "buzz_connector_worker").await?;
+    let mut connector_registry = Some(build_core_crm_registry(pool)?);
+    let outcome = run_connector_role_once(&mut connector_registry).await?;
+    tracing::info!(
+        role = role.slug(),
+        outcome = ?outcome,
+        "bounded Core CRM canary finished"
+    );
+    Ok(())
 }
 
 async fn serve(role: WorkerRole) -> Result<()> {
@@ -324,6 +348,13 @@ mod tests {
             WorkerRole::ConnectorWorker.required_secrets(),
             &["CORE_CRM_CREDENTIAL_B64", "CORE_CRM_CURSOR_KEY_B64"]
         );
+    }
+
+    #[test]
+    fn exposes_explicit_core_crm_canary_command() {
+        let parsed = Cli::try_parse_from(["buzz-core-worker", "core-crm-canary"]);
+
+        assert!(parsed.is_ok(), "the bounded Core CRM canary must parse");
     }
 
     #[tokio::test]
