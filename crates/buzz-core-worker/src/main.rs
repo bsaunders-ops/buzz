@@ -90,6 +90,36 @@ impl WorkerRole {
     }
 }
 
+trait CommandExecutor {
+    async fn serve(&mut self, role: WorkerRole) -> Result<()>;
+    async fn core_crm_canary(&mut self) -> Result<()>;
+    async fn health(&mut self) -> Result<()>;
+}
+
+struct ProductionCommandExecutor;
+
+impl CommandExecutor for ProductionCommandExecutor {
+    async fn serve(&mut self, role: WorkerRole) -> Result<()> {
+        serve(role).await
+    }
+
+    async fn core_crm_canary(&mut self) -> Result<()> {
+        core_crm_canary().await
+    }
+
+    async fn health(&mut self) -> Result<()> {
+        health()
+    }
+}
+
+async fn dispatch_command<E: CommandExecutor>(command: Command, executor: &mut E) -> Result<()> {
+    match command {
+        Command::Serve { role } => executor.serve(role).await,
+        Command::CoreCrmCanary => executor.core_crm_canary().await,
+        Command::Health => executor.health().await,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -99,26 +129,13 @@ async fn main() -> Result<()> {
         .with_span_list(false)
         .init();
 
-    match Cli::parse().command {
-        Command::Serve { role } => serve(role).await,
-        Command::CoreCrmCanary => core_crm_canary().await,
-        Command::Health => health(),
-    }
+    dispatch_command(Cli::parse().command, &mut ProductionCommandExecutor).await
 }
 
 async fn core_crm_canary() -> Result<()> {
     let role = WorkerRole::ConnectorWorker;
-    validate_environment(role)?;
-    let url = required_env("DATABASE_URL")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect(&url)
-        .await
-        .context("worker database connection failed")?;
-    verify_database_role(&pool, "buzz_connector_worker").await?;
-    let mut connector_registry = Some(build_core_crm_registry(pool)?);
-    let outcome = run_connector_role_once(&mut connector_registry).await?;
+    let mut runtime = build_worker_runtime(role, None).await?;
+    let outcome = run_core_crm_canary_once(&mut runtime.connector_registry).await?;
     tracing::info!(
         role = role.slug(),
         outcome = ?outcome,
@@ -133,30 +150,13 @@ async fn serve(role: WorkerRole) -> Result<()> {
 
 async fn serve_with_connector_registry(
     role: WorkerRole,
-    mut connector_registry: Option<Box<dyn ConnectorIterationRunner>>,
+    connector_registry: Option<Box<dyn ConnectorIterationRunner>>,
 ) -> Result<()> {
-    validate_environment(role)?;
+    let WorkerRuntime {
+        database,
+        mut connector_registry,
+    } = build_worker_runtime(role, connector_registry).await?;
     let health_path = health_path();
-    let database = if let Some(expected_role) = role.expected_database_role() {
-        let url = required_env("DATABASE_URL")?;
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect(&url)
-            .await
-            .context("worker database connection failed")?;
-        verify_database_role(&pool, expected_role).await?;
-        Some(pool)
-    } else {
-        None
-    };
-    if matches!(role, WorkerRole::ConnectorWorker) && connector_registry.is_none() {
-        let pool = database
-            .as_ref()
-            .context("connector database is not configured")?
-            .clone();
-        connector_registry = Some(build_core_crm_registry(pool)?);
-    }
 
     write_heartbeat(&health_path, role)?;
     tracing::info!(role = role.slug(), "Core worker process boundary ready");
@@ -179,6 +179,42 @@ async fn serve_with_connector_registry(
         }
         write_heartbeat(&health_path, role)?;
     }
+}
+
+struct WorkerRuntime {
+    database: Option<sqlx::PgPool>,
+    connector_registry: Option<Box<dyn ConnectorIterationRunner>>,
+}
+
+async fn build_worker_runtime(
+    role: WorkerRole,
+    mut connector_registry: Option<Box<dyn ConnectorIterationRunner>>,
+) -> Result<WorkerRuntime> {
+    validate_environment(role)?;
+    let database = if let Some(expected_role) = role.expected_database_role() {
+        let url = required_env("DATABASE_URL")?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect(&url)
+            .await
+            .context("worker database connection failed")?;
+        verify_database_role(&pool, expected_role).await?;
+        Some(pool)
+    } else {
+        None
+    };
+    if matches!(role, WorkerRole::ConnectorWorker) && connector_registry.is_none() {
+        let pool = database
+            .as_ref()
+            .context("connector database is not configured")?
+            .clone();
+        connector_registry = Some(build_core_crm_registry(pool)?);
+    }
+    Ok(WorkerRuntime {
+        database,
+        connector_registry,
+    })
 }
 
 fn decode_secret(key: &str) -> Result<Zeroizing<Vec<u8>>> {
@@ -223,6 +259,12 @@ async fn run_connector_role_once(
         .run_once()
         .await
         .context("connector iteration boundary failed")
+}
+
+async fn run_core_crm_canary_once(
+    connector_registry: &mut Option<Box<dyn ConnectorIterationRunner>>,
+) -> Result<ConnectorIterationOutcome> {
+    run_connector_role_once(connector_registry).await
 }
 
 fn validate_environment(role: WorkerRole) -> Result<()> {
@@ -301,6 +343,7 @@ mod tests {
 
     struct FakeConnectorRunner {
         calls: Arc<AtomicUsize>,
+        result: std::result::Result<ConnectorIterationOutcome, ConnectorBoundaryError>,
     }
 
     impl ConnectorIterationRunner for FakeConnectorRunner {
@@ -318,7 +361,36 @@ mod tests {
             >,
         > {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(ConnectorIterationOutcome::Idle) })
+            let result = self.result;
+            Box::pin(async move { result })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCommandExecutor {
+        serve_calls: usize,
+        canary_calls: usize,
+        health_calls: usize,
+        fail_canary: bool,
+    }
+
+    impl CommandExecutor for FakeCommandExecutor {
+        async fn serve(&mut self, _role: WorkerRole) -> Result<()> {
+            self.serve_calls += 1;
+            Ok(())
+        }
+
+        async fn core_crm_canary(&mut self) -> Result<()> {
+            self.canary_calls += 1;
+            if self.fail_canary {
+                bail!("synthetic canary failure");
+            }
+            Ok(())
+        }
+
+        async fn health(&mut self) -> Result<()> {
+            self.health_calls += 1;
+            Ok(())
         }
     }
 
@@ -350,11 +422,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exposes_explicit_core_crm_canary_command() {
-        let parsed = Cli::try_parse_from(["buzz-core-worker", "core-crm-canary"]);
+    #[tokio::test]
+    async fn core_crm_canary_command_dispatches_once_without_other_roles() {
+        let parsed = Cli::try_parse_from(["buzz-core-worker", "core-crm-canary"])
+            .expect("the bounded Core CRM canary must parse");
+        let mut executor = FakeCommandExecutor::default();
 
-        assert!(parsed.is_ok(), "the bounded Core CRM canary must parse");
+        dispatch_command(parsed.command, &mut executor)
+            .await
+            .expect("canary dispatch");
+
+        assert_eq!(executor.canary_calls, 1);
+        assert_eq!(executor.serve_calls, 0);
+        assert_eq!(executor.health_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn core_crm_canary_command_propagates_failure_without_retry() {
+        let parsed = Cli::try_parse_from(["buzz-core-worker", "core-crm-canary"])
+            .expect("the bounded Core CRM canary must parse");
+        let mut executor = FakeCommandExecutor {
+            fail_canary: true,
+            ..FakeCommandExecutor::default()
+        };
+
+        dispatch_command(parsed.command, &mut executor)
+            .await
+            .expect_err("canary failure must propagate");
+
+        assert_eq!(executor.canary_calls, 1);
+        assert_eq!(executor.serve_calls, 0);
+        assert_eq!(executor.health_calls, 0);
     }
 
     #[tokio::test]
@@ -376,14 +474,31 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let runner = FakeConnectorRunner {
             calls: Arc::clone(&calls),
+            result: Ok(ConnectorIterationOutcome::Idle),
         };
         let mut registry: Option<Box<dyn ConnectorIterationRunner>> = Some(Box::new(runner));
 
-        let outcome = run_connector_role_once(&mut registry)
+        let outcome = run_core_crm_canary_once(&mut registry)
             .await
             .expect("injected iteration succeeds");
 
         assert_eq!(outcome, ConnectorIterationOutcome::Idle);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn connector_canary_does_not_retry_an_iteration_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = FakeConnectorRunner {
+            calls: Arc::clone(&calls),
+            result: Err(ConnectorBoundaryError::new()),
+        };
+        let mut registry: Option<Box<dyn ConnectorIterationRunner>> = Some(Box::new(runner));
+
+        run_core_crm_canary_once(&mut registry)
+            .await
+            .expect_err("iteration failure must propagate");
+
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
