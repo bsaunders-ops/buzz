@@ -151,13 +151,16 @@ resource dailyPolicy 'Microsoft.RecoveryServices/vaults/backupPolicies@2024-04-0
   parent: recoveryVault
   properties: {
     backupManagementType: 'AzureIaasVM'
+    policyType: 'V2'
     instantRpRetentionRangeInDays: 5
     schedulePolicy: {
-      schedulePolicyType: 'SimpleSchedulePolicy'
+      schedulePolicyType: 'SimpleSchedulePolicyV2'
       scheduleRunFrequency: 'Daily'
-      scheduleRunTimes: [
-        '2026-08-03T02:00:00Z'
-      ]
+      dailySchedule: {
+        scheduleRunTimes: [
+          '2026-08-03T02:00:00Z'
+        ]
+      }
     }
     retentionPolicy: {
       retentionPolicyType: 'LongTermRetentionPolicy'

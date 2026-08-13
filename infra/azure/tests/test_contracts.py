@@ -184,6 +184,28 @@ class BicepContracts(unittest.TestCase):
             )
         self.assertNotRegex(main + monitoring, r"(?i)auto.?shutdown")
 
+    def test_trusted_launch_backup_uses_enhanced_v2_policy(self) -> None:
+        monitoring = read("infra/azure/modules/monitoring-backup.bicep")
+        policy = monitoring[
+            monitoring.index("resource dailyPolicy") : monitoring.index(
+                "resource protectedVm"
+            )
+        ]
+        self.assertIn("policyType: 'V2'", policy)
+        self.assertIn("schedulePolicyType: 'SimpleSchedulePolicyV2'", policy)
+        self.assertRegex(policy, r"scheduleRunFrequency:\s*'Daily'")
+        self.assertRegex(
+            policy,
+            r"(?s)schedulePolicy:\s*\{.*?dailySchedule:\s*\{\s*scheduleRunTimes:\s*\[\s*'2026-08-03T02:00:00Z'",
+        )
+        self.assertNotRegex(policy, r"schedulePolicyType:\s*'SimpleSchedulePolicy'")
+        self.assertRegex(policy, r"instantRpRetentionRangeInDays:\s*5\b")
+        self.assertRegex(
+            policy,
+            r"(?s)retentionPolicy:.*?dailySchedule:.*?retentionTimes:\s*\[\s*'2026-08-03T02:00:00Z'.*?count:\s*30\b.*?durationType:\s*'Days'",
+        )
+        self.assertRegex(policy, r"timeZone:\s*'UTC'")
+
     def test_front_door_emits_content_free_health_diagnostics_and_alerts(self) -> None:
         monitoring = read("infra/azure/modules/monitoring-backup.bicep")
         main = read("infra/azure/main.bicep")
