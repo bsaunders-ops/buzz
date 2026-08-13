@@ -16,6 +16,9 @@ import type {
 } from "@/features/home/lib/inbox";
 import { getProjectInboxReference } from "@/features/home/lib/projectInbox";
 import { ProjectInboxDetail } from "@/features/home/ui/ProjectInboxDetail";
+import { InsightCard } from "@/features/home/ui/InsightCard";
+import { resolveEvidenceSource } from "@/features/home/lib/evidenceResolution";
+import type { InsightEvidence } from "@/features/home/lib/insight";
 import { ChannelMembersBar } from "@/features/channels/ui/ChannelMembersBar";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { formatInboxTypeLabel } from "@/features/home/lib/inbox";
@@ -78,6 +81,7 @@ type InboxDetailPaneProps = {
   channel: Channel | null;
   contextChannelName?: string | null;
   currentPubkey?: string;
+  relaySelfPubkey?: string | null;
   /**
    * The event anchor: the specific event ID the user selected or navigated to
    * via `?item=`. Used for message highlighting and as the stable identity for
@@ -117,6 +121,73 @@ type InboxDetailPaneProps = {
 
 /** Routes Inbox selections to their canonical message or Buzz Git detail. */
 export function InboxDetailPane(props: InboxDetailPaneProps) {
+  const [resolvingEvidenceKey, setResolvingEvidenceKey] = React.useState<
+    string | null
+  >(null);
+  const resolvingEvidenceRef = React.useRef(false);
+  const insight = props.item?.insight ?? null;
+  const insightChannelId = props.item?.item.channelId ?? null;
+  const canResolveEvidence = Boolean(
+    insight &&
+      insightChannelId &&
+      props.channel?.visibility === "private" &&
+      props.currentPubkey &&
+      props.relaySelfPubkey,
+  );
+  const handleOpenSource = React.useCallback(
+    async (evidence: InsightEvidence) => {
+      if (
+        !insight ||
+        !evidence.citation ||
+        !insightChannelId ||
+        props.channel?.visibility !== "private" ||
+        !props.currentPubkey ||
+        !props.relaySelfPubkey ||
+        resolvingEvidenceRef.current
+      ) {
+        return;
+      }
+
+      resolvingEvidenceRef.current = true;
+      setResolvingEvidenceKey(evidence.stableKey);
+      try {
+        await resolveEvidenceSource({
+          insightId: insight.insightId,
+          channelId: insightChannelId,
+          ownerPubkey: props.currentPubkey,
+          relaySelfPubkey: props.relaySelfPubkey,
+          resolverId: evidence.citation.resolverKey,
+          sourceHash: evidence.sourceHash,
+        });
+      } finally {
+        resolvingEvidenceRef.current = false;
+        setResolvingEvidenceKey(null);
+      }
+    },
+    [
+      insight,
+      insightChannelId,
+      props.channel?.visibility,
+      props.currentPubkey,
+      props.relaySelfPubkey,
+    ],
+  );
+
+  if (props.item?.item.kind === 44300) {
+    return (
+      <section
+        className="flex min-h-0 min-w-0 flex-col overflow-y-auto bg-background/60 pt-13"
+        data-testid="home-inbox-insight-detail"
+      >
+        <InsightCard
+          onOpenSource={canResolveEvidence ? handleOpenSource : undefined}
+          payload={insight}
+          resolvingEvidenceKey={resolvingEvidenceKey}
+        />
+      </section>
+    );
+  }
+
   if (props.item && getProjectInboxReference(props.item.item)) {
     return (
       <ProjectInboxDetail

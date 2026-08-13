@@ -17,7 +17,7 @@ resource virtualMachine 'Microsoft.Compute/virtualMachines@2024-07-01' = {
   }
   properties: {
     hardwareProfile: {
-      vmSize: 'Standard_D4as_v5'
+      vmSize: 'Standard_D4as_v7'
     }
     securityProfile: {
       securityType: 'TrustedLaunch'
@@ -30,7 +30,7 @@ resource virtualMachine 'Microsoft.Compute/virtualMachines@2024-07-01' = {
       imageReference: {
         publisher: 'Canonical'
         offer: 'ubuntu-24_04-lts'
-        sku: '24_04-lts-gen2'
+        sku: 'server'
         version: ubuntuImageVersion
       }
       osDisk: {
@@ -105,7 +105,6 @@ resource entraLogin 'Microsoft.Compute/virtualMachines/extensions@2024-07-01' = 
     type: 'AADSSHLoginForLinux'
     typeHandlerVersion: '1.0'
     autoUpgradeMinorVersion: true
-    enableAutomaticUpgrade: true
   }
 }
 

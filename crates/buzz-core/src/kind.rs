@@ -572,6 +572,10 @@ pub const KIND_CORE_CALL_CONTROL: u32 = 24820;
 pub const KIND_CORE_TRANSCRIPT_SEGMENT: u32 = 24821;
 /// Core encrypted ephemeral copilot suggestion.
 pub const KIND_CORE_COPILOT_SUGGESTION: u32 = 24822;
+/// Core relay-readable ephemeral evidence-resolution request.
+pub const KIND_CORE_EVIDENCE_RESOLVE_REQUEST: u32 = 24823;
+/// Core relay-authored encrypted ephemeral evidence-resolution result.
+pub const KIND_CORE_EVIDENCE_RESOLVE_RESULT: u32 = 24824;
 
 // Forum / social (45000–45999)
 // V1 used addressable range (30001–30003) — wrong.

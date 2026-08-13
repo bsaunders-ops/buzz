@@ -1,0 +1,27 @@
+[package]
+name = "buzz-assistant-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fail-closed private assistant retrieval and insight broker for Core Buzz"
+
+[dependencies]
+buzz-connector-core = { workspace = true }
+buzz-core = { workspace = true }
+buzz-sdk = { workspace = true }
+hex = { workspace = true }
+nostr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+buzz-db = { workspace = true }
+buzz-core-worker = { path = "../buzz-core-worker" }
+chrono = { workspace = true }
+tokio = { workspace = true }

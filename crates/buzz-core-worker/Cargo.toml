@@ -13,8 +13,21 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+aes-gcm = "0.10"
+base64 = { workspace = true }
+buzz-connector-core = { workspace = true }
+buzz-core = { workspace = true }
+buzz-db = { workspace = true }
+chrono = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

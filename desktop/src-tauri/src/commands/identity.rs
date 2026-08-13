@@ -700,6 +700,47 @@ pub async fn nip44_decrypt_from_self(
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
+fn decrypt_evidence_resolution_event_inner(
+    keys: &Keys,
+    event_json: String,
+    expected_relay_pubkey: String,
+) -> Result<String, String> {
+    let event = Event::from_json(event_json).map_err(|error| format!("invalid event: {error}"))?;
+    let expected_relay = PublicKey::from_hex(expected_relay_pubkey.trim())
+        .map_err(|error| format!("invalid relay pubkey: {error}"))?;
+
+    if event.kind != Kind::Custom(24824) {
+        return Err("unexpected evidence resolution event kind".into());
+    }
+    if event.pubkey != expected_relay {
+        return Err("evidence resolution sender is not the expected relay".into());
+    }
+    if !event.verify_id() {
+        return Err("evidence resolution event has invalid ID".into());
+    }
+    if !event.verify_signature() {
+        return Err("evidence resolution event has invalid signature".into());
+    }
+
+    nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content)
+        .map_err(|error| format!("evidence resolution decrypt failed: {error}"))
+}
+
+/// Verify and decrypt a relay-signed Core evidence resolution event.
+#[tauri::command]
+pub async fn decrypt_evidence_resolution_event(
+    event_json: String,
+    expected_relay_pubkey: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let keys = state.signing_keys()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        decrypt_evidence_resolution_event_inner(&keys, event_json, expected_relay_pubkey)
+    })
+    .await
+    .map_err(|error| format!("spawn_blocking failed: {error}"))?
+}
+
 #[cfg(test)]
 mod nostr_identity_binding_tests {
     use super::build_nostr_identity_binding_event;
@@ -782,6 +823,80 @@ mod nostr_identity_binding_tests {
         .unwrap_err();
 
         assert_eq!(error, "expires_at is expired");
+    }
+}
+
+#[cfg(test)]
+mod evidence_resolution_decryption_tests {
+    use super::decrypt_evidence_resolution_event_inner;
+    use nostr::{nips::nip44, EventBuilder, JsonUtil, Keys, Kind, Tag};
+
+    fn resolution_event(owner: &Keys, relay: &Keys) -> nostr::Event {
+        let plaintext = r#"{"schema_version":1,"status":"denied"}"#;
+        let ciphertext = nip44::encrypt(
+            relay.secret_key(),
+            &owner.public_key(),
+            plaintext,
+            nip44::Version::V2,
+        )
+        .unwrap();
+        EventBuilder::new(Kind::Custom(24824), ciphertext)
+            .tags([
+                Tag::parse(["h", "550e8400-e29b-41d4-a716-446655440099"]).unwrap(),
+                Tag::parse(["p", owner.public_key().to_hex().as_str()]).unwrap(),
+            ])
+            .sign_with_keys(relay)
+            .unwrap()
+    }
+
+    #[test]
+    fn verifies_relay_event_before_decrypting_from_its_sender() {
+        let owner = Keys::generate();
+        let relay = Keys::generate();
+        let event = resolution_event(&owner, &relay);
+
+        let plaintext = decrypt_evidence_resolution_event_inner(
+            &owner,
+            event.as_json(),
+            relay.public_key().to_hex(),
+        )
+        .unwrap();
+
+        assert_eq!(plaintext, r#"{"schema_version":1,"status":"denied"}"#);
+    }
+
+    #[test]
+    fn rejects_wrong_relay_kind_and_tampered_event() {
+        let owner = Keys::generate();
+        let relay = Keys::generate();
+        let other = Keys::generate();
+        let event = resolution_event(&owner, &relay);
+
+        assert!(decrypt_evidence_resolution_event_inner(
+            &owner,
+            event.as_json(),
+            other.public_key().to_hex(),
+        )
+        .is_err());
+
+        let wrong_kind = EventBuilder::new(Kind::TextNote, event.content.clone())
+            .sign_with_keys(&relay)
+            .unwrap();
+        assert!(decrypt_evidence_resolution_event_inner(
+            &owner,
+            wrong_kind.as_json(),
+            relay.public_key().to_hex(),
+        )
+        .is_err());
+
+        let mut tampered: serde_json::Value = serde_json::from_str(&event.as_json()).unwrap();
+        tampered["content"] = serde_json::Value::String("tampered".into());
+        assert!(decrypt_evidence_resolution_event_inner(
+            &owner,
+            tampered.to_string(),
+            relay.public_key().to_hex(),
+        )
+        .is_err());
     }
 }
 

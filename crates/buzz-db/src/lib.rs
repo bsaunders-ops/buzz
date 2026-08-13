@@ -641,6 +641,17 @@ pub struct TokenSummary {
 }
 
 impl Db {
+    /// Resolve an opaque Core evidence locator against the authoritative
+    /// writer so revocations, tombstones, and chunk changes are observed
+    /// before any provider metadata is released.
+    pub async fn resolve_source_evidence(
+        &self,
+        community_id: CommunityId,
+        request: core_storage::EvidenceResolveRequest<'_>,
+    ) -> Result<core_storage::EvidenceResolution> {
+        core_storage::resolve_source_evidence(&self.pool, community_id, request).await
+    }
+
     /// Creates a new `Db` by connecting a Postgres pool with the given config.
     ///
     /// When `config.read_database_url` is set, a second pool with the same

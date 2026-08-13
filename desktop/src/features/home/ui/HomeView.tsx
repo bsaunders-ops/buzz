@@ -748,6 +748,7 @@ export function HomeView({
               channel={selectedChannel}
               contextChannelName={selectedChannel?.name ?? null}
               currentPubkey={currentPubkey}
+              relaySelfPubkey={relaySelfPubkey}
               disabledReplyReason={disabledReplyReason}
               isDeletingMessage={isDeletingMessage}
               isSendingReply={isSendingReply}

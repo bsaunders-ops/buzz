@@ -2,13 +2,24 @@
 
 use std::{cmp::Ordering, collections::BTreeSet};
 
+use buzz_core::CommunityId;
+use buzz_db::core_storage::{
+    recheck_source_chunk_fts, search_source_chunks_fts, AuthorizedSourceFtsExcerptRecord,
+    ServerResolvedSourceAudience, SourceFtsCandidateRecheckRequest, SourceFtsCitationRecord,
+    SourceFtsSearchRequest,
+};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    types::{provider_link_is_allowed, ConnectorProvider, RemoteVersion, SourceKind},
+    types::{
+        provider_link_is_allowed, ConnectorProvider, ExternalItemId, RemoteVersion, SourceKind,
+    },
     ConnectorError, Result,
 };
 
@@ -142,6 +153,100 @@ impl RetrievalQuery {
     pub const fn limit(&self) -> usize {
         self.limit
     }
+}
+
+/// Bounded embedding-independent full-text retrieval request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FullTextRetrievalQuery {
+    tenant_id: Uuid,
+    audience: RetrievalAudience,
+    query: String,
+    limit: usize,
+}
+
+impl std::fmt::Debug for FullTextRetrievalQuery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FullTextRetrievalQuery")
+            .field("query_redacted", &true)
+            .field("query_characters", &self.query.chars().count())
+            .field("channel_count", &self.audience.channel_ids.len())
+            .field("limit", &self.limit)
+            .finish()
+    }
+}
+
+impl FullTextRetrievalQuery {
+    /// Validate a tenant-scoped FTS request without an embedding version.
+    pub fn new(
+        tenant_id: Uuid,
+        audience: RetrievalAudience,
+        query: impl Into<String>,
+        limit: usize,
+    ) -> Result<Self> {
+        let query = query.into();
+        if query.trim().is_empty()
+            || query.chars().count() > MAX_QUERY_CHARS
+            || query.contains('\0')
+        {
+            return Err(ConnectorError::InvalidData("retrieval query is invalid"));
+        }
+        if limit == 0 || limit > MAX_RESULTS {
+            return Err(ConnectorError::BoundExceeded("retrieval result count"));
+        }
+        Ok(Self {
+            tenant_id,
+            audience,
+            query,
+            limit,
+        })
+    }
+
+    /// Tenant boundary.
+    #[must_use]
+    pub const fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+
+    /// Authenticated request audience.
+    #[must_use]
+    pub const fn audience(&self) -> &RetrievalAudience {
+        &self.audience
+    }
+
+    /// Full-text query.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Maximum authorized excerpts.
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+/// Compute the domain-separated stable tenant/account/scope/provider-item
+/// authority identity.
+pub fn source_item_identity_hash(
+    tenant_id: Uuid,
+    account_id: Uuid,
+    scope_id: Uuid,
+    external_item_id: &str,
+) -> Result<[u8; 32]> {
+    let external_item = ExternalItemId::new(external_item_id)?;
+    let external_item_id = external_item.as_str().as_bytes();
+    let external_item_bytes = u64::try_from(external_item_id.len())
+        .map_err(|_| ConnectorError::BoundExceeded("external item id bytes"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"core-buzz:source-item-identity:v1\0");
+    hasher.update(tenant_id.as_bytes());
+    hasher.update(account_id.as_bytes());
+    hasher.update(scope_id.as_bytes());
+    hasher.update(external_item_bytes.to_be_bytes());
+    hasher.update(external_item_id);
+    Ok(hasher.finalize().into())
 }
 
 /// A bounded SQL-preauthorized hybrid candidate without source content.
@@ -311,6 +416,7 @@ impl Citation {
 /// A post-rank reauthorized, turn-minimized source excerpt.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthorizedExcerpt {
+    source_item_id: Option<Uuid>,
     citation: Citation,
     text: String,
     start_char: usize,
@@ -346,6 +452,7 @@ impl AuthorizedExcerpt {
             return Err(ConnectorError::InvalidData("source excerpt is invalid"));
         }
         Ok(Self {
+            source_item_id: None,
             citation,
             text,
             start_char,
@@ -359,10 +466,60 @@ impl AuthorizedExcerpt {
         &self.citation
     }
 
+    /// Trusted tenant-local source item locator.
+    ///
+    /// This value is present only for database-authorized retrievals and is
+    /// deliberately excluded from model excerpt serialization.
+    #[must_use]
+    pub const fn source_item_id(&self) -> Option<Uuid> {
+        self.source_item_id
+    }
+
+    /// Construct an excerpt already bound to its trusted tenant-local source item.
+    ///
+    /// Callers must obtain `source_item_id` from the same current authorized
+    /// database read that produced the citation and excerpt text. The value is
+    /// deliberately omitted from model serialization and is useful only as an
+    /// opaque coordinate for a later authorization recheck.
+    pub fn new_with_source_item_id(
+        source_item_id: Uuid,
+        citation: Citation,
+        text: impl Into<String>,
+        start_char: usize,
+        end_char: usize,
+    ) -> Result<Self> {
+        let mut excerpt = Self::new(citation, text, start_char, end_char)?;
+        excerpt.source_item_id = Some(source_item_id);
+        Ok(excerpt)
+    }
+
     /// Selected source text only.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Check that a newly authorized read still names the same source version,
+    /// metadata, offsets, and bytes. The authorization observation timestamp
+    /// is deliberately excluded because every database recheck records a new
+    /// `as_of` value even when authority and content are unchanged.
+    #[must_use]
+    pub fn matches_current_authorized_content(&self, current: &Self) -> bool {
+        self.text == current.text
+            && self.source_item_id == current.source_item_id
+            && self.start_char == current.start_char
+            && self.end_char == current.end_char
+            && current.citation.as_of >= self.citation.as_of
+            && self.citation.title == current.citation.title
+            && self.citation.provider == current.citation.provider
+            && self.citation.source_kind == current.citation.source_kind
+            && self.citation.modified_at == current.citation.modified_at
+            && self.citation.resolvable_link == current.citation.resolvable_link
+            && self.citation.item_hash == current.citation.item_hash
+            && self.citation.remote_version == current.citation.remote_version
+            && self.citation.version_hash == current.citation.version_hash
+            && self.citation.chunk_hash == current.citation.chunk_hash
+            && self.citation.freshness == current.citation.freshness
     }
 }
 
@@ -447,6 +604,192 @@ pub fn retrieve_authorized<S: AuthorizedRetrievalStore>(
                 return Err(ConnectorError::AuthorizationChanged);
             }
             excerpts.push(excerpt);
+        }
+    }
+    Ok(excerpts)
+}
+
+/// Fail-closed error from the PostgreSQL FTS retrieval adapter.
+#[derive(Debug, Error)]
+pub enum PostgresFtsRetrievalError {
+    /// Storage rejected or could not complete the authorized read.
+    #[error(transparent)]
+    Database(#[from] buzz_db::DbError),
+    /// Stored metadata violated the connector retrieval contract.
+    #[error(transparent)]
+    Contract(#[from] ConnectorError),
+}
+
+fn provider_from_db(value: &str) -> Result<ConnectorProvider> {
+    match value {
+        "microsoft_graph" => Ok(ConnectorProvider::MicrosoftGraph),
+        "google_drive" => Ok(ConnectorProvider::GoogleDrive),
+        "core_crm" => Ok(ConnectorProvider::CoreCrm),
+        _ => Err(ConnectorError::InvalidData(
+            "stored connector provider is invalid",
+        )),
+    }
+}
+
+fn source_kind_from_db(value: &str) -> Result<SourceKind> {
+    match value {
+        "email" => Ok(SourceKind::Email),
+        "calendar_event" => Ok(SourceKind::CalendarEvent),
+        "document" => Ok(SourceKind::Document),
+        "spreadsheet" => Ok(SourceKind::Spreadsheet),
+        "presentation" => Ok(SourceKind::Presentation),
+        "crm_record" => Ok(SourceKind::CrmRecord),
+        "crm_transcript" => Ok(SourceKind::CrmTranscript),
+        _ => Err(ConnectorError::InvalidData("stored source kind is invalid")),
+    }
+}
+
+fn candidate_hashes(
+    tenant_id: Uuid,
+    candidate: &SourceFtsCitationRecord,
+) -> Result<([u8; 32], RemoteVersion, [u8; 32])> {
+    let item_hash = source_item_identity_hash(
+        tenant_id,
+        candidate.account_id,
+        candidate.scope_id,
+        &candidate.external_item_id,
+    )?;
+    let remote_version = RemoteVersion::new(
+        candidate.remote_version.clone(),
+        candidate.remote_etag.clone(),
+    )?;
+    let chunk_hash = candidate
+        .chunk_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| ConnectorError::InvalidData("stored chunk hash is invalid"))?;
+    Ok((item_hash, remote_version, chunk_hash))
+}
+
+fn excerpt_from_recheck(
+    tenant_id: Uuid,
+    candidate: &SourceFtsCitationRecord,
+    candidate_item_hash: [u8; 32],
+    candidate_version: &RemoteVersion,
+    candidate_chunk_hash: [u8; 32],
+    rechecked: AuthorizedSourceFtsExcerptRecord,
+) -> Result<AuthorizedExcerpt> {
+    let rechecked_item_hash = source_item_identity_hash(
+        tenant_id,
+        rechecked.account_id,
+        rechecked.scope_id,
+        &rechecked.external_item_id,
+    )?;
+    let rechecked_version = RemoteVersion::new(
+        rechecked.remote_version.clone(),
+        rechecked.remote_etag.clone(),
+    )?;
+    let rechecked_chunk_hash: [u8; 32] = rechecked
+        .chunk_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| ConnectorError::InvalidData("stored chunk hash is invalid"))?;
+    if rechecked.item_id != candidate.item_id
+        || rechecked.chunk_id != candidate.chunk_id
+        || rechecked_item_hash != candidate_item_hash
+        || rechecked_version != *candidate_version
+        || rechecked_chunk_hash != candidate_chunk_hash
+        || rechecked.reconciliation_fresh != candidate.reconciliation_fresh
+        || rechecked.acl_revision.len() != 32
+    {
+        return Err(ConnectorError::AuthorizationChanged);
+    }
+    let citation = Citation::new(
+        rechecked.title,
+        provider_from_db(&rechecked.provider)?,
+        source_kind_from_db(&rechecked.source_type)?,
+        rechecked.modified_at,
+        rechecked.authorization_checked_at,
+        rechecked.resolvable_link,
+        rechecked_item_hash,
+        rechecked_version,
+        rechecked_chunk_hash,
+        if rechecked.reconciliation_fresh {
+            CitationFreshness::Fresh
+        } else {
+            CitationFreshness::Stale
+        },
+    )?;
+    let start_char = usize::try_from(rechecked.start_char)
+        .map_err(|_| ConnectorError::InvalidData("stored source offsets are invalid"))?;
+    let end_char = usize::try_from(rechecked.end_char)
+        .map_err(|_| ConnectorError::InvalidData("stored source offsets are invalid"))?;
+    AuthorizedExcerpt::new_with_source_item_id(
+        rechecked.item_id,
+        citation,
+        rechecked.content,
+        start_char,
+        end_char,
+    )
+}
+
+/// Rank authorized PostgreSQL FTS candidates and re-read every candidate before
+/// releasing its already-bounded stored chunk. This path has no embedding or
+/// embedding-version dependency.
+pub async fn retrieve_authorized_fts(
+    pool: &PgPool,
+    community_id: CommunityId,
+    query: &FullTextRetrievalQuery,
+) -> std::result::Result<Vec<AuthorizedExcerpt>, PostgresFtsRetrievalError> {
+    if query.tenant_id() != *community_id.as_uuid() {
+        return Err(ConnectorError::AuthorizationChanged.into());
+    }
+    let audience = ServerResolvedSourceAudience::new(
+        query.audience().caller_pubkey(),
+        query.audience().channel_ids(),
+    );
+    let limit = i64::try_from(query.limit())
+        .map_err(|_| ConnectorError::BoundExceeded("retrieval result count"))?;
+    let candidates = search_source_chunks_fts(
+        pool,
+        community_id,
+        SourceFtsSearchRequest {
+            query: query.query(),
+            audience,
+            limit,
+        },
+    )
+    .await?;
+    if candidates.len() > query.limit() {
+        return Err(ConnectorError::BoundExceeded("retrieval result count").into());
+    }
+
+    let mut excerpts = Vec::with_capacity(candidates.len());
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        let (item_hash, remote_version, chunk_hash) =
+            candidate_hashes(query.tenant_id(), &candidate)?;
+        if !seen.insert((item_hash, chunk_hash)) {
+            continue;
+        }
+        let rechecked = recheck_source_chunk_fts(
+            pool,
+            community_id,
+            SourceFtsCandidateRecheckRequest {
+                item_id: candidate.item_id,
+                chunk_id: candidate.chunk_id,
+                remote_version: remote_version.value(),
+                remote_etag: remote_version.etag(),
+                chunk_hash: &chunk_hash,
+                reconciliation_fresh: candidate.reconciliation_fresh,
+                audience,
+            },
+        )
+        .await?;
+        if let Some(rechecked) = rechecked {
+            excerpts.push(excerpt_from_recheck(
+                query.tenant_id(),
+                &candidate,
+                item_hash,
+                &remote_version,
+                chunk_hash,
+                rechecked,
+            )?);
         }
     }
     Ok(excerpts)

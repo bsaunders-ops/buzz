@@ -146,6 +146,7 @@ pub async fn apply_postgres_change_page(
             next_cursor_integrity_hash: &page.next_cursor().integrity_hash(),
             next_cursor_key_version,
             page_digest: &page.page_digest(),
+            reconciliation_complete: page.reconciliation_complete(),
             upserts: &upserts,
             tombstones: &tombstones,
             now,

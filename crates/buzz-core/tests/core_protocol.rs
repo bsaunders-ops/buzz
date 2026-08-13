@@ -2,9 +2,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use buzz_core::core_protocol::{
     learning_bundle_coordinate, validate_core_envelope, validate_core_plaintext_content,
     ActionDecisionPayload, ActionProposalPayload, ActionReceiptPayload, CallControlPayload,
-    CanonicalUuidV4, CopilotSuggestionPayload, CoreDirection, InsightDispositionPayload,
-    InsightPayload, LearningBundleHeadPayload, LearningDomain, LearningLayer,
-    LearningRecordPayload, PositiveWriteOperation, Sha256Hex, TranscriptSegmentPayload, Version1,
+    CanonicalUuidV4, CopilotSuggestionPayload, CoreDirection, EvidenceResolveRequestPayload,
+    EvidenceResolveResultPayload, EvidenceResolveStatus, InsightDispositionPayload, InsightPayload,
+    LearningBundleHeadPayload, LearningDomain, LearningLayer, LearningRecordPayload,
+    PositiveWriteOperation, Sha256Hex, TranscriptSegmentPayload, Version1,
 };
 use buzz_core::engram::conversation_key;
 use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -411,6 +412,153 @@ fn core_envelope_requires_exact_canonical_private_route() {
     assert!(validate_core_envelope(&core_event(&author, 44_300, self_p, "{}")).is_err());
 }
 
+fn evidence_resolve_request_json(created_at: i64, expires_at: i64) -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "insight_id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+        "resolver_id": "evidence:123e4567-e89b-42d3-a456-426614174000",
+        "expected_chunk_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "nonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "created_at": created_at,
+        "expires_at": expires_at,
+    })
+    .to_string()
+}
+
+#[test]
+fn evidence_resolution_kinds_freeze_direction_encryption_and_request_lifetime() {
+    let owner = Keys::generate();
+    let relay = Keys::generate();
+    let channel = "550e8400-e29b-41d4-a716-446655440000";
+    let route = vec![
+        Tag::parse(["h", channel]).expect("h"),
+        Tag::parse(["p", relay.public_key().to_hex().as_str()]).expect("p"),
+    ];
+    let request = core_event(
+        &owner,
+        24_823,
+        route,
+        &evidence_resolve_request_json(1_700_000_000, 1_700_000_060),
+    );
+    let envelope = validate_core_envelope(&request).expect("request envelope");
+    assert_eq!(envelope.direction, CoreDirection::OwnerToRelay);
+    assert!(validate_core_plaintext_content(&request, 1_700_000_001).is_ok());
+    assert!(validate_core_plaintext_content(
+        &core_event(
+            &owner,
+            24_823,
+            vec![
+                Tag::parse(["h", channel]).expect("h"),
+                Tag::parse(["p", relay.public_key().to_hex().as_str()]).expect("p"),
+            ],
+            &evidence_resolve_request_json(1_700_000_000, 1_700_000_061),
+        ),
+        1_700_000_001,
+    )
+    .is_err());
+
+    let ciphertext = synthetic_nip44_v2(256);
+    let response = core_event(
+        &relay,
+        24_824,
+        vec![
+            Tag::parse(["h", channel]).expect("h"),
+            Tag::parse(["p", owner.public_key().to_hex().as_str()]).expect("p"),
+        ],
+        &ciphertext,
+    );
+    assert_eq!(
+        validate_core_envelope(&response)
+            .expect("response envelope")
+            .direction,
+        CoreDirection::RelayToOwner
+    );
+    assert!(validate_core_plaintext_content(&response, 1_700_000_001).is_ok());
+    let plaintext_response = core_event(
+        &relay,
+        24_824,
+        vec![
+            Tag::parse(["h", channel]).expect("h"),
+            Tag::parse(["p", owner.public_key().to_hex().as_str()]).expect("p"),
+        ],
+        r#"{"schema_version":1}"#,
+    );
+    assert!(validate_core_envelope(&plaintext_response).is_err());
+}
+
+#[test]
+fn evidence_resolve_request_shape_is_strict_and_fail_closed() {
+    let valid: EvidenceResolveRequestPayload =
+        serde_json::from_str(&evidence_resolve_request_json(1_700_000_000, 1_700_000_060))
+            .expect("request shape");
+    assert!(valid.validate_at(1_700_000_001).is_ok());
+    assert_eq!(
+        valid.resolver_id.source_item_id().to_string(),
+        "123e4567-e89b-42d3-a456-426614174000"
+    );
+
+    for invalid in [
+        evidence_resolve_request_json(1_700_000_000, 1_700_000_000),
+        evidence_resolve_request_json(1_700_000_002, 1_700_000_060),
+        evidence_resolve_request_json(1_700_000_000, 1_700_000_061),
+        evidence_resolve_request_json(1_700_000_000, 1_700_000_001)
+            .replace("\"schema_version\":1", "\"schema_version\":2"),
+        evidence_resolve_request_json(1_700_000_000, 1_700_000_001)
+            .replace("evidence:123e4567", "https://123e4567"),
+        evidence_resolve_request_json(1_700_000_000, 1_700_000_001)
+            .replace(&"a".repeat(64), &"A".repeat(64)),
+        evidence_resolve_request_json(1_700_000_000, 1_700_000_001)
+            .replace(&"b".repeat(64), &"b".repeat(63)),
+        evidence_resolve_request_json(1_700_000_000, 1_700_000_001)
+            .replace('}', ",\"extra\":true}"),
+    ] {
+        let parsed = serde_json::from_str::<EvidenceResolveRequestPayload>(&invalid);
+        if let Ok(payload) = parsed {
+            assert!(
+                payload.validate_at(1_700_000_001).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+}
+
+#[test]
+fn evidence_resolve_result_has_exact_status_dependent_shape() {
+    let resolved = r#"{"schema_version":1,"request_id":"550e8400-e29b-41d4-a716-446655440000","expires_at":1700000060,"status":"resolved","title":"Client follow-up","modified_at":1700000000,"source_type":"email","url":"https://outlook.office.com/mail/deeplink/read/opaque"}"#;
+    let payload: EvidenceResolveResultPayload = serde_json::from_str(resolved).expect("resolved");
+    assert_eq!(payload.status(), EvidenceResolveStatus::Resolved);
+    assert!(payload.validate_at(1_700_000_001).is_ok());
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("Client follow-up"));
+    assert!(!debug.contains("outlook.office.com"));
+
+    for status in ["denied", "stale", "unavailable"] {
+        let json = format!(
+            r#"{{"schema_version":1,"request_id":"550e8400-e29b-41d4-a716-446655440000","expires_at":1700000060,"status":"{status}"}}"#
+        );
+        let parsed: EvidenceResolveResultPayload = serde_json::from_str(&json).expect("status");
+        assert!(parsed.validate_at(1_700_000_001).is_ok());
+    }
+
+    for invalid in [
+        resolved.replace("\"schema_version\":1", "\"schema_version\":2"),
+        resolved.replace("https://", "http://"),
+        resolved.replace("outlook.office.com", "user@outlook.office.com"),
+        resolved.replace("outlook.office.com", "outlook.office.com:444"),
+        resolved.replace("outlook.office.com", "outlook.office.com:443"),
+        resolved.replace("/opaque", "/opaque#fragment"),
+        resolved.replace("\"status\":\"resolved\"", "\"status\":\"denied\""),
+        resolved.replace("\"url\":", "\"extra\":true,\"url\":"),
+    ] {
+        let parsed = serde_json::from_str::<EvidenceResolveResultPayload>(&invalid);
+        assert!(
+            parsed.is_err() || parsed.is_ok_and(|value| value.validate_at(1_700_000_001).is_err()),
+            "accepted {invalid}"
+        );
+    }
+}
+
 #[test]
 fn bundle_head_requires_one_lowercase_hash_coordinate() {
     let author = Keys::generate();
@@ -694,14 +842,14 @@ const INSIGHT_JSON_VERSION_2: &str = r#"{
 
 #[test]
 fn insight_and_proposal_evidence_is_nonempty_bounded_and_unique() {
-    let public_web = r#"{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","resolver_id":"citation:abc"}}"#;
+    let public_web = r#"{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","modified_at":1700000000,"resolver_id":"citation:abc"}}"#;
     assert!(serde_json::from_str::<buzz_core::core_protocol::EvidenceRef>(public_web).is_ok());
 
     let valid = r#"{
         "schema_version":1,"insight_id":"550e8400-e29b-41d4-a716-446655440000",
         "category":"deal_movement","change":"changed","why_it_matters":"matters",
         "priority":"normal",
-        "evidence":[{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","resolver_id":"citation:abc"}}],
+        "evidence":[{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","modified_at":1700000000,"resolver_id":"citation:abc"}}],
         "confidence":80,"freshness":"recent","recommendation":"review","draft":null,
         "dedupe_key":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "created_at":1700000000,"safety_policy_version":"s1","persona_version":"p1",
@@ -709,10 +857,10 @@ fn insight_and_proposal_evidence_is_nonempty_bounded_and_unique() {
 }"#;
     assert!(serde_json::from_str::<InsightPayload>(valid).is_ok());
     assert!(serde_json::from_str::<InsightPayload>(&valid.replace(
-        r#"[{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","resolver_id":"citation:abc"}}]"#,
+        r#"[{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","modified_at":1700000000,"resolver_id":"citation:abc"}}]"#,
         "[]"
     )).is_err());
-    let evidence = r#"{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","resolver_id":"citation:abc"}}"#;
+    let evidence = r#"{"source":"public_web","source_id":"article:abc","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","citation":{"title":"Public filing","modified_at":1700000000,"resolver_id":"citation:abc"}}"#;
     assert!(serde_json::from_str::<InsightPayload>(&valid.replace(
         format!("[{evidence}]").as_str(),
         format!("[{evidence},{evidence}]").as_str()

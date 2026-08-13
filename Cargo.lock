@@ -900,6 +900,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-assistant-broker"
+version = "0.1.0"
+dependencies = [
+ "buzz-connector-core",
+ "buzz-core",
+ "buzz-core-worker",
+ "buzz-db",
+ "buzz-sdk",
+ "chrono",
+ "hex",
+ "nostr",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-audit"
 version = "0.1.0"
 dependencies = [
@@ -1005,15 +1026,19 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "chrono",
+ "futures-util",
  "hex",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1041,12 +1066,23 @@ dependencies = [
 name = "buzz-core-worker"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
+ "base64 0.22.1",
+ "buzz-connector-core",
+ "buzz-core",
+ "buzz-db",
+ "chrono",
  "clap",
+ "getrandom 0.4.3",
+ "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -471,6 +471,8 @@ pub struct NewSourceChangePage<'a> {
     pub next_cursor_key_version: i32,
     /// Deterministic digest of the complete page and remote checkpoint.
     pub page_digest: &'a [u8],
+    /// Whether this page completed a full known-record reconciliation cycle.
+    pub reconciliation_complete: bool,
     /// Complete item replacements.
     pub upserts: &'a [NewIndexedSourceItem],
     /// Item tombstones.
@@ -486,6 +488,7 @@ impl std::fmt::Debug for NewSourceChangePage<'_> {
             .field("provider", &self.provider)
             .field("upsert_count", &self.upserts.len())
             .field("tombstone_count", &self.tombstones.len())
+            .field("reconciliation_complete", &self.reconciliation_complete)
             .field("authority_cursor_and_content_redacted", &true)
             .finish()
     }
@@ -1392,6 +1395,34 @@ pub struct DeltaLeaseClaim {
     pub lease_until: DateTime<Utc>,
 }
 
+/// One globally due read-only Core CRM cursor claimed with its complete server authority.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CoreCrmDeltaScopeClaim {
+    /// Tenant owning the claimed cursor.
+    pub community_id: CommunityId,
+    /// Connector account boundary.
+    pub account_id: Uuid,
+    /// Approved source-scope boundary.
+    pub scope_id: Uuid,
+    /// Configured cursor stream.
+    pub stream: String,
+    /// Private account owner receiving the indexed source ACL.
+    pub owner_pubkey: Vec<u8>,
+    /// Fenced encrypted cursor lease.
+    pub lease: DeltaLeaseClaim,
+}
+
+impl std::fmt::Debug for CoreCrmDeltaScopeClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoreCrmDeltaScopeClaim")
+            .field("stream", &self.stream)
+            .field("generation", &self.lease.generation)
+            .field("authority_cursor_and_owner_redacted", &true)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for DeltaLeaseClaim {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1440,6 +1471,94 @@ pub struct SourceCitationRecord {
     pub start_char: i64,
     /// Exclusive Unicode-scalar offset in normalized source text.
     pub end_char: i64,
+}
+
+/// Server-authenticated source retrieval audience.
+///
+/// Channel identifiers are only a server-resolved request subset. Storage
+/// always rejoins them to current membership and never treats them as grants.
+#[derive(Clone, Copy)]
+pub struct ServerResolvedSourceAudience<'a> {
+    requester_pubkey: &'a [u8],
+    authorized_channel_ids: &'a [Uuid],
+}
+
+impl<'a> ServerResolvedSourceAudience<'a> {
+    /// Bind an authenticated caller to channels resolved by the server.
+    #[must_use]
+    pub const fn new(requester_pubkey: &'a [u8], authorized_channel_ids: &'a [Uuid]) -> Self {
+        Self {
+            requester_pubkey,
+            authorized_channel_ids,
+        }
+    }
+
+    pub(super) const fn requester_pubkey(self) -> &'a [u8] {
+        self.requester_pubkey
+    }
+
+    pub(super) const fn authorized_channel_ids(self) -> &'a [Uuid] {
+        self.authorized_channel_ids
+    }
+}
+
+impl std::fmt::Debug for ServerResolvedSourceAudience<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerResolvedSourceAudience")
+            .field("caller_redacted", &true)
+            .field("channel_count", &self.authorized_channel_ids.len())
+            .finish()
+    }
+}
+
+/// Content-free full-text candidate that does not require an embedding model.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SourceFtsCitationRecord {
+    /// Local source item identifier.
+    pub item_id: Uuid,
+    /// Local source chunk identifier.
+    pub chunk_id: Uuid,
+    /// Connector account identifier used in the stable authority key.
+    pub account_id: Uuid,
+    /// Approved source scope used in the stable authority key.
+    pub scope_id: Uuid,
+    /// Immutable provider-side item identifier.
+    pub external_item_id: String,
+    /// Closed connector provider wire value.
+    pub provider: String,
+    /// Source title.
+    pub title: String,
+    /// Typed source kind wire value.
+    pub source_type: String,
+    /// Provider modification time.
+    pub modified_at: DateTime<Utc>,
+    /// Stable resolvable source link.
+    pub resolvable_link: String,
+    /// Provider version used for authorization rechecks.
+    pub remote_version: String,
+    /// Optional provider ETag used for authorization rechecks.
+    pub remote_etag: Option<String>,
+    /// Chunk hash used for post-ranking checks.
+    pub chunk_hash: Vec<u8>,
+    /// Inclusive Unicode-scalar offset in normalized source text.
+    pub start_char: i64,
+    /// Exclusive Unicode-scalar offset in normalized source text.
+    pub end_char: i64,
+    /// Whether every configured cursor for this account/scope reconciled
+    /// successfully within the server-controlled freshness objective.
+    pub reconciliation_fresh: bool,
+}
+
+impl std::fmt::Debug for SourceFtsCitationRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceFtsCitationRecord")
+            .field("provider", &self.provider)
+            .field("source_type", &self.source_type)
+            .field("metadata_and_identifiers_redacted", &true)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for SourceCitationRecord {
@@ -1525,6 +1644,151 @@ pub struct AuthorizedSourceExcerptRecord {
     pub acl_revision: Vec<u8>,
     /// Database timestamp of the authorization recheck.
     pub authorization_checked_at: DateTime<Utc>,
+}
+
+/// Source content returned by the embedding-independent FTS recheck only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthorizedSourceFtsExcerptRecord {
+    /// Local source item identifier.
+    pub item_id: Uuid,
+    /// Local source chunk identifier.
+    pub chunk_id: Uuid,
+    /// Connector account identifier.
+    pub account_id: Uuid,
+    /// Approved source scope identifier.
+    pub scope_id: Uuid,
+    /// Immutable provider item identifier.
+    pub external_item_id: String,
+    /// Closed connector provider wire value.
+    pub provider: String,
+    /// Citation title.
+    pub title: String,
+    /// Typed source kind wire value.
+    pub source_type: String,
+    /// Provider modification time.
+    pub modified_at: DateTime<Utc>,
+    /// Stable provider source link.
+    pub resolvable_link: String,
+    /// Exact provider version rechecked after ranking.
+    pub remote_version: String,
+    /// Optional provider ETag rechecked after ranking.
+    pub remote_etag: Option<String>,
+    /// Exact chunk hash rechecked after ranking.
+    pub chunk_hash: Vec<u8>,
+    /// Inclusive Unicode-scalar offset in normalized source text.
+    pub start_char: i64,
+    /// Exclusive Unicode-scalar offset in normalized source text.
+    pub end_char: i64,
+    /// Authorized bounded source chunk content.
+    pub content: String,
+    /// Hash of the complete current positive ACL set.
+    pub acl_revision: Vec<u8>,
+    /// Database timestamp of the authorization recheck.
+    pub authorization_checked_at: DateTime<Utc>,
+    /// Whether every configured cursor still satisfies the server-controlled
+    /// freshness objective at the authorization recheck.
+    pub reconciliation_fresh: bool,
+}
+
+impl std::fmt::Debug for AuthorizedSourceFtsExcerptRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedSourceFtsExcerptRecord")
+            .field("provider", &self.provider)
+            .field("source_type", &self.source_type)
+            .field("content_and_metadata_redacted", &true)
+            .field("content_characters", &self.content.chars().count())
+            .finish()
+    }
+}
+
+/// Embedding-independent full-text source retrieval request.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceFtsSearchRequest<'a> {
+    /// Full-text query.
+    pub query: &'a str,
+    /// Server-authenticated request audience.
+    pub audience: ServerResolvedSourceAudience<'a>,
+    /// Maximum returned candidates.
+    pub limit: i64,
+}
+
+/// One embedding-independent FTS candidate to re-read before disclosure.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceFtsCandidateRecheckRequest<'a> {
+    /// Candidate item returned by the rank query.
+    pub item_id: Uuid,
+    /// Candidate chunk returned by the rank query.
+    pub chunk_id: Uuid,
+    /// Exact remote version returned by the rank query.
+    pub remote_version: &'a str,
+    /// Exact optional ETag returned by the rank query.
+    pub remote_etag: Option<&'a str>,
+    /// Exact chunk hash returned by the rank query.
+    pub chunk_hash: &'a [u8],
+    /// Exact reconciliation state observed during candidate ranking.
+    pub reconciliation_fresh: bool,
+    /// Server-authenticated request audience.
+    pub audience: ServerResolvedSourceAudience<'a>,
+}
+
+/// Authorization-bound request to resolve one opaque local evidence locator.
+#[derive(Clone, Copy, Debug)]
+pub struct EvidenceResolveRequest<'a> {
+    /// Opaque tenant-local source item UUID carried by the trusted broker.
+    pub item_id: Uuid,
+    /// Exact cited source chunk hash.
+    pub chunk_hash: &'a [u8],
+    /// Exact private channel carrying the resolve request.
+    pub channel_id: Uuid,
+    /// Server-authenticated direct-user and channel audience.
+    pub audience: ServerResolvedSourceAudience<'a>,
+}
+
+/// Provider metadata released only after a complete current authorization read.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedSourceEvidence {
+    /// Human-readable source title.
+    pub title: String,
+    /// Closed source type wire value.
+    pub source_type: String,
+    /// Provider modification timestamp.
+    pub modified_at: DateTime<Utc>,
+    /// Stable provider HTTPS link, validated by the connector layer before use.
+    pub resolvable_link: String,
+}
+
+impl std::fmt::Debug for ResolvedSourceEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedSourceEvidence")
+            .field("source_metadata_redacted", &true)
+            .finish()
+    }
+}
+
+/// Outcome of a current evidence authorization and revision check.
+#[derive(Clone, PartialEq, Eq)]
+pub enum EvidenceResolution {
+    /// Current authority and exact chunk revision matched.
+    Resolved(ResolvedSourceEvidence),
+    /// The source exists but the requester lacks current positive authority.
+    Denied,
+    /// The opaque source exists but the cited chunk revision no longer matches.
+    Stale,
+    /// The source is absent, inactive, tombstoned, or otherwise unavailable.
+    Unavailable,
+}
+
+impl std::fmt::Debug for EvidenceResolution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Resolved(_) => "EvidenceResolution::Resolved(<redacted>)",
+            Self::Denied => "EvidenceResolution::Denied",
+            Self::Stale => "EvidenceResolution::Stale",
+            Self::Unavailable => "EvidenceResolution::Unavailable",
+        })
+    }
 }
 
 impl std::fmt::Debug for AuthorizedSourceExcerptRecord {

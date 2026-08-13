@@ -720,6 +720,7 @@ pub struct ChangePage {
     tombstones: Vec<Tombstone>,
     next_cursor: EncryptedCursor,
     remote_checkpoint: RemoteCheckpoint,
+    reconciliation_complete: bool,
     page_digest: [u8; 32],
 }
 
@@ -750,6 +751,38 @@ impl ChangePage {
         tombstones: Vec<Tombstone>,
         next_cursor: EncryptedCursor,
         remote_checkpoint: RemoteCheckpoint,
+    ) -> Result<Self> {
+        Self::new_reconciliation(
+            tenant_id,
+            provider,
+            account_id,
+            scope_id,
+            stream,
+            previous_cursor_hash,
+            upserts,
+            tombstones,
+            next_cursor,
+            remote_checkpoint,
+            true,
+        )
+    }
+
+    /// Validate and hash one bounded provider page while explicitly marking
+    /// whether it completed a full reconciliation pass. Partial pages advance
+    /// their cursor but must not mark the source stream fresh.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_reconciliation(
+        tenant_id: Uuid,
+        provider: ConnectorProvider,
+        account_id: AccountId,
+        scope_id: ScopeId,
+        stream: impl Into<String>,
+        previous_cursor_hash: [u8; 32],
+        upserts: Vec<SourceItemUpsert>,
+        tombstones: Vec<Tombstone>,
+        next_cursor: EncryptedCursor,
+        remote_checkpoint: RemoteCheckpoint,
+        reconciliation_complete: bool,
     ) -> Result<Self> {
         let stream = bounded_text(stream, 128, "delta stream is invalid")?;
         if !stream
@@ -799,6 +832,7 @@ impl ChangePage {
             tombstones,
             next_cursor,
             remote_checkpoint,
+            reconciliation_complete,
             page_digest: [0; 32],
         };
         if page.upserts.iter().any(|item| {
@@ -852,6 +886,7 @@ impl ChangePage {
         update_len_prefixed(&mut hasher, &self.next_cursor.ciphertext);
         hasher.update(self.next_cursor.key_version.to_be_bytes());
         hasher.update(self.next_cursor.generation.to_be_bytes());
+        hasher.update([u8::from(self.reconciliation_complete)]);
         update_len_prefixed(&mut hasher, self.remote_checkpoint.kind.as_bytes());
         update_len_prefixed(&mut hasher, self.remote_checkpoint.value.as_bytes());
         hasher.finalize().into()
@@ -915,6 +950,13 @@ impl ChangePage {
     #[must_use]
     pub const fn next_cursor(&self) -> &EncryptedCursor {
         &self.next_cursor
+    }
+
+    /// Whether this page completed a full pass over every target represented
+    /// by the logical cursor.
+    #[must_use]
+    pub const fn reconciliation_complete(&self) -> bool {
+        self.reconciliation_complete
     }
 
     /// Deterministic page digest used to recognize retries.

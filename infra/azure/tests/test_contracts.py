@@ -86,15 +86,20 @@ class BicepContracts(unittest.TestCase):
     def test_compute_is_trusted_launch_with_required_disk(self) -> None:
         compute = read("infra/azure/modules/compute.bicep")
         for expected in (
-            "Standard_D4as_v5",
+            "Standard_D4as_v7",
             "TrustedLaunch",
             "secureBootEnabled: true",
             "vTpmEnabled: true",
-            "24_04-lts-gen2",
+            "sku: 'server'",
             "diskSizeGB: 256",
             "Premium_LRS",
         ):
             self.assertIn(expected, compute)
+        entra_login = compute[
+            compute.index("resource entraLogin") : compute.index("resource monitorAgent")
+        ]
+        self.assertIn("autoUpgradeMinorVersion: true", entra_login)
+        self.assertNotIn("enableAutomaticUpgrade", entra_login)
 
     def test_front_door_validates_origin_and_has_waf_rate_limit(self) -> None:
         edge = read("infra/azure/modules/edge.bicep")
@@ -110,6 +115,9 @@ class BicepContracts(unittest.TestCase):
         self.assertRegex(edge, r"enabledState:\s*'Enabled'")
         self.assertRegex(edge, r"certificateType:\s*'ManagedCertificate'")
         self.assertEqual(edge.count("cacheConfiguration: null"), 2)
+        self.assertNotRegex(edge, r"originPath:\s*''")
+        self.assertIn("name: 'originValidation'", edge)
+        self.assertIn("name: 'addOriginSecret'", edge)
         self.assertNotIn(
             "originHostHeader",
             edge,
@@ -157,6 +165,7 @@ class BicepContracts(unittest.TestCase):
         registry_block = security[security.index("resource registry") : security.index("resource keyVault")]
         self.assertIn("networkRuleSet", registry_block)
         self.assertRegex(registry_block, r"defaultAction:\s*'Deny'")
+        self.assertNotIn("trustPolicy", registry_block)
         self.assertIn("virtualNetworkRules", registry_block)
         self.assertIn("virtualNetworkSubnetResourceId: subnetId", registry_block)
         self.assertIn("enableRbacAuthorization: true", security)
@@ -174,6 +183,28 @@ class BicepContracts(unittest.TestCase):
                 rf"(?s)actual{threshold}:\s*\{{.*?threshold:\s*{threshold}\b.*?thresholdType:\s*'Actual'",
             )
         self.assertNotRegex(main + monitoring, r"(?i)auto.?shutdown")
+
+    def test_trusted_launch_backup_uses_enhanced_v2_policy(self) -> None:
+        monitoring = read("infra/azure/modules/monitoring-backup.bicep")
+        policy = monitoring[
+            monitoring.index("resource dailyPolicy") : monitoring.index(
+                "resource protectedVm"
+            )
+        ]
+        self.assertIn("policyType: 'V2'", policy)
+        self.assertIn("schedulePolicyType: 'SimpleSchedulePolicyV2'", policy)
+        self.assertRegex(policy, r"scheduleRunFrequency:\s*'Daily'")
+        self.assertRegex(
+            policy,
+            r"(?s)schedulePolicy:\s*\{.*?dailySchedule:\s*\{\s*scheduleRunTimes:\s*\[\s*'2026-08-03T02:00:00Z'",
+        )
+        self.assertNotRegex(policy, r"schedulePolicyType:\s*'SimpleSchedulePolicy'")
+        self.assertRegex(policy, r"instantRpRetentionRangeInDays:\s*5\b")
+        self.assertRegex(
+            policy,
+            r"(?s)retentionPolicy:.*?dailySchedule:.*?retentionTimes:\s*\[\s*'2026-08-03T02:00:00Z'.*?count:\s*30\b.*?durationType:\s*'Days'",
+        )
+        self.assertRegex(policy, r"timeZone:\s*'UTC'")
 
     def test_front_door_emits_content_free_health_diagnostics_and_alerts(self) -> None:
         monitoring = read("infra/azure/modules/monitoring-backup.bicep")

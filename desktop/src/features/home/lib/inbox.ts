@@ -10,6 +10,11 @@ import {
   getProjectInboxReference,
   isProjectInboxItem,
 } from "@/features/home/lib/projectInbox";
+import {
+  insightCategoryLabel,
+  parseInsightPayload,
+  type InsightPayload,
+} from "@/features/home/lib/insight";
 import type { TimelineReaction } from "@/features/messages/types";
 import type {
   Channel,
@@ -47,6 +52,8 @@ export type InboxItem = {
   fullTimestampLabel: string;
   groupItems: FeedItem[];
   isActionRequired: boolean;
+  /** Parsed v1 Core insight. Null marks an unavailable, fail-closed payload. */
+  insight?: InsightPayload | null;
   latestActivityAt: number;
   mentionNames: string[];
   mentionPubkeysByName?: Record<string, string>;
@@ -159,7 +166,16 @@ function projectTypeLabel(item: FeedItem) {
   return "Project update";
 }
 
-function feedHeadline(item: FeedItem, groupItems: readonly FeedItem[] = []) {
+function feedHeadline(
+  item: FeedItem,
+  groupItems: readonly FeedItem[] = [],
+  insight?: InsightPayload | null,
+) {
+  if (item.kind === 44300) {
+    return insight
+      ? insightCategoryLabel(insight.category)
+      : "Insight unavailable";
+  }
   if (isProjectInboxItem(item)) {
     const root = projectRootItem(item, groupItems);
     return (
@@ -202,7 +218,12 @@ function feedHeadline(item: FeedItem, groupItems: readonly FeedItem[] = []) {
   }
 }
 
-function feedPreview(item: FeedItem) {
+function feedPreview(item: FeedItem, insight?: InsightPayload | null) {
+  if (item.kind === 44300) {
+    return insight
+      ? `${insight.change} — ${insight.whyItMatters}`
+      : "This insight could not be safely displayed.";
+  }
   const content = item.content.trim();
   if (content.length > 0) {
     return content;
@@ -636,8 +657,10 @@ export function buildInboxItems({
         profiles,
         preferResolvedSelfLabel: true,
       });
-      const subject = feedHeadline(item, group.items);
-      const preview = feedPreview(item);
+      const insight =
+        item.kind === 44300 ? parseInsightPayload(item.content) : undefined;
+      const subject = feedHeadline(item, group.items, insight);
+      const preview = feedPreview(item, insight);
       const { mentionNames, mentionPubkeysByName } = resolveMentionProps(
         item.tags,
         profiles,
@@ -648,7 +671,10 @@ export function buildInboxItems({
         channelName: channelLabel ?? item.channelName,
         channelType: item.channelType ?? groupChannel.type,
       };
-      const categoryLabel = categoryLabelFor(categories[0] ?? item.category);
+      const categoryLabel =
+        item.kind === 44300
+          ? "Insight"
+          : categoryLabelFor(categories[0] ?? item.category);
 
       return {
         avatarUrl: profiles?.[item.pubkey.toLowerCase()]?.avatarUrl ?? null,
@@ -661,6 +687,7 @@ export function buildInboxItems({
         fullTimestampLabel: formatInboxFullTimestamp(item.createdAt),
         groupItems: group.items,
         isActionRequired: categories.includes("needs_action"),
+        insight,
         latestActivityAt: group.latestActivityAt,
         mentionNames: mentionNames ?? [],
         mentionPubkeysByName,

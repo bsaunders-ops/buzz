@@ -30,10 +30,6 @@ resource registry 'Microsoft.ContainerRegistry/registries@2026-03-01-preview' = 
         days: 14
         status: 'enabled'
       }
-      trustPolicy: {
-        type: 'Notary'
-        status: 'enabled'
-      }
     }
   }
   tags: {
