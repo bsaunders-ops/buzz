@@ -95,6 +95,11 @@ class BicepContracts(unittest.TestCase):
             "Premium_LRS",
         ):
             self.assertIn(expected, compute)
+        entra_login = compute[
+            compute.index("resource entraLogin") : compute.index("resource monitorAgent")
+        ]
+        self.assertIn("autoUpgradeMinorVersion: true", entra_login)
+        self.assertNotIn("enableAutomaticUpgrade", entra_login)
 
     def test_front_door_validates_origin_and_has_waf_rate_limit(self) -> None:
         edge = read("infra/azure/modules/edge.bicep")
@@ -160,6 +165,7 @@ class BicepContracts(unittest.TestCase):
         registry_block = security[security.index("resource registry") : security.index("resource keyVault")]
         self.assertIn("networkRuleSet", registry_block)
         self.assertRegex(registry_block, r"defaultAction:\s*'Deny'")
+        self.assertNotIn("trustPolicy", registry_block)
         self.assertIn("virtualNetworkRules", registry_block)
         self.assertIn("virtualNetworkSubnetResourceId: subnetId", registry_block)
         self.assertIn("enableRbacAuthorization: true", security)

@@ -105,7 +105,6 @@ resource entraLogin 'Microsoft.Compute/virtualMachines/extensions@2024-07-01' = 
     type: 'AADSSHLoginForLinux'
     typeHandlerVersion: '1.0'
     autoUpgradeMinorVersion: true
-    enableAutomaticUpgrade: true
   }
 }
 
