@@ -86,7 +86,7 @@ class BicepContracts(unittest.TestCase):
     def test_compute_is_trusted_launch_with_required_disk(self) -> None:
         compute = read("infra/azure/modules/compute.bicep")
         for expected in (
-            "Standard_D4as_v5",
+            "Standard_D4as_v7",
             "TrustedLaunch",
             "secureBootEnabled: true",
             "vTpmEnabled: true",
@@ -110,6 +110,9 @@ class BicepContracts(unittest.TestCase):
         self.assertRegex(edge, r"enabledState:\s*'Enabled'")
         self.assertRegex(edge, r"certificateType:\s*'ManagedCertificate'")
         self.assertEqual(edge.count("cacheConfiguration: null"), 2)
+        self.assertNotRegex(edge, r"originPath:\s*''")
+        self.assertIn("name: 'originValidation'", edge)
+        self.assertIn("name: 'addOriginSecret'", edge)
         self.assertNotIn(
             "originHostHeader",
             edge,

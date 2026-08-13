@@ -10,7 +10,7 @@ images, changes DNS, activates services, or locks immutable storage.
 The subscription-scoped `infra/azure/main.bicep` creates one East US 2 resource
 group and composes focused network, security, compute, Front Door/WAF,
 monitoring/backup, audit-storage, and budget modules. The VM is Ubuntu 24.04
-Trusted Launch on `Standard_D4as_v5`, with a 256-GiB P15 data disk. Its NSG has
+Trusted Launch on `Standard_D4as_v7`, with a 256-GiB P15 data disk. Its NSG has
 one custom inbound allow: TCP 443 from `AzureFrontDoor.Backend`. An explicit
 priority-200 deny follows it, overriding Azure's default VNet inbound allow for
 all other traffic, including future peers. There is no permanent public

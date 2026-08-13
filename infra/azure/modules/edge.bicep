@@ -87,7 +87,6 @@ resource route 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-09-01' = if (!cu
     httpsRedirect: 'Enabled'
     enabledState: 'Enabled'
     cacheConfiguration: null
-    originPath: ''
   }
 }
 
@@ -195,12 +194,12 @@ resource securityPolicy 'Microsoft.Cdn/profiles/securityPolicies@2024-09-01' = {
 
 // Front Door sends this secret header on every origin request. Caddy rejects requests without it.
 resource originHeaderRuleSet 'Microsoft.Cdn/profiles/ruleSets@2024-09-01' = {
-  name: 'origin-validation'
+  name: 'originValidation'
   parent: profile
 }
 
 resource originHeaderRule 'Microsoft.Cdn/profiles/ruleSets/rules@2024-09-01' = {
-  name: 'add-origin-secret'
+  name: 'addOriginSecret'
   parent: originHeaderRuleSet
   properties: {
     order: 1

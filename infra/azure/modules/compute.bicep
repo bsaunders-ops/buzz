@@ -17,7 +17,7 @@ resource virtualMachine 'Microsoft.Compute/virtualMachines@2024-07-01' = {
   }
   properties: {
     hardwareProfile: {
-      vmSize: 'Standard_D4as_v5'
+      vmSize: 'Standard_D4as_v7'
     }
     securityProfile: {
       securityType: 'TrustedLaunch'
