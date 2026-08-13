@@ -90,7 +90,7 @@ class BicepContracts(unittest.TestCase):
             "TrustedLaunch",
             "secureBootEnabled: true",
             "vTpmEnabled: true",
-            "24_04-lts-gen2",
+            "sku: 'server'",
             "diskSizeGB: 256",
             "Premium_LRS",
         ):

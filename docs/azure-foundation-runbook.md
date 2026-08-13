@@ -92,8 +92,8 @@ Each gate needs a separate approval; one approval does not imply the next.
     --location eastus2 \
     --publisher Canonical \
     --offer ubuntu-24_04-lts \
-    --sku 24_04-lts-gen2 \
-    --all --query '[-1].version' -o tsv
+    --sku server \
+    --all --query "sort_by([?sku == 'server'], &version)[-1].version" -o tsv
   ```
 
 - Nine immutable container references in `registry/repository@sha256:<64 hex>`

@@ -30,7 +30,7 @@ resource virtualMachine 'Microsoft.Compute/virtualMachines@2024-07-01' = {
       imageReference: {
         publisher: 'Canonical'
         offer: 'ubuntu-24_04-lts'
-        sku: '24_04-lts-gen2'
+        sku: 'server'
         version: ubuntuImageVersion
       }
       osDisk: {
