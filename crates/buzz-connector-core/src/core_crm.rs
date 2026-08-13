@@ -21,6 +21,7 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::{
+    core_crm_sync::CoreCrmMissingState,
     egress::{EgressRequest, ProviderEgressPolicy, RedirectMode},
     types::{
         AclPrincipal, ConnectorProvider, ExternalItemId, RemoteVersion, SourceItemUpsert,
@@ -179,6 +180,35 @@ impl CoreCrmReadOperation {
             ));
         }
         Ok(())
+    }
+
+    fn require_matching_missing_identity(
+        &self,
+        actual_kind: CoreCrmMissingRecordKind,
+        actual_key: &str,
+    ) -> Result<()> {
+        let expected_kind = match self {
+            Self::GetContact(_) => CoreCrmMissingRecordKind::Contact,
+            Self::GetCompany(_) => CoreCrmMissingRecordKind::Company,
+            Self::GetProject(_) => CoreCrmMissingRecordKind::Project,
+            Self::GetActivity(_) => CoreCrmMissingRecordKind::Activity,
+            Self::GetGuidanceDoc(_) => CoreCrmMissingRecordKind::GuidanceDocument,
+            Self::SearchContacts(_)
+            | Self::SearchCompanies(_)
+            | Self::ListProjects(_)
+            | Self::ListActivities(_)
+            | Self::ListGuidanceDocs(_) => {
+                return Err(ConnectorError::InvalidData(
+                    "Core CRM missing result is not an exact detail read",
+                ))
+            }
+        };
+        if actual_kind != expected_kind {
+            return Err(ConnectorError::InvalidData(
+                "Core CRM missing result kind does not match the request",
+            ));
+        }
+        self.require_matching_detail_identity(actual_key)
     }
 }
 
@@ -763,6 +793,22 @@ impl<T: CoreCrmMcpTransport> CoreCrmReadAdapter<T> {
         let response = self.transport.call(operation).await?;
         normalize_core_crm_response(operation, response.request_id(), response.body(), acls)
     }
+
+    /// Execute one bounded read and recognize only an exact, versioned,
+    /// identity-bound missing-record result as authoritative.
+    pub async fn read_reconciliation(
+        &self,
+        operation: &CoreCrmReadOperation,
+        acls: Vec<AclPrincipal>,
+    ) -> Result<CoreCrmReconciliationOutcome> {
+        let response = self.transport.call(operation).await?;
+        normalize_core_crm_reconciliation_response(
+            operation,
+            response.request_id(),
+            response.body(),
+            acls,
+        )
+    }
 }
 
 /// Honest coverage marker for the current MCP surface.
@@ -802,6 +848,15 @@ pub struct CoreCrmSnapshot {
     coverage: CoreCrmSnapshotCoverage,
 }
 
+/// Closed result of normalizing a Core CRM read for reconciliation.
+pub enum CoreCrmReconciliationOutcome {
+    /// A validated provider snapshot whose authority is limited to its exact
+    /// detail record or bounded discovery page.
+    Snapshot(CoreCrmSnapshot),
+    /// An explicit provider result for the exact requested detail identity.
+    Missing(CoreCrmMissingState),
+}
+
 impl CoreCrmSnapshot {
     /// Validated current records. No destructive tombstones are inferred.
     #[must_use]
@@ -826,6 +881,25 @@ impl CoreCrmSnapshot {
     }
 }
 
+/// Normalize either a regular snapshot or the closed v1 authoritative
+/// missing-record contract for one exact detail request.
+pub fn normalize_core_crm_reconciliation_response(
+    operation: &CoreCrmReadOperation,
+    expected_request_id: u64,
+    response: &[u8],
+    acls: Vec<AclPrincipal>,
+) -> Result<CoreCrmReconciliationOutcome> {
+    let text = validated_tool_text(expected_request_id, response)?;
+    let text = text.as_str();
+    if let Ok(missing) = serde_json::from_str::<CoreCrmAuthoritativeMissingResult>(text) {
+        return missing
+            .validate_for(operation)
+            .map(CoreCrmReconciliationOutcome::Missing);
+    }
+    normalize_core_crm_response(operation, expected_request_id, response, acls)
+        .map(CoreCrmReconciliationOutcome::Snapshot)
+}
+
 /// Validate a JSON-RPC/MCP envelope and normalize only its expected tool result.
 pub fn normalize_core_crm_response(
     operation: &CoreCrmReadOperation,
@@ -833,26 +907,8 @@ pub fn normalize_core_crm_response(
     response: &[u8],
     acls: Vec<AclPrincipal>,
 ) -> Result<CoreCrmSnapshot> {
-    if response.len() > MAX_RESPONSE_BYTES {
-        return Err(ConnectorError::BoundExceeded("Core CRM response bytes"));
-    }
-    let envelope: McpEnvelope = serde_json::from_slice(response)
-        .map_err(|_| ConnectorError::InvalidData("Core CRM JSON-RPC envelope is invalid"))?;
-    if expected_request_id == 0
-        || envelope.jsonrpc != "2.0"
-        || envelope.id != expected_request_id
-        || envelope.result.is_error.unwrap_or(false)
-    {
-        return Err(ConnectorError::InvalidData(
-            "Core CRM tool returned an error",
-        ));
-    }
-    if envelope.result.content.len() != 1 {
-        return Err(ConnectorError::InvalidData(
-            "Core CRM content blocks are invalid",
-        ));
-    }
-    let text = &envelope.result.content[0].text;
+    let text = validated_tool_text(expected_request_id, response)?;
+    let text = text.as_str();
     let mut upserts = Vec::new();
     let mut discovery_results = Vec::new();
     match operation {
@@ -990,6 +1046,88 @@ pub fn normalize_core_crm_response(
         discovery_results,
         coverage: CoreCrmSnapshotCoverage::BoundedInitialSnapshotOnly,
     })
+}
+
+fn validated_tool_text(expected_request_id: u64, response: &[u8]) -> Result<String> {
+    if response.len() > MAX_RESPONSE_BYTES {
+        return Err(ConnectorError::BoundExceeded("Core CRM response bytes"));
+    }
+    let envelope: McpEnvelope = serde_json::from_slice(response)
+        .map_err(|_| ConnectorError::InvalidData("Core CRM JSON-RPC envelope is invalid"))?;
+    if expected_request_id == 0
+        || envelope.jsonrpc != "2.0"
+        || envelope.id != expected_request_id
+        || envelope.result.is_error.unwrap_or(false)
+    {
+        return Err(ConnectorError::InvalidData(
+            "Core CRM tool returned an error",
+        ));
+    }
+    if envelope.result.content.len() != 1 {
+        return Err(ConnectorError::InvalidData(
+            "Core CRM content blocks are invalid",
+        ));
+    }
+    envelope
+        .result
+        .content
+        .into_iter()
+        .next()
+        .map(|content| content.text)
+        .ok_or(ConnectorError::InvalidData(
+            "Core CRM content blocks are invalid",
+        ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CoreCrmMissingRecordKind {
+    Contact,
+    Company,
+    Project,
+    Activity,
+    GuidanceDocument,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CoreCrmMissingWireState {
+    Deleted,
+    Revoked,
+    Inaccessible,
+}
+
+impl From<CoreCrmMissingWireState> for CoreCrmMissingState {
+    fn from(value: CoreCrmMissingWireState) -> Self {
+        match value {
+            CoreCrmMissingWireState::Deleted => Self::Deleted,
+            CoreCrmMissingWireState::Revoked => Self::Revoked,
+            CoreCrmMissingWireState::Inaccessible => Self::Inaccessible,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreCrmAuthoritativeMissingResult {
+    schema_version: u16,
+    ok: bool,
+    error: String,
+    state: CoreCrmMissingWireState,
+    record_kind: CoreCrmMissingRecordKind,
+    record_key: String,
+}
+
+impl CoreCrmAuthoritativeMissingResult {
+    fn validate_for(self, operation: &CoreCrmReadOperation) -> Result<CoreCrmMissingState> {
+        if self.schema_version != 1 || self.ok || self.error != "core_crm_record_unavailable" {
+            return Err(ConnectorError::InvalidData(
+                "Core CRM missing result contract is invalid",
+            ));
+        }
+        operation.require_matching_missing_identity(self.record_kind, &self.record_key)?;
+        Ok(self.state.into())
+    }
 }
 
 #[derive(Deserialize)]

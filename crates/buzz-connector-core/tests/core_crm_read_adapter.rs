@@ -2,10 +2,12 @@ use std::time::Duration;
 
 use buzz_connector_core::{
     core_crm::{
-        normalize_core_crm_response, BearerToken, CoreCrmDiscoveryResult, CoreCrmReadOperation,
+        normalize_core_crm_reconciliation_response, normalize_core_crm_response, BearerToken,
+        CoreCrmDiscoveryResult, CoreCrmReadOperation, CoreCrmReconciliationOutcome,
         CoreCrmRequestBuilder, CoreCrmSnapshotCoverage, CORE_CRM_MCP_PROTOCOL_VERSION,
         CORE_CRM_MCP_URL,
     },
+    core_crm_sync::CoreCrmMissingState,
     egress::RedirectMode,
     types::{AclPrincipal, SourceKind},
 };
@@ -29,6 +31,28 @@ fn principals() -> Vec<AclPrincipal> {
             Uuid::parse_str("10000000-0000-4000-8000-000000000001").expect("fixture UUID"),
         ),
     ]
+}
+
+fn reconciliation_response(result: Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "content": [{"type": "text", "text": result.to_string()}]
+        }
+    }))
+    .expect("synthetic reconciliation response")
+}
+
+fn missing_result(state: &str, record_kind: &str, record_key: &str) -> Value {
+    json!({
+        "schema_version": 1,
+        "ok": false,
+        "error": "core_crm_record_unavailable",
+        "state": state,
+        "record_kind": record_kind,
+        "record_key": record_key
+    })
 }
 
 #[test]
@@ -217,6 +241,121 @@ fn complete_synthetic_detail_fixtures_normalize_to_typed_upserts() {
             "untrusted_external_source"
         );
         assert!(snapshot.require_complete_corpus().is_err());
+    }
+}
+
+#[test]
+fn exact_versioned_missing_detail_results_map_to_closed_states() {
+    let cases = [
+        (
+            operation(
+                "get_contact",
+                json!({"id": "11111111-1111-4111-8111-111111111111", "activity_limit": 20}),
+            ),
+            missing_result("deleted", "contact", "11111111-1111-4111-8111-111111111111"),
+            CoreCrmMissingState::Deleted,
+        ),
+        (
+            operation(
+                "get_company",
+                json!({"id": "22222222-2222-4222-8222-222222222222"}),
+            ),
+            missing_result("revoked", "company", "22222222-2222-4222-8222-222222222222"),
+            CoreCrmMissingState::Revoked,
+        ),
+        (
+            operation("get_guidance_doc", json!({"slug": "email-voice-playbook"})),
+            missing_result("inaccessible", "guidance_document", "email-voice-playbook"),
+            CoreCrmMissingState::Inaccessible,
+        ),
+    ];
+
+    for (operation, result, expected) in cases {
+        let response = reconciliation_response(result);
+        let outcome =
+            normalize_core_crm_reconciliation_response(&operation, 1, &response, principals())
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} missing result must normalize: {error}",
+                        operation.tool_name()
+                    )
+                });
+        assert!(matches!(
+            outcome,
+            CoreCrmReconciliationOutcome::Missing(actual) if actual == expected
+        ));
+    }
+}
+
+#[test]
+fn authoritative_missing_result_requires_exact_kind_identity_and_known_version() {
+    let operation = operation(
+        "get_contact",
+        json!({"id": "11111111-1111-4111-8111-111111111111", "activity_limit": 20}),
+    );
+    let mut wrong_version =
+        missing_result("deleted", "contact", "11111111-1111-4111-8111-111111111111");
+    wrong_version["schema_version"] = json!(2);
+    let mut unknown_state =
+        missing_result("deleted", "contact", "11111111-1111-4111-8111-111111111111");
+    unknown_state["state"] = json!("temporarily_unavailable");
+
+    for result in [
+        missing_result("deleted", "company", "11111111-1111-4111-8111-111111111111"),
+        missing_result("deleted", "contact", "99999999-9999-4999-8999-999999999999"),
+        wrong_version,
+        unknown_state,
+        json!({
+            "schema_version": 1,
+            "ok": false,
+            "error": "core_crm_record_unavailable",
+            "state": "deleted",
+            "record_kind": "contact",
+            "record_key": "11111111-1111-4111-8111-111111111111",
+            "unexpected": true
+        }),
+    ] {
+        let response = reconciliation_response(result);
+        assert!(
+            normalize_core_crm_reconciliation_response(&operation, 1, &response, principals(),)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn generic_provider_errors_and_capped_absence_never_become_missing_results() {
+    let detail = operation(
+        "get_contact",
+        json!({"id": "11111111-1111-4111-8111-111111111111", "activity_limit": 20}),
+    );
+    let generic_typed_error = reconciliation_response(json!({
+        "ok": false,
+        "error": "contact_not_found",
+        "contact_id": "11111111-1111-4111-8111-111111111111"
+    }));
+    let generic_mcp_error = br#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"not found"}]}}"#;
+
+    for response in [generic_typed_error.as_slice(), generic_mcp_error.as_slice()] {
+        assert!(
+            normalize_core_crm_reconciliation_response(&detail, 1, response, principals(),)
+                .is_err()
+        );
+    }
+
+    let discovery = operation("search_contacts", json!({"limit": 50}));
+    let empty_page = reconciliation_response(json!([]));
+    let outcome =
+        normalize_core_crm_reconciliation_response(&discovery, 1, &empty_page, principals())
+            .expect("an empty capped discovery page is a valid non-authoritative snapshot");
+    match outcome {
+        CoreCrmReconciliationOutcome::Snapshot(snapshot) => {
+            assert!(snapshot.upserts().is_empty());
+            assert!(snapshot.discovery_results().is_empty());
+        }
+        CoreCrmReconciliationOutcome::Missing(_) => {
+            panic!("capped discovery absence must not become a missing result")
+        }
     }
 }
 

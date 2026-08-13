@@ -8,7 +8,10 @@ use aes_gcm::{
 };
 use buzz_connector_core::{
     apply::ApplyOutcome,
-    core_crm::{BearerToken, CoreCrmHttpTransport, CoreCrmReadAdapter, CoreCrmReadOperation},
+    core_crm::{
+        BearerToken, CoreCrmHttpTransport, CoreCrmReadAdapter, CoreCrmReadOperation,
+        CoreCrmReconciliationOutcome,
+    },
     core_crm_sync::CoreCrmSyncCursorV1,
     persistence::apply_postgres_change_page,
     types::{AccountId, AclPrincipal, ChangePage, ConnectorProvider, EncryptedCursor, ScopeId},
@@ -152,8 +155,9 @@ impl CoreCrmCursorCodec for CoreCrmAesCursorCodec {
     }
 }
 
-/// Production exact-detail reader. Provider errors remain non-destructive and
-/// never become tombstones without a future explicit typed missing contract.
+/// Production exact-detail reader. Generic provider errors remain
+/// non-destructive; only the closed authoritative missing contract can become
+/// a tombstone.
 pub struct ProductionCoreCrmReader {
     adapter: CoreCrmReadAdapter<CoreCrmHttpTransport>,
 }
@@ -174,11 +178,15 @@ impl CoreCrmSnapshotReader for ProductionCoreCrmReader {
         operation: &CoreCrmReadOperation,
         acls: Vec<AclPrincipal>,
     ) -> Result<CoreCrmReadOutcome, ProviderPageError> {
-        self.adapter
-            .read(operation, acls)
-            .await
-            .map(CoreCrmReadOutcome::Snapshot)
-            .map_err(|_| ProviderPageError::InvalidResponse)
+        match self.adapter.read_reconciliation(operation, acls).await {
+            Ok(CoreCrmReconciliationOutcome::Snapshot(snapshot)) => {
+                Ok(CoreCrmReadOutcome::Snapshot(snapshot))
+            }
+            Ok(CoreCrmReconciliationOutcome::Missing(state)) => {
+                Ok(CoreCrmReadOutcome::Missing(state))
+            }
+            Err(_) => Err(ProviderPageError::InvalidResponse),
+        }
     }
 }
 
